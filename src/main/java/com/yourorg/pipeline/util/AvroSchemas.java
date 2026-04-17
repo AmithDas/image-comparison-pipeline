@@ -15,11 +15,15 @@ public final class AvroSchemas {
 
     public static final Schema PAYLOAD_ROW;
     public static final Schema PENDING_ROW;
+    public static final Schema COMPARISON_RESULT;
+    public static final Schema DEAD_LETTER_ROW;
 
     static {
         try {
-            PAYLOAD_ROW = parse("/avro/payload_row.json");
-            PENDING_ROW = parse("/avro/pending_row.json");
+            PAYLOAD_ROW       = parse("/avro/payload_row.json");
+            PENDING_ROW       = parse("/avro/pending_row.json");
+            COMPARISON_RESULT = parse("/avro/comparison_result.json");
+            DEAD_LETTER_ROW   = parse("/avro/dead_letter_row.json");
         } catch (IOException e) {
             throw new ExceptionInInitializerError(e);
         }
