@@ -140,10 +140,14 @@ public class ImageComparisonPipeline {
         LOG.info("Reading source table: {} for window [{}, {})",
                 options.getSourceTable(), options.getWindowStart(), options.getWindowEnd());
         String sourceQuery = String.format(
-                "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'",
+                "SELECT * FROM `%s`"
+                        + " WHERE created_at >= '%s' AND created_at < '%s'"
+                        + " AND method IN ('%s', '%s')",
                 options.getSourceTable().replace(':', '.'),
                 options.getWindowStart(),
-                options.getWindowEnd());
+                options.getWindowEnd(),
+                options.getAiMethod(),
+                options.getHumanMethod());
         PCollection<TableRow> rawRows = pipeline.apply(
                 "ReadSourcePayloads",
                 BigQueryIO.readTableRows()
