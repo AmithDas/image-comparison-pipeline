@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "DeadLetterRow",
+  "namespace": "com.yourorg.pipeline",
+  "fields": [
+    {"name": "image_id",      "type": "string"},
+    {"name": "pending_type",  "type": "string"},
+    {"name": "payload",       "type": ["null", "string"], "default": null},
+    {"name": "created_at",    "type": ["null", "string"], "default": null},
+    {"name": "first_seen_at", "type": ["null", "string"], "default": null},
+    {"name": "aged_out_at",   "type": "string"},
+    {"name": "reason",        "type": ["null", "string"], "default": null}
+  ]
+}

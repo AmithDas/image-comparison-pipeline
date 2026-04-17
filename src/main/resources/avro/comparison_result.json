@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "ComparisonResult",
+  "namespace": "com.yourorg.pipeline",
+  "fields": [
+    {"name": "image_id",         "type": "string"},
+    {"name": "ai_iteration",     "type": "int"},
+    {"name": "ai_created_at",    "type": ["null", "string"], "default": null},
+    {"name": "human_created_at", "type": ["null", "string"], "default": null},
+    {"name": "field_name",       "type": "string"},
+    {"name": "human_value",      "type": ["null", "string"], "default": null},
+    {"name": "ai_value",         "type": ["null", "string"], "default": null},
+    {"name": "is_match",         "type": "boolean"},
+    {"name": "compared_at",      "type": "string"}
+  ]
+}
