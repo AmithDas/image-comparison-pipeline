@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "PendingRow",
+  "namespace": "com.yourorg.pipeline",
+  "fields": [
+    {"name": "image_id",        "type": ["null", "string"], "default": null},
+    {"name": "pending_type",    "type": "string"},
+    {"name": "payload",         "type": "string"},
+    {"name": "created_at",      "type": ["null", "string"], "default": null},
+    {"name": "first_seen_at",   "type": ["null", "string"], "default": null},
+    {"name": "last_retried_at", "type": ["null", "string"], "default": null},
+    {"name": "retry_count",     "type": "long",             "default": 0}
+  ]
+}
