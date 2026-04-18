@@ -11,8 +11,9 @@
 --    payload_type: 'human' or 'ai'
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `your_project.your_dataset.image_payloads` (
+  key_id        STRING    NOT NULL,   -- Barricade encryption key identifier
   method        STRING    NOT NULL,   -- identifies payload origin (e.g. 'aimetadata' or 'controller.SubmitDispute')
-  payload       STRING    NOT NULL,   -- raw JSON string; must contain "image_name" field
+  payload       STRING    NOT NULL,   -- Barricade-encrypted JSON; must contain "image_name" after decryption
   created_at    TIMESTAMP NOT NULL
 )
 PARTITION BY DATE(created_at)
@@ -28,13 +29,14 @@ OPTIONS (
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `your_project.your_dataset.image_comparison_results` (
   image_id          STRING    NOT NULL,
+  key_id            STRING    NOT NULL,   -- Barricade key used to encrypt human_value and ai_value
   ai_iteration      INT64     NOT NULL,   -- 1-based, ordered by created_at ASC
   ai_created_at     TIMESTAMP,
   human_created_at  TIMESTAMP,
   field_name        STRING    NOT NULL,   -- dot-notation path e.g. "metadata.label"
-  human_value       STRING,              -- null if field absent in human payload
-  ai_value          STRING,              -- null if field absent in AI payload
-  is_match          BOOL      NOT NULL,
+  human_value       STRING,              -- Barricade-encrypted; null if field absent in human payload
+  ai_value          STRING,              -- Barricade-encrypted; null if field absent in AI payload
+  is_match          BOOL      NOT NULL,  -- compared on plaintext before encryption
   compared_at       TIMESTAMP NOT NULL
 )
 PARTITION BY DATE(compared_at)
@@ -52,8 +54,9 @@ OPTIONS (
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_comparisons` (
   image_id         STRING    NOT NULL,
+  key_id           STRING    NOT NULL,   -- Barricade encryption key identifier
   pending_type     STRING    NOT NULL,   -- 'human' or 'ai'
-  payload          STRING    NOT NULL,   -- raw JSON string of the orphaned payload
+  payload          STRING    NOT NULL,   -- Barricade-encrypted payload
   created_at       TIMESTAMP,           -- original created_at from source table
   first_seen_at    TIMESTAMP NOT NULL,  -- when first written to pending
   last_retried_at  TIMESTAMP,           -- updated on each pipeline run

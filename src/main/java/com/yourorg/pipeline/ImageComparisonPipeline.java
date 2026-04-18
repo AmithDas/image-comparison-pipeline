@@ -27,6 +27,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.util.Collections;
+import java.util.Map;
 
 /**
  * Entry point for the Image Comparison Dataflow pipeline.
@@ -116,6 +118,12 @@ public class ImageComparisonPipeline {
         @Validation.Required
         String getHumanMethod();
         void setHumanMethod(String value);
+
+        @Description("Comma-separated sort keys per array path, e.g. 'terms=code,items=id'. "
+                + "Each entry specifies which field to sort array elements by at that dot-notation path. "
+                + "Omit to sort by full element JSON string.")
+        String getArraySortKeys();
+        void setArraySortKeys(String value);
     }
 
     // ── Entry point ───────────────────────────────────────────────────────────
@@ -216,7 +224,9 @@ public class ImageComparisonPipeline {
 
         // ── 6. Flatten JSON + field-level comparison ──────────────────────────
         PCollection<TableRow> comparisonResults = matched
-                .apply("FlattenAndCompare", ParDo.of(new FlattenAndCompareFn()));
+                .apply("FlattenAndCompare",
+                        ParDo.of(new FlattenAndCompareFn(
+                                parseArraySortKeys(options.getArraySortKeys()))));
 
         // ── 7. Write comparison results ───────────────────────────────────────
         comparisonResults.apply(
@@ -261,6 +271,7 @@ public class ImageComparisonPipeline {
     private static TableRow fromPendingRecord(GenericRecord r) {
         return new TableRow()
                 .set("image_id",        str(r.get("image_id")))
+                .set("key_id",          str(r.get("key_id")))
                 .set("pending_type",    str(r.get("pending_type")))
                 .set("payload",         str(r.get("payload")))
                 .set("created_at",      str(r.get("created_at")))
@@ -273,6 +284,7 @@ public class ImageComparisonPipeline {
     private static TableRow fromAgedOutRecord(GenericRecord r) {
         return new TableRow()
                 .set("image_id",      str(r.get("image_id")))
+                .set("key_id",        str(r.get("key_id")))
                 .set("pending_type",  str(r.get("pending_type")))
                 .set("payload",       str(r.get("payload")))
                 .set("created_at",    str(r.get("created_at")))
@@ -284,5 +296,17 @@ public class ImageComparisonPipeline {
 
     private static String str(Object value) {
         return value != null ? value.toString() : null;
+    }
+
+    private static Map<String, String> parseArraySortKeys(String raw) {
+        if (raw == null || raw.isBlank()) return Collections.emptyMap();
+        Map<String, String> map = new java.util.HashMap<>();
+        for (String entry : raw.split(",")) {
+            String[] parts = entry.split("=", 2);
+            if (parts.length == 2 && !parts[0].isBlank() && !parts[1].isBlank()) {
+                map.put(parts[0].trim(), parts[1].trim());
+            }
+        }
+        return map;
     }
 }

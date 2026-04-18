@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,6 +26,10 @@ import java.util.Map;
  *   {"a": [{"b": 1}]}         → {"a.b": "1"}
  *   {"a": [{"b":1},{"b":2}]}  → {"a.b": "[\"1\",\"2\"]"}
  *   {"a": null}               → {"a": null}
+ *
+ * Array elements are sorted before accumulation to make comparison order-insensitive.
+ * The sort field per array path can be configured via the arraySortKeys map (dot-notation
+ * path → field name). Falls back to full element JSON string sort when no key is configured.
  */
 public final class JsonFieldExtractor {
 
@@ -51,13 +56,20 @@ public final class JsonFieldExtractor {
     }
 
     /**
-     * Flattens a JSON string into a map of dot-notation paths → string values.
-     * Returns an empty map if the input is null, blank, or malformed.
-     *
-     * @param json raw JSON string
-     * @return ordered map of flattened field paths to string values
+     * Flattens a JSON string using default sort (full element JSON string).
      */
     public static Map<String, String> flatten(String json) {
+        return flatten(json, Collections.emptyMap());
+    }
+
+    /**
+     * Flattens a JSON string into a map of dot-notation paths → string values.
+     *
+     * @param json          raw JSON string
+     * @param arraySortKeys map of dot-notation array path → field name to sort elements by
+     * @return ordered map of flattened field paths to string values
+     */
+    public static Map<String, String> flatten(String json, Map<String, String> arraySortKeys) {
         Map<String, String> result = new LinkedHashMap<>();
         if (json == null || json.isBlank()) {
             return result;
@@ -65,9 +77,8 @@ public final class JsonFieldExtractor {
         try {
             JsonElement root = JsonParser.parseString(json);
             if (root.isJsonObject()) {
-                flattenObject(root.getAsJsonObject(), "", result);
+                flattenObject(root.getAsJsonObject(), "", result, arraySortKeys);
             } else {
-                // Top-level is a scalar or array — store under empty key
                 result.put("$root", root.isJsonNull() ? null : root.toString());
             }
         } catch (Exception e) {
@@ -77,7 +88,8 @@ public final class JsonFieldExtractor {
     }
 
     private static void flattenObject(JsonObject obj, String prefix,
-                                      Map<String, String> result) {
+                                      Map<String, String> result,
+                                      Map<String, String> arraySortKeys) {
         for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
             String key = prefix.isEmpty()
                     ? entry.getKey()
@@ -85,9 +97,9 @@ public final class JsonFieldExtractor {
             JsonElement val = entry.getValue();
 
             if (val.isJsonObject()) {
-                flattenObject(val.getAsJsonObject(), key, result);
+                flattenObject(val.getAsJsonObject(), key, result, arraySortKeys);
             } else if (val.isJsonArray()) {
-                flattenArray(val.getAsJsonArray(), key, result);
+                flattenArray(val.getAsJsonArray(), key, result, arraySortKeys);
             } else if (val.isJsonNull()) {
                 result.put(key, null);
             } else {
@@ -97,11 +109,14 @@ public final class JsonFieldExtractor {
     }
 
     private static void flattenArray(JsonArray arr, String prefix,
-                                     Map<String, String> result) {
-        // Sort by JSON string so [1,2] and [2,1] produce identical keys (order-insensitive).
+                                     Map<String, String> result,
+                                     Map<String, String> arraySortKeys) {
         List<JsonElement> elements = new ArrayList<>();
         arr.forEach(elements::add);
-        elements.sort(Comparator.comparing(JsonElement::toString));
+
+        // Sort by configured field for this path, or fall back to full element string.
+        String sortField = arraySortKeys.get(prefix);
+        elements.sort(Comparator.comparing(el -> sortValue(el, sortField)));
 
         // Flatten each element into a temp map, then merge into an accumulator.
         // Keys that appear in multiple elements collect all values into a JSON array.
@@ -109,9 +124,9 @@ public final class JsonFieldExtractor {
         for (JsonElement el : elements) {
             Map<String, String> elResult = new LinkedHashMap<>();
             if (el.isJsonObject()) {
-                flattenObject(el.getAsJsonObject(), prefix, elResult);
+                flattenObject(el.getAsJsonObject(), prefix, elResult, arraySortKeys);
             } else if (el.isJsonArray()) {
-                flattenArray(el.getAsJsonArray(), prefix, elResult);
+                flattenArray(el.getAsJsonArray(), prefix, elResult, arraySortKeys);
             } else if (el.isJsonNull()) {
                 elResult.put(prefix, null);
             } else {
@@ -134,5 +149,13 @@ public final class JsonFieldExtractor {
                 result.put(k, jsonArr.toString());
             }
         });
+    }
+
+    private static String sortValue(JsonElement el, String sortField) {
+        if (sortField != null && el.isJsonObject()) {
+            JsonElement field = el.getAsJsonObject().get(sortField);
+            if (field != null && !field.isJsonNull()) return field.getAsString();
+        }
+        return el.toString();
     }
 }

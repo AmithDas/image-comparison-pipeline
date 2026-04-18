@@ -2,6 +2,7 @@ package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.util.AvroSchemas;
+import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
@@ -21,17 +22,10 @@ import java.util.List;
 /**
  * Core eligibility and pairing transform.
  *
- * <p>For each image group, merges rows from the current source read with any
- * previously pending rows (via CoGroupByKey), then routes to one of three outputs:
- *
- * <ul>
- *   <li>{@link #MATCHED}     — exactly 1 human + 1 AI present; emit paired rows for comparison.</li>
- *   <li>{@link #NEW_PENDING} — one side arrived but not the other; store for retry next run.</li>
- *   <li>{@link #AGED_OUT}    — pending row has exceeded MAX_WAIT_DAYS; route to dead-letter.</li>
- * </ul>
- *
- * <p>Internal records use Avro {@link GenericRecord} with schemas defined in
- * {@code payload_row.avsc} and {@code pending_row.avsc}.
+ * <p>Source payloads are Barricade-encrypted. This transform decrypts each payload
+ * transiently to extract {@code image_name}, then stores the encrypted payload
+ * and {@code key_id} in the {@link GenericRecord} so that decryption of field
+ * values happens once, in {@link FlattenAndCompareFn}.
  */
 public class FilterAndPairFn
         extends DoFn<KV<String, CoGbkResult>,
@@ -39,7 +33,6 @@ public class FilterAndPairFn
 
     private static final Logger LOG = LoggerFactory.getLogger(FilterAndPairFn.class);
 
-    /** Maximum days to wait for the counterpart payload before dead-lettering. */
     public static final int MAX_WAIT_DAYS = 7;
 
     private final String aiMethod;
@@ -52,23 +45,15 @@ public class FilterAndPairFn
 
     // ── CoGroupByKey input tags ───────────────────────────────────────────────
 
-    /** Tag for rows from the source (image_payloads) table. */
-    public static final TupleTag<TableRow> SOURCE_TAG = new TupleTag<>() {};
-
-    /** Tag for rows from the pending_comparisons table. */
+    public static final TupleTag<TableRow> SOURCE_TAG  = new TupleTag<>() {};
     public static final TupleTag<TableRow> PENDING_TAG = new TupleTag<>() {};
 
     // ── Output tags ──────────────────────────────────────────────────────────
 
-    /** Both human and AI present — proceed to comparison. */
     public static final TupleTag<KV<String, KV<GenericRecord, GenericRecord>>> MATCHED
             = new TupleTag<>() {};
-
-    /** One side missing — store in pending_comparisons for retry. */
     public static final TupleTag<GenericRecord> NEW_PENDING = new TupleTag<>() {};
-
-    /** Pending row exceeded MAX_WAIT_DAYS — route to dead-letter. */
-    public static final TupleTag<GenericRecord> AGED_OUT = new TupleTag<>() {};
+    public static final TupleTag<GenericRecord> AGED_OUT    = new TupleTag<>() {};
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
@@ -80,20 +65,26 @@ public class FilterAndPairFn
         List<GenericRecord> aiRows    = new ArrayList<>();
 
         for (TableRow row : result.getAll(SOURCE_TAG)) {
-            String payload = (String) row.get("payload");
-            String method  = (String) row.get("method");
+            String encryptedPayload = (String) row.get("payload");
+            String keyId            = (String) row.get("key_id");
+            String method           = (String) row.get("method");
+
             String payloadType;
             if (aiMethod.equals(method)) {
                 payloadType = "ai";
             } else if (humanMethod.equals(method)) {
                 payloadType = "human";
             } else {
-                LOG.warn("Unrecognised method value '{}' for imageId={} — skipping row", method, imageId);
+                LOG.warn("Unrecognised method '{}' for imageId={} — skipping", method, imageId);
                 continue;
             }
-            GenericRecord p = newPayloadRow(
-                    JsonFieldExtractor.extractField(payload, "image_name"),
-                    payloadType, payload, (String) row.get("created_at"));
+
+            // Decrypt transiently to extract image_name; encrypted payload is kept in the record.
+            String decrypted = BarricadeEncryptionUtil.decrypt(keyId, encryptedPayload);
+            String extractedImageId = JsonFieldExtractor.extractField(decrypted, "image_name");
+
+            GenericRecord p = newPayloadRow(extractedImageId, keyId, payloadType,
+                    encryptedPayload, (String) row.get("created_at"));
             if ("human".equals(payloadType)) {
                 humanRows.add(p);
             } else {
@@ -110,12 +101,13 @@ public class FilterAndPairFn
 
         if (pending != null) {
             String pendingType = str(pending.get("pending_type"));
+            String pendingKeyId = str(pending.get("key_id"));
             if ("human".equals(pendingType) && humanRows.isEmpty()) {
-                humanRows.add(newPayloadRow(imageId, "human",
+                humanRows.add(newPayloadRow(imageId, pendingKeyId, "human",
                         str(pending.get("payload")), str(pending.get("created_at"))));
                 LOG.debug("Restored pending human payload for imageId={}", imageId);
             } else if ("ai".equals(pendingType) && aiRows.isEmpty()) {
-                aiRows.add(newPayloadRow(imageId, "ai",
+                aiRows.add(newPayloadRow(imageId, pendingKeyId, "ai",
                         str(pending.get("payload")), str(pending.get("created_at"))));
                 LOG.debug("Restored pending AI payload for imageId={}", imageId);
             }
@@ -124,9 +116,9 @@ public class FilterAndPairFn
         boolean humanPresent = humanRows.size() == 1;
         boolean aiPresent    = aiRows.size() == 1;
 
-        Instant now       = Instant.now();
+        Instant now         = Instant.now();
         String firstSeenStr = pending != null ? str(pending.get("first_seen_at")) : null;
-        Instant firstSeen = firstSeenStr != null ? parseInstant(firstSeenStr) : now;
+        Instant firstSeen   = firstSeenStr != null ? parseInstant(firstSeenStr) : now;
         if (firstSeen == null) firstSeen = now;
         long daysWaited = ChronoUnit.DAYS.between(firstSeen, now);
         long retryCount = pending != null
@@ -142,7 +134,7 @@ public class FilterAndPairFn
             // ── State 2: human arrived, AI missing ──────────────────────────
             GenericRecord human = humanRows.get(0);
             LOG.info("Human-only imageId={} — pending AI (days waited={})", imageId, daysWaited);
-            emitPendingOrAgedOut(ctx, imageId, "human",
+            emitPendingOrAgedOut(ctx, imageId, str(human.get("key_id")), "human",
                     str(human.get("payload")), str(human.get("created_at")),
                     firstSeen, now, retryCount, daysWaited);
 
@@ -150,7 +142,7 @@ public class FilterAndPairFn
             // ── State 3: AI arrived, human missing ──────────────────────────
             GenericRecord ai = aiRows.get(0);
             LOG.info("AI-only imageId={} — pending human (days waited={})", imageId, daysWaited);
-            emitPendingOrAgedOut(ctx, imageId, "ai",
+            emitPendingOrAgedOut(ctx, imageId, str(ai.get("key_id")), "ai",
                     str(ai.get("payload")), str(ai.get("created_at")),
                     firstSeen, now, retryCount, daysWaited);
 
@@ -158,19 +150,20 @@ public class FilterAndPairFn
             // ── State 4: neither present, pending row aged out ───────────────
             LOG.warn("imageId={} aged out after {} days — routing to dead-letter", imageId, daysWaited);
             ctx.output(AGED_OUT, newPendingRow(imageId,
-                    str(pending.get("pending_type")), str(pending.get("payload")),
-                    str(pending.get("created_at")), firstSeen, now, retryCount));
+                    str(pending.get("key_id")), str(pending.get("pending_type")),
+                    str(pending.get("payload")), str(pending.get("created_at")),
+                    firstSeen, now, retryCount));
         }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private void emitPendingOrAgedOut(ProcessContext ctx,
-                                       String imageId, String pendingType,
+                                       String imageId, String keyId, String pendingType,
                                        String payload, String createdAt,
                                        Instant firstSeen, Instant now,
                                        long retryCount, long daysWaited) {
-        GenericRecord row = newPendingRow(imageId, pendingType, payload, createdAt,
+        GenericRecord row = newPendingRow(imageId, keyId, pendingType, payload, createdAt,
                 firstSeen, now, retryCount);
         if (daysWaited >= MAX_WAIT_DAYS) {
             ctx.output(AGED_OUT, row);
@@ -179,22 +172,25 @@ public class FilterAndPairFn
         }
     }
 
-    private static GenericRecord newPayloadRow(String imageId, String payloadType,
-                                                String payload, String createdAt) {
+    private static GenericRecord newPayloadRow(String imageId, String keyId,
+                                                String payloadType, String payload,
+                                                String createdAt) {
         GenericRecord r = new GenericData.Record(AvroSchemas.PAYLOAD_ROW);
         r.put("image_id",     imageId);
+        r.put("key_id",       keyId);
         r.put("payload_type", payloadType);
         r.put("payload",      payload);
         r.put("created_at",   createdAt);
         return r;
     }
 
-    private static GenericRecord newPendingRow(String imageId, String pendingType,
-                                                String payload, String createdAt,
-                                                Instant firstSeen, Instant now,
-                                                long retryCount) {
+    private static GenericRecord newPendingRow(String imageId, String keyId,
+                                                String pendingType, String payload,
+                                                String createdAt, Instant firstSeen,
+                                                Instant now, long retryCount) {
         GenericRecord r = new GenericData.Record(AvroSchemas.PENDING_ROW);
         r.put("image_id",        imageId);
+        r.put("key_id",          keyId);
         r.put("pending_type",    pendingType);
         r.put("payload",         payload);
         r.put("created_at",      createdAt);
@@ -207,6 +203,7 @@ public class FilterAndPairFn
     private static GenericRecord toPendingRecord(TableRow row) {
         GenericRecord r = new GenericData.Record(AvroSchemas.PENDING_ROW);
         r.put("image_id",        row.get("image_id"));
+        r.put("key_id",          row.get("key_id"));
         r.put("pending_type",    row.get("pending_type"));
         r.put("payload",         row.get("payload"));
         r.put("created_at",      row.get("created_at"));
