@@ -2,8 +2,6 @@ package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.util.AvroSchemas;
-import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
-import com.yourorg.pipeline.util.JsonFieldExtractor;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.transforms.DoFn;
@@ -22,10 +20,10 @@ import java.util.List;
 /**
  * Core eligibility and pairing transform.
  *
- * <p>Source payloads are Barricade-encrypted. This transform decrypts each payload
- * transiently to extract {@code image_name}, then stores the encrypted payload
- * and {@code key_id} in the {@link GenericRecord} so that decryption of field
- * values happens once, in {@link FlattenAndCompareFn}.
+ * <p>Source payloads are Barricade-encrypted. {@code image_name} is already the
+ * CoGroupByKey grouping key (extracted once upstream). This transform stores the
+ * encrypted payload and {@code key_id} in the {@link GenericRecord}; decryption
+ * of field values happens in {@link FlattenAndCompareFn}.
  */
 public class FilterAndPairFn
         extends DoFn<KV<String, CoGbkResult>,
@@ -79,11 +77,7 @@ public class FilterAndPairFn
                 continue;
             }
 
-            // Decrypt transiently to extract image_name; encrypted payload is kept in the record.
-            String decrypted = BarricadeEncryptionUtil.decrypt(keyId, encryptedPayload);
-            String extractedImageId = JsonFieldExtractor.extractField(decrypted, "image_name");
-
-            GenericRecord p = newPayloadRow(extractedImageId, keyId, payloadType,
+            GenericRecord p = newPayloadRow(imageId, keyId, payloadType,
                     encryptedPayload, (String) row.get("created_at"));
             if ("human".equals(payloadType)) {
                 humanRows.add(p);

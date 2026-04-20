@@ -4,6 +4,7 @@ import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
 import com.yourorg.pipeline.util.AvroSchemas;
+import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 import com.yourorg.pipeline.util.SchemaUtil;
 import org.apache.avro.generic.GenericRecord;
@@ -181,11 +182,15 @@ public class ImageComparisonPipeline {
                         WithKeys.of((TableRow row) -> (String) row.get("image_id"))
                                 .withKeyType(TypeDescriptors.strings()));
 
-        // ── 3. Key source rows by image_name extracted from payload ───────────
+        // ── 3. Key source rows by image_name extracted from decrypted payload ──
         PCollection<KV<String, TableRow>> keyedSource = rawRows
                 .apply("KeySourceById",
-                        WithKeys.of((TableRow row) -> JsonFieldExtractor.extractField(
-                                        (String) row.get("payload"), "image_name"))
+                        WithKeys.of((TableRow row) -> {
+                            String keyId     = (String) row.get("key_id");
+                            String decrypted = BarricadeEncryptionUtil.decrypt(
+                                    keyId, (String) row.get("payload"));
+                            return JsonFieldExtractor.extractField(decrypted, "image_name");
+                        })
                                 .withKeyType(TypeDescriptors.strings()));
 
         // ── 4. Co-group source + pending by image name ────────────────────────
