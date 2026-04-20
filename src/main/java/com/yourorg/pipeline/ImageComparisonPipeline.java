@@ -55,7 +55,8 @@ import java.util.Map;
  *   mvn compile exec:java \
  *     -Dexec.mainClass=com.yourorg.pipeline.ImageComparisonPipeline \
  *     -Dexec.args="--runner=DirectRunner \
- *       --sourceTable=project:dataset.image_payloads \
+ *       --aiSourceTable=project:ai_dataset.ai_payloads \
+ *       --humanSourceTable=project:human_dataset.human_payloads \
  *       --outputTable=project:dataset.image_comparison_results \
  *       --pendingTable=project:dataset.pending_comparisons \
  *       --deadLetterTable=project:dataset.dead_letter_comparisons \
@@ -73,11 +74,15 @@ public class ImageComparisonPipeline {
 
     public interface Options extends PipelineOptions {
 
-        @Description("Source BigQuery table containing human and AI payloads. "
-                + "Format: project:dataset.table")
+        @Description("BigQuery table containing AI payloads. Format: project:dataset.table")
         @Validation.Required
-        String getSourceTable();
-        void setSourceTable(String value);
+        String getAiSourceTable();
+        void setAiSourceTable(String value);
+
+        @Description("BigQuery table containing human payloads. Format: project:dataset.table")
+        @Validation.Required
+        String getHumanSourceTable();
+        void setHumanSourceTable(String value);
 
         @Description("Output BigQuery table for field-level comparison results. "
                 + "Format: project:dataset.table")
@@ -145,23 +150,41 @@ public class ImageComparisonPipeline {
      */
     public static void buildPipeline(Pipeline pipeline, Options options) {
 
-        // ── 1. Read source table (filtered to processing window) ──────────────
-        LOG.info("Reading source table: {} for window [{}, {})",
-                options.getSourceTable(), options.getWindowStart(), options.getWindowEnd());
-        String sourceQuery = String.format(
+        // ── 1. Read AI and human source tables separately, then flatten ──────
+        LOG.info("Reading AI source table: {} for window [{}, {})",
+                options.getAiSourceTable(), options.getWindowStart(), options.getWindowEnd());
+        String aiQuery = String.format(
                 "SELECT * FROM `%s`"
                         + " WHERE created_at >= '%s' AND created_at < '%s'"
-                        + " AND method IN ('%s', '%s')",
-                options.getSourceTable().replace(':', '.'),
+                        + " AND method = '%s'",
+                options.getAiSourceTable().replace(':', '.'),
                 options.getWindowStart(),
                 options.getWindowEnd(),
-                options.getAiMethod(),
-                options.getHumanMethod());
-        PCollection<TableRow> rawRows = pipeline.apply(
-                "ReadSourcePayloads",
+                options.getAiMethod());
+        PCollection<TableRow> aiRows = pipeline.apply(
+                "ReadAiPayloads",
                 BigQueryIO.readTableRows()
-                        .fromQuery(sourceQuery)
+                        .fromQuery(aiQuery)
                         .usingStandardSql());
+
+        LOG.info("Reading human source table: {} for window [{}, {})",
+                options.getHumanSourceTable(), options.getWindowStart(), options.getWindowEnd());
+        String humanQuery = String.format(
+                "SELECT * FROM `%s`"
+                        + " WHERE created_at >= '%s' AND created_at < '%s'"
+                        + " AND method = '%s'",
+                options.getHumanSourceTable().replace(':', '.'),
+                options.getWindowStart(),
+                options.getWindowEnd(),
+                options.getHumanMethod());
+        PCollection<TableRow> humanRows = pipeline.apply(
+                "ReadHumanPayloads",
+                BigQueryIO.readTableRows()
+                        .fromQuery(humanQuery)
+                        .usingStandardSql());
+
+        PCollection<TableRow> rawRows = PCollectionList.of(aiRows).and(humanRows)
+                .apply("FlattenSourcePayloads", Flatten.pCollections());
 
         // ── 2. Read pending table with partition filter (last MAX_WAIT_DAYS only) ─
         // Partitioned on DATE(first_seen_at) — filter eliminates partitions older

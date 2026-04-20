@@ -5,40 +5,53 @@
     <mxCell id="1" parent="0" />
 
     <!-- ── BigQuery Source Tables ─────────────────────────────────────── -->
-    <mxCell id="10" value="image_payloads&#xa;(BigQuery)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=11;" vertex="1" parent="1">
-      <mxGeometry x="120" y="40" width="180" height="70" as="geometry" />
+    <mxCell id="10" value="ai_dataset.ai_payloads&#xa;(BigQuery)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="40" y="40" width="180" height="70" as="geometry" />
+    </mxCell>
+
+    <mxCell id="12" value="human_dataset.human_payloads&#xa;(BigQuery)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+      <mxGeometry x="280" y="40" width="200" height="70" as="geometry" />
     </mxCell>
 
     <mxCell id="11" value="pending_comparisons&#xa;(BigQuery — input)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=10;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=11;" vertex="1" parent="1">
-      <mxGeometry x="600" y="40" width="200" height="70" as="geometry" />
+      <mxGeometry x="660" y="40" width="200" height="70" as="geometry" />
     </mxCell>
 
     <!-- ── Read Steps ─────────────────────────────────────────────────── -->
-    <mxCell id="20" value="ReadSourcePayloads&#xa;WHERE created_at IN [windowStart, windowEnd)&#xa;AND method IN (aiMethod, humanMethod)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=10;" vertex="1" parent="1">
-      <mxGeometry x="60" y="170" width="300" height="60" as="geometry" />
+    <mxCell id="20" value="ReadAiPayloads&#xa;WHERE created_at IN [windowStart, windowEnd)&#xa;AND method = aiMethod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="20" y="170" width="220" height="60" as="geometry" />
+    </mxCell>
+
+    <mxCell id="22" value="ReadHumanPayloads&#xa;WHERE created_at IN [windowStart, windowEnd)&#xa;AND method = humanMethod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="260" y="170" width="220" height="60" as="geometry" />
     </mxCell>
 
     <mxCell id="21" value="ReadPendingTable&#xa;WHERE first_seen_at &gt;= NOW() - 7 days&#xa;(partition filter — no full table scan)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=10;" vertex="1" parent="1">
-      <mxGeometry x="560" y="170" width="300" height="60" as="geometry" />
+      <mxGeometry x="620" y="170" width="300" height="60" as="geometry" />
+    </mxCell>
+
+    <!-- ── Flatten ───────────────────────────────────────────────────── -->
+    <mxCell id="23" value="FlattenSourcePayloads&#xa;union AI and human rows into one PCollection" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=10;" vertex="1" parent="1">
+      <mxGeometry x="100" y="290" width="320" height="50" as="geometry" />
     </mxCell>
 
     <!-- ── Keying Steps ───────────────────────────────────────────────── -->
     <mxCell id="30" value="KeySourceById&#xa;decrypt(key_id, payload)&#xa;→ extract image_name as group key" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=10;" vertex="1" parent="1">
-      <mxGeometry x="60" y="290" width="300" height="60" as="geometry" />
+      <mxGeometry x="100" y="390" width="320" height="60" as="geometry" />
     </mxCell>
 
     <mxCell id="31" value="KeyPendingById&#xa;read image_id column directly&#xa;(no decryption needed)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=10;" vertex="1" parent="1">
-      <mxGeometry x="560" y="290" width="300" height="60" as="geometry" />
+      <mxGeometry x="620" y="390" width="300" height="60" as="geometry" />
     </mxCell>
 
     <!-- ── CoGroupByKey ───────────────────────────────────────────────── -->
     <mxCell id="40" value="CoGroupByKey&#xa;on image_name" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=11;" vertex="1" parent="1">
-      <mxGeometry x="310" y="410" width="300" height="60" as="geometry" />
+      <mxGeometry x="310" y="510" width="300" height="60" as="geometry" />
     </mxCell>
 
     <!-- ── FilterAndPairFn ────────────────────────────────────────────── -->
     <mxCell id="50" value="FilterAndPairFn&#xa;classify rows by method → human / ai&#xa;restore pending row if present&#xa;check days waited vs MAX_WAIT_DAYS (7)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=10;verticalAlign=middle;" vertex="1" parent="1">
-      <mxGeometry x="260" y="530" width="400" height="100" as="geometry" />
+      <mxGeometry x="260" y="630" width="400" height="100" as="geometry" />
     </mxCell>
 
     <!-- ── Routing Outcomes ──────────────────────────────────────────── -->
@@ -84,10 +97,19 @@
     <mxCell id="100" edge="1" source="10" target="20" parent="1">
       <mxGeometry relative="1" as="geometry" />
     </mxCell>
+    <mxCell id="116" edge="1" source="12" target="22" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="117" edge="1" source="20" target="23" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+    <mxCell id="118" edge="1" source="22" target="23" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
     <mxCell id="101" edge="1" source="11" target="21" parent="1">
       <mxGeometry relative="1" as="geometry" />
     </mxCell>
-    <mxCell id="102" edge="1" source="20" target="30" parent="1">
+    <mxCell id="102" edge="1" source="23" target="30" parent="1">
       <mxGeometry relative="1" as="geometry" />
     </mxCell>
     <mxCell id="103" edge="1" source="21" target="31" parent="1">

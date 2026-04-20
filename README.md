@@ -11,32 +11,40 @@ Apache Beam / Google Cloud Dataflow batch pipeline that:
 
 ## Architecture
 
-```
-image_payloads (BQ)
-        │
-        ▼
- [ReadSourcePayloads]
-        │
-        ├──────────────────────────────────────┐
-        ▼                                      ▼
-[MapToPayloadRow]                   [ReadPendingTable]
-        │                                      │
-        ▼                                      ▼
-[KeyByImageId → GroupByKey]          [View.asMap (side input)]
-        │                                      │
-        └──────────────┬───────────────────────┘
-                       ▼
-              [FilterAndPairFn]
-             /         |         \
-            ▼          ▼          ▼
-         MATCHED   NEW_PENDING  AGED_OUT
-            │          │            │
-            ▼          ▼            ▼
-  [FlattenAndCompare] [WritePending] [WriteDeadLetter]
-            │         (TRUNCATE)     (APPEND)
-            ▼
-  [WriteComparisonResults]
-         (APPEND)
+```mermaid
+flowchart TD
+    SRC[(image_payloads\nBigQuery)]
+    PND[(pending_comparisons\nBigQuery)]
+
+    SRC -->|"SELECT * WHERE created_at IN windowStart, windowEnd\nAND method IN aiMethod, humanMethod"| READ_SRC[ReadSourcePayloads]
+    PND -->|"SELECT * WHERE first_seen_at >= NOW() minus 7 days"| READ_PND[ReadPendingTable]
+
+    READ_SRC --> KEY_SRC["KeySourceById\ndecrypt payload using key_id\nextract image_name as group key"]
+    READ_PND --> KEY_PND["KeyPendingById\nread image_id column directly\nno decryption needed"]
+
+    KEY_SRC --> COGBK[CoGroupByKey\non image_name]
+    KEY_PND --> COGBK
+
+    COGBK --> FILTER["FilterAndPairFn\nclassify rows by method → human or ai\nrestore pending row if present\ncheck days waited vs MAX_WAIT_DAYS"]
+
+    FILTER -->|"human present AND ai present"| MATCHED["MATCHED\nKV of imageId and iteration\nwith human and ai GenericRecord"]
+    FILTER -->|"one side missing\ndays waited less than 7"| NEW_PENDING[NEW_PENDING\nGenericRecord]
+    FILTER -->|"one side missing\ndays waited 7 or more"| AGED_OUT[AGED_OUT\nGenericRecord]
+
+    MATCHED --> COMPARE["FlattenAndCompareFn\ndecrypt both payloads using key_id\nflatten JSON to dot-notation field paths\nsort arrays for order-insensitive compare\ncompute is_match on plaintext\nre-encrypt human_value and ai_value\nemit one TableRow per field"]
+
+    COMPARE --> OUT[(image_comparison_results\nWRITE_APPEND)]
+    NEW_PENDING --> MAP_PND[MapPendingToTableRow]
+    MAP_PND --> PND_OUT[(pending_comparisons\nWRITE_TRUNCATE)]
+    AGED_OUT --> MAP_DL[MapAgedOutToTableRow]
+    MAP_DL --> DL_OUT[(dead_letter_comparisons\nWRITE_APPEND)]
+
+    style MATCHED fill:#d4edda,stroke:#28a745
+    style NEW_PENDING fill:#fff3cd,stroke:#ffc107
+    style AGED_OUT fill:#f8d7da,stroke:#dc3545
+    style OUT fill:#cce5ff,stroke:#004085
+    style PND_OUT fill:#fff3cd,stroke:#ffc107
+    style DL_OUT fill:#f8d7da,stroke:#dc3545
 ```
 
 ### State matrix (per image_id per run)
@@ -76,17 +84,20 @@ image-comparison-pipeline/
     ├── main/
     │   ├── java/com/yourorg/pipeline/
     │   │   ├── ImageComparisonPipeline.java     ← entry point + pipeline graph
-    │   │   ├── model/
-    │   │   │   ├── PayloadRow.java              ← source row POJO
-    │   │   │   ├── PendingRow.java              ← pending state POJO
-    │   │   │   └── ComparisonResult.java        ← output row POJO
     │   │   ├── transforms/
     │   │   │   ├── FilterAndPairFn.java         ← eligibility + pairing DoFn
     │   │   │   └── FlattenAndCompareFn.java     ← JSON flatten + compare DoFn
     │   │   └── util/
+    │   │       ├── AvroSchemas.java             ← loads Avro schemas from classpath
+    │   │       ├── BarricadeEncryptionUtil.java ← encrypt/decrypt stub (wire up Barricade client)
     │   │       ├── JsonFieldExtractor.java      ← recursive JSON flattener
-    │   │       └── SchemaUtil.java              ← BigQuery TableSchema definitions
+    │   │       └── SchemaUtil.java              ← derives BigQuery TableSchema from Avro schema
     │   └── resources/
+    │       ├── avro/
+    │       │   ├── payload_row.json             ← Avro schema for source payload records
+    │       │   ├── pending_row.json             ← Avro schema for pending state records
+    │       │   ├── comparison_result.json       ← Avro schema for comparison output rows
+    │       │   └── dead_letter_row.json         ← Avro schema for dead-letter rows
     │       └── bigquery_ddl.sql                 ← DDL for all 4 tables
     └── test/
         └── java/com/yourorg/pipeline/
