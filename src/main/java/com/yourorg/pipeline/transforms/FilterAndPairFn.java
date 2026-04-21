@@ -14,16 +14,34 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Core eligibility and pairing transform.
  *
+ * <p>One human payload is matched against every AI iteration for the same
+ * {@code image_name}. Each AI iteration produces an independent MATCHED pair
+ * and therefore an independent set of comparison rows in the output table.
+ *
+ * <p>Pairing rules (per {@code image_name} per run):
+ * <ul>
+ *   <li><b>Human + N AI iterations present</b> → emit N MATCHED pairs, one per AI
+ *       iteration (sorted by {@code created_at}; iteration number = sort position).</li>
+ *   <li><b>Human only</b> → pend human; wait for AI iterations.</li>
+ *   <li><b>AI iterations only</b> → pend each AI iteration independently;
+ *       wait for human.</li>
+ *   <li><b>Pending row(s) aged out (≥ MAX_WAIT_DAYS)</b> → route to dead-letter.</li>
+ * </ul>
+ *
+ * <p>Multiple pending AI rows per image are supported. Each carries its own
+ * {@code first_seen_at} and {@code retry_count}. Aging is evaluated per iteration.
+ *
  * <p>Source payloads are Barricade-encrypted. {@code image_name} is already the
- * CoGroupByKey grouping key (extracted once upstream). This transform stores the
- * encrypted payload and {@code key_id} in the {@link GenericRecord}; decryption
- * of field values happens in {@link FlattenAndCompareFn}.
+ * CoGroupByKey grouping key (extracted once upstream). Encrypted payloads are stored
+ * as-is in {@link GenericRecord}; decryption happens in {@link FlattenAndCompareFn}.
  */
 public class FilterAndPairFn
         extends DoFn<KV<String, CoGbkResult>,
@@ -86,67 +104,98 @@ public class FilterAndPairFn
             }
         }
 
-        // ── Restore pending row if present (at most one per image) ───────────
-        GenericRecord pending = null;
-        Iterator<TableRow> pendingIter = result.getAll(PENDING_TAG).iterator();
-        if (pendingIter.hasNext()) {
-            pending = toPendingRecord(pendingIter.next());
+        if (humanRows.size() > 1) {
+            LOG.warn("imageId={} has {} human rows — using the earliest by created_at",
+                    imageId, humanRows.size());
+            humanRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
         }
 
-        if (pending != null) {
-            String pendingType = str(pending.get("pending_type"));
-            String pendingKeyId = str(pending.get("key_id"));
+        // ── Restore pending rows ──────────────────────────────────────────────
+        // Key: "type:created_at" → original pending GenericRecord
+        // Used to carry forward first_seen_at and retry_count per iteration.
+        Map<String, GenericRecord> pendingMeta = new HashMap<>();
+
+        for (TableRow pendingRow : result.getAll(PENDING_TAG)) {
+            GenericRecord p     = toPendingRecord(pendingRow);
+            String pendingType  = str(p.get("pending_type"));
+            String pendingKeyId = str(p.get("key_id"));
+            String createdAt    = str(p.get("created_at"));
+
+            pendingMeta.put(pendingType + ":" + createdAt, p);
+
             if ("human".equals(pendingType) && humanRows.isEmpty()) {
                 humanRows.add(newPayloadRow(imageId, pendingKeyId, "human",
-                        str(pending.get("payload")), str(pending.get("created_at"))));
+                        str(p.get("payload")), createdAt));
                 LOG.debug("Restored pending human payload for imageId={}", imageId);
-            } else if ("ai".equals(pendingType) && aiRows.isEmpty()) {
+            } else if ("ai".equals(pendingType)) {
+                // Always restore every pending AI iteration — each is independent.
                 aiRows.add(newPayloadRow(imageId, pendingKeyId, "ai",
-                        str(pending.get("payload")), str(pending.get("created_at"))));
-                LOG.debug("Restored pending AI payload for imageId={}", imageId);
+                        str(p.get("payload")), createdAt));
+                LOG.debug("Restored pending AI iteration (created_at={}) for imageId={}",
+                        createdAt, imageId);
             }
         }
 
-        boolean humanPresent = humanRows.size() == 1;
-        boolean aiPresent    = aiRows.size() == 1;
+        Instant now          = Instant.now();
+        boolean humanPresent = !humanRows.isEmpty();
+        boolean anyAiPresent = !aiRows.isEmpty();
 
-        Instant now         = Instant.now();
-        String firstSeenStr = pending != null ? str(pending.get("first_seen_at")) : null;
-        Instant firstSeen   = firstSeenStr != null ? parseInstant(firstSeenStr) : now;
-        if (firstSeen == null) firstSeen = now;
-        long daysWaited = ChronoUnit.DAYS.between(firstSeen, now);
-        long retryCount = pending != null
-                ? ((Number) pending.get("retry_count")).longValue() + 1 : 0L;
-
-        if (humanPresent && aiPresent) {
-            // ── State 1: both present → compare ─────────────────────────────
-            String pairKey = imageId + "::1";
-            ctx.output(MATCHED, KV.of(pairKey, KV.of(humanRows.get(0), aiRows.get(0))));
-            LOG.info("Matched imageId={} — emitting for comparison", imageId);
+        if (humanPresent && anyAiPresent) {
+            // ── State 1: human + N AI iterations → emit one MATCHED per AI ──
+            // Sort AI rows by created_at so iteration numbers are stable across runs.
+            aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
+            GenericRecord human = humanRows.get(0);
+            for (int i = 0; i < aiRows.size(); i++) {
+                String pairKey = imageId + "::" + (i + 1);
+                ctx.output(MATCHED, KV.of(pairKey, KV.of(human, aiRows.get(i))));
+            }
+            LOG.info("Matched imageId={} — {} AI iteration(s) emitted for comparison",
+                    imageId, aiRows.size());
 
         } else if (humanPresent) {
-            // ── State 2: human arrived, AI missing ──────────────────────────
-            GenericRecord human = humanRows.get(0);
+            // ── State 2: human present, no AI yet → pend human ──────────────
+            GenericRecord human     = humanRows.get(0);
+            String        createdAt = str(human.get("created_at"));
+            GenericRecord meta      = pendingMeta.get("human:" + createdAt);
+            Instant firstSeen       = metaFirstSeen(meta, now);
+            long retryCount         = metaRetryCount(meta);
+            long daysWaited         = ChronoUnit.DAYS.between(firstSeen, now);
             LOG.info("Human-only imageId={} — pending AI (days waited={})", imageId, daysWaited);
             emitPendingOrAgedOut(ctx, imageId, str(human.get("key_id")), "human",
-                    str(human.get("payload")), str(human.get("created_at")),
+                    str(human.get("payload")), createdAt,
                     firstSeen, now, retryCount, daysWaited);
 
-        } else if (aiPresent) {
-            // ── State 3: AI arrived, human missing ──────────────────────────
-            GenericRecord ai = aiRows.get(0);
-            LOG.info("AI-only imageId={} — pending human (days waited={})", imageId, daysWaited);
-            emitPendingOrAgedOut(ctx, imageId, str(ai.get("key_id")), "ai",
-                    str(ai.get("payload")), str(ai.get("created_at")),
-                    firstSeen, now, retryCount, daysWaited);
+        } else if (anyAiPresent) {
+            // ── State 3: one or more AI iterations, no human → pend each ────
+            aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
+            for (GenericRecord ai : aiRows) {
+                String        createdAt = str(ai.get("created_at"));
+                GenericRecord meta      = pendingMeta.get("ai:" + createdAt);
+                Instant firstSeen       = metaFirstSeen(meta, now);
+                long retryCount         = metaRetryCount(meta);
+                long daysWaited         = ChronoUnit.DAYS.between(firstSeen, now);
+                LOG.info("AI-only imageId={} (created_at={}) — pending human (days waited={})",
+                        imageId, createdAt, daysWaited);
+                emitPendingOrAgedOut(ctx, imageId, str(ai.get("key_id")), "ai",
+                        str(ai.get("payload")), createdAt,
+                        firstSeen, now, retryCount, daysWaited);
+            }
 
-        } else if (pending != null && daysWaited >= MAX_WAIT_DAYS) {
-            // ── State 4: neither present, pending row aged out ───────────────
-            LOG.warn("imageId={} aged out after {} days — routing to dead-letter", imageId, daysWaited);
-            ctx.output(AGED_OUT, newPendingRow(imageId,
-                    str(pending.get("key_id")), str(pending.get("pending_type")),
-                    str(pending.get("payload")), str(pending.get("created_at")),
-                    firstSeen, now, retryCount));
+        } else if (!pendingMeta.isEmpty()) {
+            // ── State 4: no source rows, pending rows exist but unrestorable ─
+            // (e.g. duplicate human rows discarded above). Age out if stale.
+            for (GenericRecord p : pendingMeta.values()) {
+                Instant firstSeen = metaFirstSeen(p, now);
+                long daysWaited   = ChronoUnit.DAYS.between(firstSeen, now);
+                if (daysWaited >= MAX_WAIT_DAYS) {
+                    LOG.warn("imageId={} pending row (type={}) aged out after {} days — dead-letter",
+                            imageId, str(p.get("pending_type")), daysWaited);
+                    ctx.output(AGED_OUT, newPendingRow(imageId,
+                            str(p.get("key_id")), str(p.get("pending_type")),
+                            str(p.get("payload")), str(p.get("created_at")),
+                            firstSeen, now, metaRetryCount(p)));
+                }
+            }
         }
     }
 
@@ -164,6 +213,20 @@ public class FilterAndPairFn
         } else {
             ctx.output(NEW_PENDING, row);
         }
+    }
+
+    /** Returns {@code first_seen_at} from a pending meta record, or {@code fallback} if absent. */
+    private static Instant metaFirstSeen(GenericRecord meta, Instant fallback) {
+        if (meta == null) return fallback;
+        Instant parsed = parseInstant(str(meta.get("first_seen_at")));
+        return parsed != null ? parsed : fallback;
+    }
+
+    /** Returns {@code retry_count + 1} from a pending meta record, or 0 for a new row. */
+    private static long metaRetryCount(GenericRecord meta) {
+        if (meta == null) return 0L;
+        Object count = meta.get("retry_count");
+        return count != null ? ((Number) count).longValue() + 1 : 0L;
     }
 
     private static GenericRecord newPayloadRow(String imageId, String keyId,

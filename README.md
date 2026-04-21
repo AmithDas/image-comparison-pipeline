@@ -47,17 +47,21 @@ flowchart TD
     style DL_OUT fill:#f8d7da,stroke:#dc3545
 ```
 
-### State matrix (per image_id per run)
+### State matrix (per image_name per run)
 
-| Human in source | AI in source | Action |
+One human payload is matched independently against **every** AI iteration for the same `image_name`. Each match produces its own set of field-level comparison rows.
+
+| Human | AI iterations | Action |
 |---|---|---|
-| ✅ Present | ✅ Present | Compare → write results |
-| ✅ Present | ❌ Absent | Pend human payload → retry next run |
-| ❌ Absent | ✅ Present | Pend AI payload → retry next run |
-| ❌ Absent | ❌ Absent | Keep existing pending row (or skip) |
-| Either side | Pending aged > 7 days | Move to dead-letter |
+| ✅ Present | N iterations present | Emit N MATCHED pairs (one per iteration) |
+| ✅ Present | ❌ None | Pend human → wait for AI |
+| ❌ Absent | N iterations present | Pend each AI iteration independently → wait for human |
+| ❌ Absent | ❌ None | Existing pending rows kept; aged-out rows → dead-letter |
 
-The pending table uses `WRITE_TRUNCATE` on every run — resolved images automatically disappear without any explicit delete.
+- AI iterations are sorted by `created_at` to assign stable iteration numbers.
+- Each pending AI iteration tracks its own `first_seen_at` and `retry_count`.
+- A pending AI iteration is aged out individually after `MAX_WAIT_DAYS` (default 7).
+- The pending table uses `WRITE_TRUNCATE` on every run — resolved images disappear automatically.
 
 ---
 
