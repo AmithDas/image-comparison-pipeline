@@ -29,10 +29,12 @@ import java.util.Map;
  * <p>Pairing rules (per {@code image_name} per run):
  * <ul>
  *   <li><b>Human + N AI iterations present</b> → emit N MATCHED pairs, one per AI
- *       iteration (sorted by {@code created_at}; iteration number = sort position).</li>
+ *       iteration (sorted by {@code created_at}; iteration number = sort position).
+ *       Human is re-pended so late-arriving AI iterations in future runs can still
+ *       match against it.</li>
  *   <li><b>Human only</b> → pend human; wait for AI iterations.</li>
- *   <li><b>AI iterations only</b> → pend each AI iteration independently;
- *       wait for human.</li>
+ *   <li><b>AI iterations only</b> → restored pending human (if present) is matched;
+ *       otherwise pend each AI iteration independently and wait for human.</li>
  *   <li><b>Pending row(s) aged out (≥ MAX_WAIT_DAYS)</b> → route to dead-letter.</li>
  * </ul>
  *
@@ -140,10 +142,11 @@ public class FilterAndPairFn
         boolean humanPresent = !humanRows.isEmpty();
         boolean anyAiPresent = !aiRows.isEmpty();
 
+        // Sort AI rows by created_at for stable iteration numbering across all states.
+        aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
+
         if (humanPresent && anyAiPresent) {
             // ── State 1: human + N AI iterations → emit one MATCHED per AI ──
-            // Sort AI rows by created_at so iteration numbers are stable across runs.
-            aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
             GenericRecord human = humanRows.get(0);
             for (int i = 0; i < aiRows.size(); i++) {
                 String pairKey = imageId + "::" + (i + 1);
@@ -151,6 +154,17 @@ public class FilterAndPairFn
             }
             LOG.info("Matched imageId={} — {} AI iteration(s) emitted for comparison",
                     imageId, aiRows.size());
+
+            // Keep human in pending so late-arriving AI iterations in future runs
+            // can still be matched against it (up to MAX_WAIT_DAYS).
+            String        humanCreatedAt = str(human.get("created_at"));
+            GenericRecord humanMeta      = pendingMeta.get("human:" + humanCreatedAt);
+            Instant       firstSeen      = metaFirstSeen(humanMeta, now);
+            long          retryCount     = metaRetryCount(humanMeta);
+            long          daysWaited     = ChronoUnit.DAYS.between(firstSeen, now);
+            emitPendingOrAgedOut(ctx, imageId, str(human.get("key_id")), "human",
+                    str(human.get("payload")), humanCreatedAt,
+                    firstSeen, now, retryCount, daysWaited);
 
         } else if (humanPresent) {
             // ── State 2: human present, no AI yet → pend human ──────────────
@@ -167,8 +181,8 @@ public class FilterAndPairFn
 
         } else if (anyAiPresent) {
             // ── State 3: one or more AI iterations, no human → pend each ────
-            aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
-            for (GenericRecord ai : aiRows) {
+            for (int i = 0; i < aiRows.size(); i++) {
+                GenericRecord ai        = aiRows.get(i);
                 String        createdAt = str(ai.get("created_at"));
                 GenericRecord meta      = pendingMeta.get("ai:" + createdAt);
                 Instant firstSeen       = metaFirstSeen(meta, now);
