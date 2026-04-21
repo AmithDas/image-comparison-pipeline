@@ -130,6 +130,16 @@ public class ImageComparisonPipeline {
                 + "Omit to sort by full element JSON string.")
         String getArraySortKeys();
         void setArraySortKeys(String value);
+
+        @Description("Dot-notation JSON field name inside the decrypted human payload to filter on. "
+                + "Only human rows where this field equals --humanFilterValue are processed. "
+                + "Omit to skip filtering.")
+        String getHumanFilterField();
+        void setHumanFilterField(String value);
+
+        @Description("Expected value for --humanFilterField. Required when --humanFilterField is set.")
+        String getHumanFilterValue();
+        void setHumanFilterValue(String value);
     }
 
     // ── Entry point ───────────────────────────────────────────────────────────
@@ -150,7 +160,7 @@ public class ImageComparisonPipeline {
      */
     public static void buildPipeline(Pipeline pipeline, Options options) {
 
-        // ── 1. Read AI and human source tables separately, then flatten ──────
+        // ── 1. Read AI and human source tables separately ────────────────────
         LOG.info("Reading AI source table: {} for window [{}, {})",
                 options.getAiSourceTable(), options.getWindowStart(), options.getWindowEnd());
         String aiQuery = String.format(
@@ -183,9 +193,6 @@ public class ImageComparisonPipeline {
                         .fromQuery(humanQuery)
                         .usingStandardSql());
 
-        PCollection<TableRow> rawRows = PCollectionList.of(aiRows).and(humanRows)
-                .apply("FlattenSourcePayloads", Flatten.pCollections());
-
         // ── 2. Read pending table with partition filter (last MAX_WAIT_DAYS only) ─
         // Partitioned on DATE(first_seen_at) — filter eliminates partitions older
         // than the eviction window, avoiding a full table scan as the table grows.
@@ -205,9 +212,9 @@ public class ImageComparisonPipeline {
                         WithKeys.of((TableRow row) -> (String) row.get("image_id"))
                                 .withKeyType(TypeDescriptors.strings()));
 
-        // ── 3. Key source rows by image_name extracted from decrypted payload ──
-        PCollection<KV<String, TableRow>> keyedSource = rawRows
-                .apply("KeySourceById",
+        // ── 3. Key AI rows by image_name (decrypt → extract) ─────────────────
+        PCollection<KV<String, TableRow>> keyedAi = aiRows
+                .apply("KeyAiById",
                         WithKeys.of((TableRow row) -> {
                             String keyId     = (String) row.get("key_id");
                             String decrypted = BarricadeEncryptionUtil.decrypt(
@@ -216,14 +223,51 @@ public class ImageComparisonPipeline {
                         })
                                 .withKeyType(TypeDescriptors.strings()));
 
-        // ── 4. Co-group source + pending by image name ────────────────────────
+        // ── 4. Filter human rows by payload field, then key by image_name ─────
+        // Filtering and keying share the same single decrypt call per row.
+        final String humanFilterField = options.getHumanFilterField();
+        final String humanFilterValue = options.getHumanFilterValue();
+
+        PCollection<KV<String, TableRow>> keyedHuman = humanRows
+                .apply("FilterAndKeyHumanById",
+                        ParDo.of(new DoFn<TableRow, KV<String, TableRow>>() {
+                            @ProcessElement
+                            public void processElement(ProcessContext ctx) {
+                                TableRow row      = ctx.element();
+                                String   keyId    = (String) row.get("key_id");
+                                String decrypted  = BarricadeEncryptionUtil.decrypt(
+                                        keyId, (String) row.get("payload"));
+
+                                // Apply optional payload field filter
+                                if (humanFilterField != null && !humanFilterField.isBlank()) {
+                                    String actual = JsonFieldExtractor.extractField(
+                                            decrypted, humanFilterField);
+                                    if (!humanFilterValue.equals(actual)) {
+                                        LOG.debug("Skipping human row: payload.{} = '{}', expected '{}'",
+                                                humanFilterField, actual, humanFilterValue);
+                                        return;
+                                    }
+                                }
+
+                                String imageName = JsonFieldExtractor.extractField(
+                                        decrypted, "image_name");
+                                ctx.output(KV.of(imageName, row));
+                            }
+                        }));
+
+        // ── 5. Merge keyed AI + filtered human into one source PCollection ────
+        PCollection<KV<String, TableRow>> keyedSource =
+                PCollectionList.of(keyedAi).and(keyedHuman)
+                        .apply("FlattenKeyedSource", Flatten.pCollections());
+
+        // ── 6. Co-group source + pending by image name ────────────────────────
         PCollection<KV<String, CoGbkResult>> coGrouped =
                 KeyedPCollectionTuple
                         .of(FilterAndPairFn.SOURCE_TAG, keyedSource)
                         .and(FilterAndPairFn.PENDING_TAG, keyedPending)
                         .apply("CoGroupByImageId", CoGroupByKey.create());
 
-        // ── 5. Filter & pair ──────────────────────────────────────────────────
+        // ── 7. Filter & pair ──────────────────────────────────────────────────
         PCollectionTuple routed = coGrouped.apply(
                 "FilterAndPair",
                 ParDo.of(new FilterAndPairFn(options.getAiMethod(), options.getHumanMethod()))
