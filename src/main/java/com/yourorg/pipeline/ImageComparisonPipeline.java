@@ -1,11 +1,11 @@
 package com.yourorg.pipeline;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.transforms.FilterAndKeyHumanByIdFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
+import com.yourorg.pipeline.transforms.KeyAiByIdFn;
 import com.yourorg.pipeline.util.AvroSchemas;
-import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
-import com.yourorg.pipeline.util.JsonFieldExtractor;
 import com.yourorg.pipeline.util.SchemaUtil;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.Pipeline;
@@ -131,6 +131,13 @@ public class ImageComparisonPipeline {
         String getArraySortKeys();
         void setArraySortKeys(String value);
 
+        @Description("Dot-notation path to the image identifier field inside the decrypted payload, "
+                + "e.g. 'metadata.image_name' or 'header.imageId'. "
+                + "Rows where this field is absent or null are skipped.")
+        @Validation.Required
+        String getImageNameField();
+        void setImageNameField(String value);
+
         @Description("Dot-notation JSON field name inside the decrypted human payload to filter on. "
                 + "Only human rows where this field equals --humanFilterValue are processed. "
                 + "Omit to skip filtering.")
@@ -140,6 +147,19 @@ public class ImageComparisonPipeline {
         @Description("Expected value for --humanFilterField. Required when --humanFilterField is set.")
         String getHumanFilterValue();
         void setHumanFilterValue(String value);
+
+        @Description("Firestore collection name that stores wrapped DEKs. "
+                + "Each document ID is a key_id; the document must contain a "
+                + "'wrapped_dek' field with the base64-encoded KMS-wrapped DEK.")
+        @Validation.Required
+        String getFirestoreCollection();
+        void setFirestoreCollection(String value);
+
+        @Description("Full Cloud KMS CryptoKey resource path used to unwrap DEKs. "
+                + "Format: projects/P/locations/L/keyRings/R/cryptoKeys/K")
+        @Validation.Required
+        String getKmsKeyPath();
+        void setKmsKeyPath(String value);
     }
 
     // ── Entry point ───────────────────────────────────────────────────────────
@@ -212,48 +232,24 @@ public class ImageComparisonPipeline {
                         WithKeys.of((TableRow row) -> (String) row.get("image_id"))
                                 .withKeyType(TypeDescriptors.strings()));
 
-        // ── 3. Key AI rows by image_name (decrypt → extract) ─────────────────
+        // ── 3. Key AI rows by image name (decrypt → extract) ──────────────────
         PCollection<KV<String, TableRow>> keyedAi = aiRows
                 .apply("KeyAiById",
-                        WithKeys.of((TableRow row) -> {
-                            String keyId     = (String) row.get("key_id");
-                            String decrypted = BarricadeEncryptionUtil.decrypt(
-                                    keyId, (String) row.get("payload"));
-                            return JsonFieldExtractor.extractField(decrypted, "image_name");
-                        })
-                                .withKeyType(TypeDescriptors.strings()));
+                        ParDo.of(new KeyAiByIdFn(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath(),
+                                options.getImageNameField())));
 
-        // ── 4. Filter human rows by payload field, then key by image_name ─────
+        // ── 4. Filter human rows by payload field, then key by image name ──────
         // Filtering and keying share the same single decrypt call per row.
-        final String humanFilterField = options.getHumanFilterField();
-        final String humanFilterValue = options.getHumanFilterValue();
-
         PCollection<KV<String, TableRow>> keyedHuman = humanRows
                 .apply("FilterAndKeyHumanById",
-                        ParDo.of(new DoFn<TableRow, KV<String, TableRow>>() {
-                            @ProcessElement
-                            public void processElement(ProcessContext ctx) {
-                                TableRow row      = ctx.element();
-                                String   keyId    = (String) row.get("key_id");
-                                String decrypted  = BarricadeEncryptionUtil.decrypt(
-                                        keyId, (String) row.get("payload"));
-
-                                // Apply optional payload field filter
-                                if (humanFilterField != null && !humanFilterField.isBlank()) {
-                                    String actual = JsonFieldExtractor.extractField(
-                                            decrypted, humanFilterField);
-                                    if (!humanFilterValue.equals(actual)) {
-                                        LOG.debug("Skipping human row: payload.{} = '{}', expected '{}'",
-                                                humanFilterField, actual, humanFilterValue);
-                                        return;
-                                    }
-                                }
-
-                                String imageName = JsonFieldExtractor.extractField(
-                                        decrypted, "image_name");
-                                ctx.output(KV.of(imageName, row));
-                            }
-                        }));
+                        ParDo.of(new FilterAndKeyHumanByIdFn(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath(),
+                                options.getImageNameField(),
+                                options.getHumanFilterField(),
+                                options.getHumanFilterValue())));
 
         // ── 5. Merge keyed AI + filtered human into one source PCollection ────
         PCollection<KV<String, TableRow>> keyedSource =
@@ -298,7 +294,9 @@ public class ImageComparisonPipeline {
         PCollection<TableRow> comparisonResults = matched
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
-                                parseArraySortKeys(options.getArraySortKeys()))));
+                                parseArraySortKeys(options.getArraySortKeys()),
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath())));
 
         // ── 7. Write comparison results ───────────────────────────────────────
         comparisonResults.apply(

@@ -31,9 +31,20 @@ public class FlattenAndCompareFn
     private static final Logger LOG = LoggerFactory.getLogger(FlattenAndCompareFn.class);
 
     private final Map<String, String> arraySortKeys;
+    private final String firestoreCollection;
+    private final String kmsKeyPath;
 
-    public FlattenAndCompareFn(Map<String, String> arraySortKeys) {
-        this.arraySortKeys = arraySortKeys;
+    public FlattenAndCompareFn(Map<String, String> arraySortKeys,
+                                String firestoreCollection,
+                                String kmsKeyPath) {
+        this.arraySortKeys       = arraySortKeys;
+        this.firestoreCollection = firestoreCollection;
+        this.kmsKeyPath          = kmsKeyPath;
+    }
+
+    @Setup
+    public void setup() {
+        BarricadeEncryptionUtil.configure(firestoreCollection, kmsKeyPath);
     }
 
     @ProcessElement

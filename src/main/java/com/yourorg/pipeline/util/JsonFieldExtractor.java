@@ -38,19 +38,35 @@ public final class JsonFieldExtractor {
     private JsonFieldExtractor() {}
 
     /**
-     * Extracts a single top-level string field from a JSON object.
-     * Returns null if the input is null, blank, malformed, or the field is absent.
+     * Extracts a single string field from a JSON object using a dot-notation path.
+     *
+     * <p>Examples:
+     * <pre>
+     *   extractField(json, "name")              → root "name" field
+     *   extractField(json, "metadata.imageName") → root.metadata.imageName
+     *   extractField(json, "a.b.c")              → root.a.b.c
+     * </pre>
+     *
+     * Returns {@code null} if the input is null/blank/malformed, any segment in the
+     * path is absent or not an object, or the final value is a JSON null.
      */
-    public static String extractField(String json, String fieldName) {
+    public static String extractField(String json, String fieldPath) {
         if (json == null || json.isBlank()) return null;
         try {
-            JsonElement root = JsonParser.parseString(json);
-            if (root.isJsonObject()) {
-                JsonElement el = root.getAsJsonObject().get(fieldName);
-                if (el != null && !el.isJsonNull()) return el.getAsString();
+            JsonElement current = JsonParser.parseString(json);
+            String[] segments = fieldPath.split("\\.");
+            for (int i = 0; i < segments.length; i++) {
+                if (!current.isJsonObject()) {
+                    LOG.warn("Path segment '{}' in '{}' does not resolve to a JSON object",
+                            segments[i], fieldPath);
+                    return null;
+                }
+                current = current.getAsJsonObject().get(segments[i]);
+                if (current == null || current.isJsonNull()) return null;
             }
+            return current.isJsonPrimitive() ? current.getAsString() : current.toString();
         } catch (Exception e) {
-            LOG.warn("Failed to extract field '{}' from JSON. Error: {}", fieldName, e.getMessage());
+            LOG.warn("Failed to extract field '{}' from JSON. Error: {}", fieldPath, e.getMessage());
         }
         return null;
     }
