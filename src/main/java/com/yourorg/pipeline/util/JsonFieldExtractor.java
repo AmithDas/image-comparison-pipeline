@@ -38,33 +38,84 @@ public final class JsonFieldExtractor {
     private JsonFieldExtractor() {}
 
     /**
-     * Extracts a single string field from a JSON object using a dot-notation path.
+     * Extracts a single string field from a JSON document using a dot-notation path
+     * with optional array indexing.
      *
-     * <p>Examples:
+     * <h3>Supported syntax</h3>
      * <pre>
-     *   extractField(json, "name")              → root "name" field
-     *   extractField(json, "metadata.imageName") → root.metadata.imageName
-     *   extractField(json, "a.b.c")              → root.a.b.c
+     *   "name"                       → root field "name"
+     *   "metadata.imageName"         → root.metadata.imageName
+     *   "queueImages[0].fileName"    → root.queueImages (array) → element 0 → fileName
+     *   "a.b[2].c"                   → root.a.b (array) → element 2 → c
      * </pre>
      *
-     * Returns {@code null} if the input is null/blank/malformed, any segment in the
-     * path is absent or not an object, or the final value is a JSON null.
+     * <ul>
+     *   <li>Segments are split on {@code .}.</li>
+     *   <li>A segment of the form {@code field[n]} navigates into the named field
+     *       (which must be a JSON array) and then selects the element at index {@code n}.</li>
+     * </ul>
+     *
+     * Returns {@code null} if the input is null/blank/malformed, any segment is absent
+     * or resolves to a JSON null, an array index is out of bounds, or a type mismatch
+     * occurs (e.g. expected object, found array).
      */
     public static String extractField(String json, String fieldPath) {
         if (json == null || json.isBlank()) return null;
         try {
             JsonElement current = JsonParser.parseString(json);
-            String[] segments = fieldPath.split("\\.");
-            for (int i = 0; i < segments.length; i++) {
-                if (!current.isJsonObject()) {
-                    LOG.warn("Path segment '{}' in '{}' does not resolve to a JSON object",
-                            segments[i], fieldPath);
-                    return null;
+
+            for (String segment : fieldPath.split("\\.")) {
+                int bracketOpen = segment.indexOf('[');
+                if (bracketOpen >= 0) {
+                    // Segment like "queueImages[0]" — object field then array index.
+                    int bracketClose = segment.indexOf(']', bracketOpen);
+                    if (bracketClose < 0) {
+                        LOG.warn("Malformed array index in segment '{}' of path '{}'",
+                                segment, fieldPath);
+                        return null;
+                    }
+                    String fieldName = segment.substring(0, bracketOpen);
+                    int    index     = Integer.parseInt(
+                            segment.substring(bracketOpen + 1, bracketClose));
+
+                    // Step into the named field.
+                    if (!current.isJsonObject()) {
+                        LOG.warn("Expected JSON object at '{}' in path '{}', found: {}",
+                                fieldName, fieldPath, current.getClass().getSimpleName());
+                        return null;
+                    }
+                    current = current.getAsJsonObject().get(fieldName);
+                    if (current == null || current.isJsonNull()) return null;
+
+                    // Step into the array at the given index.
+                    if (!current.isJsonArray()) {
+                        LOG.warn("Expected JSON array for '{}' in path '{}', found: {}",
+                                fieldName, fieldPath, current.getClass().getSimpleName());
+                        return null;
+                    }
+                    JsonArray arr = current.getAsJsonArray();
+                    if (index < 0 || index >= arr.size()) {
+                        LOG.warn("Array index {} out of bounds (size={}) in path '{}'",
+                                index, arr.size(), fieldPath);
+                        return null;
+                    }
+                    current = arr.get(index);
+                    if (current == null || current.isJsonNull()) return null;
+
+                } else {
+                    // Plain field navigation.
+                    if (!current.isJsonObject()) {
+                        LOG.warn("Expected JSON object at segment '{}' in path '{}', found: {}",
+                                segment, fieldPath, current.getClass().getSimpleName());
+                        return null;
+                    }
+                    current = current.getAsJsonObject().get(segment);
+                    if (current == null || current.isJsonNull()) return null;
                 }
-                current = current.getAsJsonObject().get(segments[i]);
-                if (current == null || current.isJsonNull()) return null;
             }
+
             return current.isJsonPrimitive() ? current.getAsString() : current.toString();
+
         } catch (Exception e) {
             LOG.warn("Failed to extract field '{}' from JSON. Error: {}", fieldPath, e.getMessage());
         }

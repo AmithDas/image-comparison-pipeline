@@ -15,6 +15,7 @@ import org.apache.beam.sdk.extensions.avro.coders.AvroCoder;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.CreateDisposition;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.WriteDisposition;
+import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
@@ -131,10 +132,10 @@ public class ImageComparisonPipeline {
         String getArraySortKeys();
         void setArraySortKeys(String value);
 
-        @Description("Dot-notation path to the image identifier field inside the decrypted payload, "
-                + "e.g. 'metadata.image_name' or 'header.imageId'. "
-                + "Rows where this field is absent or null are skipped.")
-        @Validation.Required
+        @Description("Dot-notation path to the image identifier field inside the decrypted payload. "
+                + "Supports nested fields and array indexing, e.g. 'queueImages[0].fileName' "
+                + "or 'metadata.imageId'. Rows where this field is absent or null are skipped.")
+        @Default.String("queueImages[0].fileName")
         String getImageNameField();
         void setImageNameField(String value);
 
