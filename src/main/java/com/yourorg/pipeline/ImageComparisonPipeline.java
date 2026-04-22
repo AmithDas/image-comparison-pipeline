@@ -1,10 +1,9 @@
 package com.yourorg.pipeline;
 
 import com.google.api.services.bigquery.model.TableRow;
-import com.yourorg.pipeline.transforms.FilterAndKeyHumanByIdFn;
+import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
-import com.yourorg.pipeline.transforms.KeyAiByIdFn;
 import com.yourorg.pipeline.util.AvroSchemas;
 import com.yourorg.pipeline.util.SchemaUtil;
 import org.apache.avro.generic.GenericRecord;
@@ -233,19 +232,19 @@ public class ImageComparisonPipeline {
                         WithKeys.of((TableRow row) -> (String) row.get("image_id"))
                                 .withKeyType(TypeDescriptors.strings()));
 
-        // ── 3. Key AI rows by image name (decrypt → extract) ──────────────────
+        // ── 3. Decrypt + key AI rows by image name ────────────────────────────
         PCollection<KV<String, TableRow>> keyedAi = aiRows
                 .apply("KeyAiById",
-                        ParDo.of(new KeyAiByIdFn(
+                        ParDo.of(DecryptAndKeyFn.forAi(
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath(),
                                 options.getImageNameField())));
 
-        // ── 4. Filter human rows by payload field, then key by image name ──────
+        // ── 4. Decrypt + filter + key human rows by image name ────────────────
         // Filtering and keying share the same single decrypt call per row.
         PCollection<KV<String, TableRow>> keyedHuman = humanRows
-                .apply("FilterAndKeyHumanById",
-                        ParDo.of(new FilterAndKeyHumanByIdFn(
+                .apply("KeyHumanById",
+                        ParDo.of(DecryptAndKeyFn.forHuman(
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath(),
                                 options.getImageNameField(),
