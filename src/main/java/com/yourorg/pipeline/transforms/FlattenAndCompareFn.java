@@ -4,6 +4,7 @@ import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.values.KV;
 import org.slf4j.Logger;
@@ -24,19 +25,24 @@ import java.util.TreeSet;
  * decrypts them using {@code key_id} from the human record before flattening.
  * {@code is_match} is computed on plaintext. {@code human_value} and {@code ai_value}
  * are re-encrypted with Barricade before writing to BigQuery.
+ *
+ * <h3>ValueProvider fields</h3>
+ * {@code firestoreCollection} and {@code kmsKeyPath} are {@link ValueProvider}s so
+ * they can be wired directly from pipeline options and resolved on each Dataflow
+ * worker in {@code @Setup}, before any {@code @ProcessElement} call.
  */
 public class FlattenAndCompareFn
         extends DoFn<KV<String, KV<GenericRecord, GenericRecord>>, TableRow> {
 
     private static final Logger LOG = LoggerFactory.getLogger(FlattenAndCompareFn.class);
 
-    private final Map<String, String> arraySortKeys;
-    private final String firestoreCollection;
-    private final String kmsKeyPath;
+    private final Map<String, String>   arraySortKeys;
+    private final ValueProvider<String> firestoreCollection;
+    private final ValueProvider<String> kmsKeyPath;
 
     public FlattenAndCompareFn(Map<String, String> arraySortKeys,
-                                String firestoreCollection,
-                                String kmsKeyPath) {
+                                ValueProvider<String> firestoreCollection,
+                                ValueProvider<String> kmsKeyPath) {
         this.arraySortKeys       = arraySortKeys;
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
@@ -44,7 +50,9 @@ public class FlattenAndCompareFn
 
     @Setup
     public void setup() {
-        BarricadeEncryptionUtil.configure(firestoreCollection, kmsKeyPath);
+        BarricadeEncryptionUtil.configure(
+                firestoreCollection.get(),
+                kmsKeyPath.get());
     }
 
     @ProcessElement
@@ -69,13 +77,13 @@ public class FlattenAndCompareFn
         GenericRecord human = ctx.element().getValue().getKey();
         GenericRecord ai    = ctx.element().getValue().getValue();
 
-        String keyId      = str(human.get("key_id"));
-        String humanKeyId = keyId;
+        String humanKeyId = str(human.get("key_id"));
         String aiKeyId    = str(ai.get("key_id"));
         if (!Objects.equals(humanKeyId, aiKeyId)) {
             LOG.warn("imageId='{}' has mismatched key_ids (human={}, ai={}) — using human key_id",
                     imageId, humanKeyId, aiKeyId);
         }
+        String keyId = humanKeyId;
 
         // ── Decrypt payloads, then flatten ────────────────────────────────────
         String humanPayload = BarricadeEncryptionUtil.decrypt(keyId, str(human.get("payload")));
@@ -101,7 +109,6 @@ public class FlattenAndCompareFn
             String humanVal = humanFields.get(field);
             String aiVal    = aiFields.get(field);
 
-            // Compare on plaintext; encrypt values for storage.
             boolean isMatch          = Objects.equals(humanVal, aiVal);
             String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
             String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);

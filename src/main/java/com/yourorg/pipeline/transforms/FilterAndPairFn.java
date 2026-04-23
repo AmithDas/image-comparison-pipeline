@@ -1,7 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
-import com.yourorg.pipeline.util.AvroSchemas;
+import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.transforms.DoFn;
@@ -38,12 +38,9 @@ import java.util.Map;
  *   <li><b>Pending row(s) aged out (≥ MAX_WAIT_DAYS)</b> → route to dead-letter.</li>
  * </ul>
  *
- * <p>Multiple pending AI rows per image are supported. Each carries its own
- * {@code first_seen_at} and {@code retry_count}. Aging is evaluated per iteration.
- *
- * <p>Source payloads are Barricade-encrypted. {@code image_name} is already the
- * CoGroupByKey grouping key (extracted once upstream). Encrypted payloads are stored
- * as-is in {@link GenericRecord}; decryption happens in {@link FlattenAndCompareFn}.
+ * <p>Schemas for {@link GenericRecord} construction are injected via the constructor
+ * rather than accessed from a static registry, keeping the DoFn self-contained and
+ * testable without classpath schema files.
  */
 public class FilterAndPairFn
         extends DoFn<KV<String, CoGbkResult>,
@@ -55,10 +52,23 @@ public class FilterAndPairFn
 
     private final String aiMethod;
     private final String humanMethod;
+    private final Schema payloadSchema;
+    private final Schema pendingSchema;
 
-    public FilterAndPairFn(String aiMethod, String humanMethod) {
-        this.aiMethod    = aiMethod;
-        this.humanMethod = humanMethod;
+    /**
+     * @param aiMethod      value of the {@code method} column identifying an AI row
+     * @param humanMethod   value of the {@code method} column identifying a human row
+     * @param payloadSchema Avro schema for intermediate {@code PayloadRow} records
+     * @param pendingSchema Avro schema for intermediate {@code PendingRow} records
+     */
+    public FilterAndPairFn(String aiMethod,
+                            String humanMethod,
+                            Schema payloadSchema,
+                            Schema pendingSchema) {
+        this.aiMethod      = aiMethod;
+        this.humanMethod   = humanMethod;
+        this.payloadSchema = payloadSchema;
+        this.pendingSchema = pendingSchema;
     }
 
     // ── CoGroupByKey input tags ───────────────────────────────────────────────
@@ -130,7 +140,6 @@ public class FilterAndPairFn
                         str(p.get("payload")), createdAt));
                 LOG.debug("Restored pending human payload for imageId={}", imageId);
             } else if ("ai".equals(pendingType)) {
-                // Always restore every pending AI iteration — each is independent.
                 aiRows.add(newPayloadRow(imageId, pendingKeyId, "ai",
                         str(p.get("payload")), createdAt));
                 LOG.debug("Restored pending AI iteration (created_at={}) for imageId={}",
@@ -181,8 +190,7 @@ public class FilterAndPairFn
 
         } else if (anyAiPresent) {
             // ── State 3: one or more AI iterations, no human → pend each ────
-            for (int i = 0; i < aiRows.size(); i++) {
-                GenericRecord ai        = aiRows.get(i);
+            for (GenericRecord ai : aiRows) {
                 String        createdAt = str(ai.get("created_at"));
                 GenericRecord meta      = pendingMeta.get("ai:" + createdAt);
                 Instant firstSeen       = metaFirstSeen(meta, now);
@@ -197,7 +205,6 @@ public class FilterAndPairFn
 
         } else if (!pendingMeta.isEmpty()) {
             // ── State 4: no source rows, pending rows exist but unrestorable ─
-            // (e.g. duplicate human rows discarded above). Age out if stale.
             for (GenericRecord p : pendingMeta.values()) {
                 Instant firstSeen = metaFirstSeen(p, now);
                 long daysWaited   = ChronoUnit.DAYS.between(firstSeen, now);
@@ -229,24 +236,22 @@ public class FilterAndPairFn
         }
     }
 
-    /** Returns {@code first_seen_at} from a pending meta record, or {@code fallback} if absent. */
     private static Instant metaFirstSeen(GenericRecord meta, Instant fallback) {
         if (meta == null) return fallback;
         Instant parsed = parseInstant(str(meta.get("first_seen_at")));
         return parsed != null ? parsed : fallback;
     }
 
-    /** Returns {@code retry_count + 1} from a pending meta record, or 0 for a new row. */
     private static long metaRetryCount(GenericRecord meta) {
         if (meta == null) return 0L;
         Object count = meta.get("retry_count");
         return count != null ? ((Number) count).longValue() + 1 : 0L;
     }
 
-    private static GenericRecord newPayloadRow(String imageId, String keyId,
-                                                String payloadType, String payload,
-                                                String createdAt) {
-        GenericRecord r = new GenericData.Record(AvroSchemas.PAYLOAD_ROW);
+    private GenericRecord newPayloadRow(String imageId, String keyId,
+                                         String payloadType, String payload,
+                                         String createdAt) {
+        GenericRecord r = new GenericData.Record(payloadSchema);
         r.put("image_id",     imageId);
         r.put("key_id",       keyId);
         r.put("payload_type", payloadType);
@@ -255,11 +260,11 @@ public class FilterAndPairFn
         return r;
     }
 
-    private static GenericRecord newPendingRow(String imageId, String keyId,
-                                                String pendingType, String payload,
-                                                String createdAt, Instant firstSeen,
-                                                Instant now, long retryCount) {
-        GenericRecord r = new GenericData.Record(AvroSchemas.PENDING_ROW);
+    private GenericRecord newPendingRow(String imageId, String keyId,
+                                         String pendingType, String payload,
+                                         String createdAt, Instant firstSeen,
+                                         Instant now, long retryCount) {
+        GenericRecord r = new GenericData.Record(pendingSchema);
         r.put("image_id",        imageId);
         r.put("key_id",          keyId);
         r.put("pending_type",    pendingType);
@@ -271,8 +276,8 @@ public class FilterAndPairFn
         return r;
     }
 
-    private static GenericRecord toPendingRecord(TableRow row) {
-        GenericRecord r = new GenericData.Record(AvroSchemas.PENDING_ROW);
+    private GenericRecord toPendingRecord(TableRow row) {
+        GenericRecord r = new GenericData.Record(pendingSchema);
         r.put("image_id",        row.get("image_id"));
         r.put("key_id",          row.get("key_id"));
         r.put("pending_type",    row.get("pending_type"));

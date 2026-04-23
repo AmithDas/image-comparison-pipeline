@@ -3,6 +3,7 @@ package com.yourorg.pipeline.transforms;
 import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
+import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.values.KV;
 import org.slf4j.Logger;
@@ -24,16 +25,22 @@ import org.slf4j.LoggerFactory;
  *                                     filterField, filterValue))
  * </pre>
  *
+ * <h3>ValueProvider fields</h3>
+ * {@code firestoreCollection}, {@code kmsKeyPath}, and {@code imageNameField} are
+ * {@link ValueProvider}s so that they can be wired directly from pipeline options
+ * and resolved lazily on each Dataflow worker in {@code @Setup} / {@code @ProcessElement}.
+ * {@code filterField} and {@code filterValue} are plain {@link String}s — they are
+ * optional and always resolved at graph-construction time.
+ *
  * <h3>Image name field path</h3>
  * {@code imageNameField} is a dot-notation path with optional array indexing, e.g.
  * {@code "queueImages[0].fileName"} or {@code "metadata.imageId"}.
  * Rows where the path resolves to null or is absent are dropped with a WARN log.
  *
  * <h3>Payload filter</h3>
- * When {@code filterField} is non-blank, only rows whose decrypted payload contains
- * {@code filterField == filterValue} are forwarded; others are silently dropped.
+ * When {@code filterField} is non-blank, only rows where
+ * {@code filterField == filterValue} in the decrypted payload are forwarded.
  * Pass {@code null} for {@code filterField} to disable filtering.
- * Filtering and key extraction share a single decrypt call per row.
  *
  * <h3>Encryption</h3>
  * DEKs are resolved via {@link BarricadeEncryptionUtil} using each row's
@@ -44,15 +51,15 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
 
     private static final Logger LOG = LoggerFactory.getLogger(DecryptAndKeyFn.class);
 
-    private final String firestoreCollection;
-    private final String kmsKeyPath;
-    private final String imageNameField;
-    private final String filterField;   // null → no filter
-    private final String filterValue;   // required when filterField is non-blank
+    private final ValueProvider<String> firestoreCollection;
+    private final ValueProvider<String> kmsKeyPath;
+    private final ValueProvider<String> imageNameField;
+    private final String                filterField;   // null → no filter
+    private final String                filterValue;
 
-    private DecryptAndKeyFn(String firestoreCollection,
-                             String kmsKeyPath,
-                             String imageNameField,
+    private DecryptAndKeyFn(ValueProvider<String> firestoreCollection,
+                             ValueProvider<String> kmsKeyPath,
+                             ValueProvider<String> imageNameField,
                              String filterField,
                              String filterValue) {
         this.firestoreCollection = firestoreCollection;
@@ -65,9 +72,9 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     // ── Static factories ──────────────────────────────────────────────────────
 
     /** No payload filter — suitable for AI rows. */
-    public static DecryptAndKeyFn forAi(String firestoreCollection,
-                                         String kmsKeyPath,
-                                         String imageNameField) {
+    public static DecryptAndKeyFn forAi(ValueProvider<String> firestoreCollection,
+                                         ValueProvider<String> kmsKeyPath,
+                                         ValueProvider<String> imageNameField) {
         return new DecryptAndKeyFn(firestoreCollection, kmsKeyPath, imageNameField, null, null);
     }
 
@@ -75,9 +82,9 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
      * With an optional payload filter — suitable for human rows.
      * Pass {@code null} for {@code filterField} to skip filtering.
      */
-    public static DecryptAndKeyFn forHuman(String firestoreCollection,
-                                            String kmsKeyPath,
-                                            String imageNameField,
+    public static DecryptAndKeyFn forHuman(ValueProvider<String> firestoreCollection,
+                                            ValueProvider<String> kmsKeyPath,
+                                            ValueProvider<String> imageNameField,
                                             String filterField,
                                             String filterValue) {
         return new DecryptAndKeyFn(
@@ -88,7 +95,9 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
 
     @Setup
     public void setup() {
-        BarricadeEncryptionUtil.configure(firestoreCollection, kmsKeyPath);
+        BarricadeEncryptionUtil.configure(
+                firestoreCollection.get(),
+                kmsKeyPath.get());
     }
 
     @ProcessElement
@@ -107,10 +116,10 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
             }
         }
 
-        String imageName = JsonFieldExtractor.extractField(decrypted, imageNameField);
+        String imageName = JsonFieldExtractor.extractField(decrypted, imageNameField.get());
         if (imageName == null || imageName.isBlank()) {
             LOG.warn("Skipping row: field '{}' is absent or null for key_id={}",
-                    imageNameField, keyId);
+                    imageNameField.get(), keyId);
             return;
         }
 

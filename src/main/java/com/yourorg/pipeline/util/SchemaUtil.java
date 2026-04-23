@@ -8,23 +8,24 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 /**
- * Derives BigQuery TableSchema definitions from the Avro schemas in AvroSchemas.
- * Adding or renaming a field only requires updating the corresponding .json schema file.
+ * Derives BigQuery {@link TableSchema} definitions from Avro schemas in the
+ * {@link SchemaRegistry}. Adding or renaming a field only requires updating
+ * the corresponding {@code .json} schema file — no Java changes needed.
  */
 public final class SchemaUtil {
 
     private SchemaUtil() {}
 
     public static TableSchema comparisonResultsSchema() {
-        return toTableSchema(AvroSchemas.COMPARISON_RESULT);
+        return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.COMPARISON_RESULT));
     }
 
     public static TableSchema pendingSchema() {
-        return toTableSchema(AvroSchemas.PENDING_ROW);
+        return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.PENDING_ROW));
     }
 
     public static TableSchema deadLetterSchema() {
-        return toTableSchema(AvroSchemas.DEAD_LETTER_ROW);
+        return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.DEAD_LETTER_ROW));
     }
 
     // ── Avro → BigQuery conversion ────────────────────────────────────────────

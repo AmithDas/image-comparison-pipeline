@@ -1,7 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
-import com.yourorg.pipeline.util.AvroSchemas;
+import com.yourorg.pipeline.util.SchemaRegistry;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.coders.StringUtf8Coder;
@@ -87,19 +87,25 @@ public class FilterAndPairFnTest {
                             .withKeyType(TypeDescriptors.strings()));
         }
 
+        SchemaRegistry registry = SchemaRegistry.getInstance();
         return KeyedPCollectionTuple
                 .of(FilterAndPairFn.SOURCE_TAG, keyedSource)
                 .and(FilterAndPairFn.PENDING_TAG, keyedPending)
                 .apply("CoGroup", CoGroupByKey.create())
                 .apply("FilterAndPair",
-                        ParDo.of(new FilterAndPairFn(AI_METHOD, HUMAN_METHOD))
+                        ParDo.of(new FilterAndPairFn(
+                                        AI_METHOD, HUMAN_METHOD,
+                                        registry.get(SchemaRegistry.PAYLOAD_ROW),
+                                        registry.get(SchemaRegistry.PENDING_ROW)))
                              .withOutputTags(FilterAndPairFn.MATCHED,
                                      TupleTagList.of(FilterAndPairFn.NEW_PENDING)
                                                  .and(FilterAndPairFn.AGED_OUT)));
     }
 
     private PCollection<KV<String, KV<GenericRecord, GenericRecord>>> matched(PCollectionTuple t) {
-        AvroCoder<GenericRecord> payloadCoder = AvroCoder.of(GenericRecord.class, AvroSchemas.PAYLOAD_ROW);
+        SchemaRegistry registry = SchemaRegistry.getInstance();
+        AvroCoder<GenericRecord> payloadCoder =
+                AvroCoder.of(GenericRecord.class, registry.get(SchemaRegistry.PAYLOAD_ROW));
         return t.get(FilterAndPairFn.MATCHED)
                 .setCoder(KvCoder.of(StringUtf8Coder.of(),
                         KvCoder.of(payloadCoder, payloadCoder)));
@@ -107,12 +113,14 @@ public class FilterAndPairFnTest {
 
     private PCollection<GenericRecord> newPending(PCollectionTuple t) {
         return t.get(FilterAndPairFn.NEW_PENDING)
-                .setCoder(AvroCoder.of(GenericRecord.class, AvroSchemas.PENDING_ROW));
+                .setCoder(AvroCoder.of(GenericRecord.class,
+                        SchemaRegistry.getInstance().get(SchemaRegistry.PENDING_ROW)));
     }
 
     private PCollection<GenericRecord> agedOut(PCollectionTuple t) {
         return t.get(FilterAndPairFn.AGED_OUT)
-                .setCoder(AvroCoder.of(GenericRecord.class, AvroSchemas.PENDING_ROW));
+                .setCoder(AvroCoder.of(GenericRecord.class,
+                        SchemaRegistry.getInstance().get(SchemaRegistry.PENDING_ROW)));
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────

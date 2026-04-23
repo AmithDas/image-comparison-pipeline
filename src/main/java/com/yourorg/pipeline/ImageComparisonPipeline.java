@@ -4,8 +4,9 @@ import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
-import com.yourorg.pipeline.util.AvroSchemas;
+import com.yourorg.pipeline.util.SchemaRegistry;
 import com.yourorg.pipeline.util.SchemaUtil;
+import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.coders.KvCoder;
@@ -19,11 +20,21 @@ import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.Validation;
-import org.apache.beam.sdk.transforms.*;
-import org.apache.beam.sdk.transforms.join.CoGroupByKey;
+import org.apache.beam.sdk.options.ValueProvider;
+import org.apache.beam.sdk.transforms.Flatten;
+import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.WithKeys;
 import org.apache.beam.sdk.transforms.join.CoGbkResult;
+import org.apache.beam.sdk.transforms.join.CoGroupByKey;
 import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
-import org.apache.beam.sdk.values.*;
+import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
+import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.TupleTagList;
+import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.beam.sdk.values.TypeDescriptors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,9 +47,9 @@ import java.util.Map;
  *
  * <p>Pipeline overview:
  * <ol>
- *   <li>Read windowed rows from {@code image_payloads} source table.</li>
+ *   <li>Read windowed rows from separate AI and human BigQuery source tables.</li>
  *   <li>Read current pending state from {@code pending_comparisons}.</li>
- *   <li>CoGroupByKey on image name (extracted from payload) to join source and pending.</li>
+ *   <li>Decrypt each source row; extract the image identifier; co-group with pending.</li>
  *   <li>Run {@link FilterAndPairFn} to merge source + pending, check eligibility,
  *       and route to MATCHED / NEW_PENDING / AGED_OUT.</li>
  *   <li>Run {@link FlattenAndCompareFn} on MATCHED pairs to produce field-level results.</li>
@@ -47,8 +58,12 @@ import java.util.Map;
  *   <li>Append aged-out rows to {@code dead_letter_comparisons}.</li>
  * </ol>
  *
- * <p>Internal records use Avro {@link GenericRecord} with schemas defined in
- * {@code payload_row.avsc} and {@code pending_row.avsc}.
+ * <p>Avro schemas for internal records are loaded from the {@link SchemaRegistry}
+ * (classpath {@code /avro/<name>.json}) and passed directly to DoFns that need them,
+ * so no DoFn accesses the registry or any static schema constant.
+ *
+ * <p>All pipeline options use {@link ValueProvider} so that values can be resolved
+ * lazily on Dataflow workers rather than only at graph-construction time.
  *
  * <p>Run locally (DirectRunner):
  * <pre>
@@ -63,7 +78,9 @@ import java.util.Map;
  *       --windowStart=2026-04-16T00:00:00Z \
  *       --windowEnd=2026-04-17T00:00:00Z \
  *       --aiMethod=aimetadata \
- *       --humanMethod=controller.SubmitDispute"
+ *       --humanMethod=controller.SubmitDispute \
+ *       --firestoreCollection=dek_store \
+ *       --kmsKeyPath=projects/p/locations/l/keyRings/r/cryptoKeys/k"
  * </pre>
  */
 public class ImageComparisonPipeline {
@@ -76,90 +93,90 @@ public class ImageComparisonPipeline {
 
         @Description("BigQuery table containing AI payloads. Format: project:dataset.table")
         @Validation.Required
-        String getAiSourceTable();
-        void setAiSourceTable(String value);
+        ValueProvider<String> getAiSourceTable();
+        void setAiSourceTable(ValueProvider<String> value);
 
         @Description("BigQuery table containing human payloads. Format: project:dataset.table")
         @Validation.Required
-        String getHumanSourceTable();
-        void setHumanSourceTable(String value);
+        ValueProvider<String> getHumanSourceTable();
+        void setHumanSourceTable(ValueProvider<String> value);
 
         @Description("Output BigQuery table for field-level comparison results. "
                 + "Format: project:dataset.table")
         @Validation.Required
-        String getOutputTable();
-        void setOutputTable(String value);
+        ValueProvider<String> getOutputTable();
+        void setOutputTable(ValueProvider<String> value);
 
         @Description("BigQuery table used as a durable pending state store for "
                 + "orphaned payloads awaiting their counterpart. "
                 + "Format: project:dataset.table")
         @Validation.Required
-        String getPendingTable();
-        void setPendingTable(String value);
+        ValueProvider<String> getPendingTable();
+        void setPendingTable(ValueProvider<String> value);
 
         @Description("BigQuery table for payloads that exceeded the maximum wait "
                 + "threshold (default 7 days). Format: project:dataset.table")
         @Validation.Required
-        String getDeadLetterTable();
-        void setDeadLetterTable(String value);
+        ValueProvider<String> getDeadLetterTable();
+        void setDeadLetterTable(ValueProvider<String> value);
 
         @Description("Inclusive start of the processing window (ISO-8601, e.g. 2026-04-16T00:00:00Z). "
                 + "Only source rows with created_at >= windowStart are read.")
         @Validation.Required
-        String getWindowStart();
-        void setWindowStart(String value);
+        ValueProvider<String> getWindowStart();
+        void setWindowStart(ValueProvider<String> value);
 
         @Description("Exclusive end of the processing window (ISO-8601, e.g. 2026-04-17T00:00:00Z). "
                 + "Only source rows with created_at < windowEnd are read.")
         @Validation.Required
-        String getWindowEnd();
-        void setWindowEnd(String value);
+        ValueProvider<String> getWindowEnd();
+        void setWindowEnd(ValueProvider<String> value);
 
         @Description("Value of the 'method' column that identifies an AI payload (e.g. 'aimetadata').")
         @Validation.Required
-        String getAiMethod();
-        void setAiMethod(String value);
+        ValueProvider<String> getAiMethod();
+        void setAiMethod(ValueProvider<String> value);
 
-        @Description("Value of the 'method' column that identifies a human payload (e.g. 'controller.SubmitDispute').")
+        @Description("Value of the 'method' column that identifies a human payload "
+                + "(e.g. 'controller.SubmitDispute').")
         @Validation.Required
-        String getHumanMethod();
-        void setHumanMethod(String value);
+        ValueProvider<String> getHumanMethod();
+        void setHumanMethod(ValueProvider<String> value);
 
         @Description("Comma-separated sort keys per array path, e.g. 'terms=code,items=id'. "
-                + "Each entry specifies which field to sort array elements by at that dot-notation path. "
                 + "Omit to sort by full element JSON string.")
-        String getArraySortKeys();
-        void setArraySortKeys(String value);
+        ValueProvider<String> getArraySortKeys();
+        void setArraySortKeys(ValueProvider<String> value);
 
         @Description("Dot-notation path to the image identifier field inside the decrypted payload. "
-                + "Supports nested fields and array indexing, e.g. 'queueImages[0].fileName' "
-                + "or 'metadata.imageId'. Rows where this field is absent or null are skipped.")
+                + "Supports nested fields and array indexing, e.g. 'queueImages[0].fileName'. "
+                + "Rows where this field is absent or null are skipped.")
         @Default.String("queueImages[0].fileName")
-        String getImageNameField();
-        void setImageNameField(String value);
+        ValueProvider<String> getImageNameField();
+        void setImageNameField(ValueProvider<String> value);
 
         @Description("Dot-notation JSON field name inside the decrypted human payload to filter on. "
                 + "Only human rows where this field equals --humanFilterValue are processed. "
                 + "Omit to skip filtering.")
-        String getHumanFilterField();
-        void setHumanFilterField(String value);
+        ValueProvider<String> getHumanFilterField();
+        void setHumanFilterField(ValueProvider<String> value);
 
         @Description("Expected value for --humanFilterField. Required when --humanFilterField is set.")
-        String getHumanFilterValue();
-        void setHumanFilterValue(String value);
+        ValueProvider<String> getHumanFilterValue();
+        void setHumanFilterValue(ValueProvider<String> value);
 
         @Description("Firestore collection name that stores wrapped DEKs. "
                 + "Each document ID is a key_id; the document must contain a "
                 + "'wrapped_dek' field with the base64-encoded KMS-wrapped DEK.")
         @Validation.Required
-        String getFirestoreCollection();
-        void setFirestoreCollection(String value);
+        ValueProvider<String> getFirestoreCollection();
+        void setFirestoreCollection(ValueProvider<String> value);
 
         @Description("Full Cloud KMS CryptoKey resource path used to unwrap DEKs. "
                 + "Format: projects/P/locations/L/keyRings/R/cryptoKeys/K")
         @Validation.Required
-        String getKmsKeyPath();
-        void setKmsKeyPath(String value);
+        ValueProvider<String> getKmsKeyPath();
+        void setKmsKeyPath(ValueProvider<String> value);
     }
 
     // ── Entry point ───────────────────────────────────────────────────────────
@@ -177,52 +194,56 @@ public class ImageComparisonPipeline {
 
     /**
      * Builds the pipeline graph. Separated from {@link #main} for testability.
+     *
+     * <p>Schemas are fetched from the {@link SchemaRegistry} here and passed to
+     * DoFns that need them — no DoFn accesses the registry directly.
      */
     public static void buildPipeline(Pipeline pipeline, Options options) {
 
-        // ── 1. Read AI and human source tables separately ────────────────────
-        LOG.info("Reading AI source table: {} for window [{}, {})",
-                options.getAiSourceTable(), options.getWindowStart(), options.getWindowEnd());
+        // ── Schemas — fetched once here and injected into DoFns ───────────────
+        SchemaRegistry registry    = SchemaRegistry.getInstance();
+        Schema payloadSchema       = registry.get(SchemaRegistry.PAYLOAD_ROW);
+        Schema pendingSchema       = registry.get(SchemaRegistry.PENDING_ROW);
+
+        // ── 1. Read AI and human source tables separately ─────────────────────
         String aiQuery = String.format(
                 "SELECT * FROM `%s`"
                         + " WHERE created_at >= '%s' AND created_at < '%s'"
                         + " AND method = '%s'",
-                options.getAiSourceTable().replace(':', '.'),
-                options.getWindowStart(),
-                options.getWindowEnd(),
-                options.getAiMethod());
+                options.getAiSourceTable().get().replace(':', '.'),
+                options.getWindowStart().get(),
+                options.getWindowEnd().get(),
+                options.getAiMethod().get());
+
         PCollection<TableRow> aiRows = pipeline.apply(
                 "ReadAiPayloads",
                 BigQueryIO.readTableRows()
                         .fromQuery(aiQuery)
                         .usingStandardSql());
 
-        LOG.info("Reading human source table: {} for window [{}, {})",
-                options.getHumanSourceTable(), options.getWindowStart(), options.getWindowEnd());
         String humanQuery = String.format(
                 "SELECT * FROM `%s`"
                         + " WHERE created_at >= '%s' AND created_at < '%s'"
                         + " AND method = '%s'",
-                options.getHumanSourceTable().replace(':', '.'),
-                options.getWindowStart(),
-                options.getWindowEnd(),
-                options.getHumanMethod());
+                options.getHumanSourceTable().get().replace(':', '.'),
+                options.getWindowStart().get(),
+                options.getWindowEnd().get(),
+                options.getHumanMethod().get());
+
         PCollection<TableRow> humanRows = pipeline.apply(
                 "ReadHumanPayloads",
                 BigQueryIO.readTableRows()
                         .fromQuery(humanQuery)
                         .usingStandardSql());
 
-        // ── 2. Read pending table with partition filter (last MAX_WAIT_DAYS only) ─
-        // Partitioned on DATE(first_seen_at) — filter eliminates partitions older
-        // than the eviction window, avoiding a full table scan as the table grows.
-        LOG.info("Reading pending table: {}", options.getPendingTable());
+        // ── 2. Read pending table ─────────────────────────────────────────────
         String pendingQuery = String.format(
                 "SELECT * FROM `%s`"
                         + " WHERE first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
                         + " INTERVAL %d DAY)",
-                options.getPendingTable().replace(':', '.'),
+                options.getPendingTable().get().replace(':', '.'),
                 FilterAndPairFn.MAX_WAIT_DAYS);
+
         PCollection<KV<String, TableRow>> keyedPending = pipeline
                 .apply("ReadPendingTable",
                         BigQueryIO.readTableRows()
@@ -241,17 +262,22 @@ public class ImageComparisonPipeline {
                                 options.getImageNameField())));
 
         // ── 4. Decrypt + filter + key human rows by image name ────────────────
-        // Filtering and keying share the same single decrypt call per row.
+        // filterField/filterValue resolved here; ValueProviders passed for runtime fields.
+        String filterField = options.getHumanFilterField() != null
+                ? options.getHumanFilterField().get() : null;
+        String filterValue = options.getHumanFilterValue() != null
+                ? options.getHumanFilterValue().get() : null;
+
         PCollection<KV<String, TableRow>> keyedHuman = humanRows
                 .apply("KeyHumanById",
                         ParDo.of(DecryptAndKeyFn.forHuman(
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath(),
                                 options.getImageNameField(),
-                                options.getHumanFilterField(),
-                                options.getHumanFilterValue())));
+                                filterField,
+                                filterValue)));
 
-        // ── 5. Merge keyed AI + filtered human into one source PCollection ────
+        // ── 5. Merge keyed AI + human into one source PCollection ─────────────
         PCollection<KV<String, TableRow>> keyedSource =
                 PCollectionList.of(keyedAi).and(keyedHuman)
                         .apply("FlattenKeyedSource", Flatten.pCollections());
@@ -263,21 +289,23 @@ public class ImageComparisonPipeline {
                         .and(FilterAndPairFn.PENDING_TAG, keyedPending)
                         .apply("CoGroupByImageId", CoGroupByKey.create());
 
-        // ── 7. Filter & pair ──────────────────────────────────────────────────
+        // ── 7. Filter & pair — schemas injected, no static registry access ────
         PCollectionTuple routed = coGrouped.apply(
                 "FilterAndPair",
-                ParDo.of(new FilterAndPairFn(options.getAiMethod(), options.getHumanMethod()))
+                ParDo.of(new FilterAndPairFn(
+                                options.getAiMethod().get(),
+                                options.getHumanMethod().get(),
+                                payloadSchema,
+                                pendingSchema))
                      .withOutputTags(
                              FilterAndPairFn.MATCHED,
                              TupleTagList
                                      .of(FilterAndPairFn.NEW_PENDING)
                                      .and(FilterAndPairFn.AGED_OUT)));
 
-        // Register Avro coders so Beam can serialise GenericRecord between steps.
-        AvroCoder<GenericRecord> payloadCoder =
-                AvroCoder.of(GenericRecord.class, AvroSchemas.PAYLOAD_ROW);
-        AvroCoder<GenericRecord> pendingCoder =
-                AvroCoder.of(GenericRecord.class, AvroSchemas.PENDING_ROW);
+        // ── Register Avro coders for GenericRecord serialisation ──────────────
+        AvroCoder<GenericRecord> payloadCoder = AvroCoder.of(GenericRecord.class, payloadSchema);
+        AvroCoder<GenericRecord> pendingCoder = AvroCoder.of(GenericRecord.class, pendingSchema);
 
         PCollection<KV<String, KV<GenericRecord, GenericRecord>>> matched =
                 routed.get(FilterAndPairFn.MATCHED)
@@ -290,7 +318,7 @@ public class ImageComparisonPipeline {
         PCollection<GenericRecord> agedOut =
                 routed.get(FilterAndPairFn.AGED_OUT).setCoder(pendingCoder);
 
-        // ── 6. Flatten JSON + field-level comparison ──────────────────────────
+        // ── 8. Flatten JSON + field-level comparison ──────────────────────────
         PCollection<TableRow> comparisonResults = matched
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
@@ -298,7 +326,7 @@ public class ImageComparisonPipeline {
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath())));
 
-        // ── 7. Write comparison results ───────────────────────────────────────
+        // ── 9. Write comparison results ───────────────────────────────────────
         comparisonResults.apply(
                 "WriteComparisonResults",
                 BigQueryIO.writeTableRows()
@@ -307,7 +335,7 @@ public class ImageComparisonPipeline {
                         .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                         .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 8. Overwrite pending table (WRITE_TRUNCATE = implicit cleanup) ────
+        // ── 10. Overwrite pending table (WRITE_TRUNCATE = implicit cleanup) ───
         newPending
                 .apply("MapPendingToTableRow",
                         MapElements
@@ -320,7 +348,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 9. Append aged-out rows to dead-letter table ──────────────────────
+        // ── 11. Append aged-out rows to dead-letter table ─────────────────────
         agedOut
                 .apply("MapAgedOutToTableRow",
                         MapElements
@@ -368,10 +396,12 @@ public class ImageComparisonPipeline {
         return value != null ? value.toString() : null;
     }
 
-    private static Map<String, String> parseArraySortKeys(String raw) {
-        if (raw == null || raw.isBlank()) return Collections.emptyMap();
+    private static Map<String, String> parseArraySortKeys(ValueProvider<String> raw) {
+        if (raw == null || !raw.isAccessible() || raw.get() == null || raw.get().isBlank()) {
+            return Collections.emptyMap();
+        }
         Map<String, String> map = new java.util.HashMap<>();
-        for (String entry : raw.split(",")) {
+        for (String entry : raw.get().split(",")) {
             String[] parts = entry.split("=", 2);
             if (parts.length == 2 && !parts[0].isBlank() && !parts[1].isBlank()) {
                 map.put(parts[0].trim(), parts[1].trim());
