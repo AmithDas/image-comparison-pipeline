@@ -6,9 +6,9 @@
     {"name": "image_id",      "type": "string"},
     {"name": "pending_type",  "type": "string"},
     {"name": "payload",       "type": ["null", "string"], "default": null},
-    {"name": "created_at",    "type": ["null", "string"], "default": null},
-    {"name": "first_seen_at", "type": ["null", "string"], "default": null},
-    {"name": "aged_out_at",   "type": "string"},
+    {"name": "created_at",    "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
+    {"name": "first_seen_at", "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
+    {"name": "aged_out_at",   "type": "string",                             "bqType": "TIMESTAMP"},
     {"name": "reason",        "type": ["null", "string"], "default": null}
   ]
 }

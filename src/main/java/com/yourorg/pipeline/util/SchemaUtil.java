@@ -51,9 +51,15 @@ public final class SchemaUtil {
             }
         }
 
+        // Honour an explicit "bqType" property on the Avro field — used for types like
+        // TIMESTAMP where the Avro wire type is "string" (ISO-8601) but BigQuery needs
+        // the semantic type. Falls back to the Avro-derived BQ type when absent.
+        String bqTypeOverride = field.getProp("bqType");
+        String bqType = bqTypeOverride != null ? bqTypeOverride : toBqType(schema);
+
         return new TableFieldSchema()
                 .setName(field.name())
-                .setType(toBqType(schema))
+                .setType(bqType)
                 .setMode(mode);
     }
 

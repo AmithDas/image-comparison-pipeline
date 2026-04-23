@@ -7,9 +7,9 @@
     {"name": "key_id",          "type": "string"},
     {"name": "pending_type",    "type": "string"},
     {"name": "payload",         "type": "string"},
-    {"name": "created_at",      "type": ["null", "string"], "default": null},
-    {"name": "first_seen_at",   "type": ["null", "string"], "default": null},
-    {"name": "last_retried_at", "type": ["null", "string"], "default": null},
+    {"name": "created_at",      "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
+    {"name": "first_seen_at",   "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
+    {"name": "last_retried_at", "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
     {"name": "retry_count",     "type": "long",             "default": 0}
   ]
 }
