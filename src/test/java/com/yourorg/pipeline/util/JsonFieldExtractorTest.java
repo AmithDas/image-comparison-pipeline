@@ -2,107 +2,50 @@ package com.yourorg.pipeline.util;
 
 import org.junit.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.Assert.*;
 
 public class JsonFieldExtractorTest {
 
-    // ── flatten ───────────────────────────────────────────────────────────────
+    // ── flatten — scalars ─────────────────────────────────────────────────────
 
     @Test
     public void flatFlattensTopLevelFields() {
         String json = "{\"a\": \"val1\", \"b\": \"val2\"}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        assertEquals("val1", result.get("a"));
-        assertEquals("val2", result.get("b"));
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        assertEquals(List.of("val1"), result.get("a"));
+        assertEquals(List.of("val2"), result.get("b"));
         assertEquals(2, result.size());
     }
 
     @Test
     public void flatFlattensNestedFields() {
         String json = "{\"a\": {\"b\": {\"c\": \"deep\"}}}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        assertEquals("deep", result.get("a.b.c"));
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        assertEquals(List.of("deep"), result.get("a.b.c"));
         assertEquals(1, result.size());
     }
 
     @Test
     public void flatHandlesNullValues() {
         String json = "{\"a\": null}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
         assertTrue(result.containsKey("a"));
-        assertNull(result.get("a"));
+        assertEquals(1, result.get("a").size());
+        assertNull(result.get("a").get(0));
     }
 
     @Test
-    public void flatPrimitiveArrayEmitsIndexedKeys() {
-        String json = "{\"tags\": [\"x\", \"y\"]}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        // Each element gets its own indexed key
-        assertEquals("x", result.get("tags[0]"));
-        assertEquals("y", result.get("tags[1]"));
-        assertEquals(2, result.size());
-    }
-
-    @Test
-    public void flatArrayOrderIsInsensitive() {
-        // Elements are sorted before indexing, so the same logical set maps to the
-        // same indexed keys regardless of the original order.
-        Map<String, String> r1 = JsonFieldExtractor.flatten("{\"tags\": [\"y\", \"x\"]}");
-        Map<String, String> r2 = JsonFieldExtractor.flatten("{\"tags\": [\"x\", \"y\"]}");
-        assertEquals(r1.get("tags[0]"), r2.get("tags[0]"));
-        assertEquals(r1.get("tags[1]"), r2.get("tags[1]"));
-    }
-
-    @Test
-    public void flatArrayOfObjectsEmitsIndexedDotKeys() {
-        String json = "{\"terms\": [{\"code\": \"A\", \"message\": \"hello\"},"
-                + "{\"code\": \"B\", \"message\": \"world\"}]}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        // Sorted by full-element JSON string: "A" object sorts before "B"
-        assertEquals("A",     result.get("terms[0].code"));
-        assertEquals("hello", result.get("terms[0].message"));
-        assertEquals("B",     result.get("terms[1].code"));
-        assertEquals("world", result.get("terms[1].message"));
-        assertEquals(4, result.size());
-    }
-
-    @Test
-    public void flatSingleElementArrayEmitsSingleIndexedKey() {
-        String json = "{\"tags\": [\"only\"]}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        assertEquals("only", result.get("tags[0]"));
-        assertEquals(1, result.size());
-    }
-
-    @Test
-    public void flatArrayNullElementEmitsIndexedNullKey() {
-        String json = "{\"items\": [null, \"present\"]}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        // null sorts before "present" as a string
-        assertNull(result.get("items[0]"));
-        assertEquals("present", result.get("items[1]"));
-    }
-
-    @Test
-    public void flatNestedArrayEmitsDoublyIndexedKeys() {
-        // Array of arrays
-        String json = "{\"matrix\": [[\"a\", \"b\"], [\"c\"]]}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        // Outer sorted by full JSON; inner sorted too
-        assertTrue(result.containsKey("matrix[0][0]"));
-        assertTrue(result.containsKey("matrix[0][1]"));
-        assertTrue(result.containsKey("matrix[1][0]"));
-    }
-
-    @Test
-    public void flatArrayWithSortKeyUsesConfiguredField() {
-        String json = "{\"items\": [{\"id\": \"z\", \"val\": 1}, {\"id\": \"a\", \"val\": 2}]}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json, Map.of("items", "id"));
-        // Sorted by "id": "a" object first, "z" object second
-        assertEquals("a", result.get("items[0].id"));
-        assertEquals("z", result.get("items[1].id"));
+    public void flatHandlesMixedNestedAndFlat() {
+        String json = "{\"a\": \"flat\", \"b\": {\"c\": \"nested\"}, \"d\": null}";
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        assertEquals(List.of("flat"),   result.get("a"));
+        assertEquals(List.of("nested"), result.get("b.c"));
+        assertEquals(1, result.get("d").size());
+        assertNull(result.get("d").get(0));
+        assertEquals(3, result.size());
     }
 
     @Test
@@ -120,14 +63,94 @@ public class JsonFieldExtractorTest {
         assertTrue(JsonFieldExtractor.flatten("{bad json").isEmpty());
     }
 
+    // ── flatten — primitive arrays ────────────────────────────────────────────
+
     @Test
-    public void flatHandlesMixedNestedAndFlat() {
-        String json = "{\"a\": \"flat\", \"b\": {\"c\": \"nested\"}, \"d\": null}";
-        Map<String, String> result = JsonFieldExtractor.flatten(json);
-        assertEquals("flat",   result.get("a"));
-        assertEquals("nested", result.get("b.c"));
-        assertNull(result.get("d"));
-        assertEquals(3, result.size());
+    public void flatPrimitiveArrayCollectsAllValuesUnderSameKey() {
+        // Elements are sorted before accumulation
+        String json = "{\"tags\": [\"x\", \"y\"]}";
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        assertEquals(1, result.size());
+        assertEquals(List.of("x", "y"), result.get("tags"));
+    }
+
+    @Test
+    public void flatArrayOrderIsInsensitive() {
+        // Different input order → same sorted list
+        Map<String, List<String>> r1 = JsonFieldExtractor.flatten("{\"tags\": [\"y\", \"x\"]}");
+        Map<String, List<String>> r2 = JsonFieldExtractor.flatten("{\"tags\": [\"x\", \"y\"]}");
+        assertEquals(r1.get("tags"), r2.get("tags"));
+    }
+
+    @Test
+    public void flatSingleElementArrayProducesSingleElementList() {
+        String json = "{\"tags\": [\"only\"]}";
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        assertEquals(List.of("only"), result.get("tags"));
+    }
+
+    @Test
+    public void flatArrayNullElementIncludedAsList() {
+        // null sorts before non-null strings (null → "" in sortValue)
+        String json = "{\"items\": [\"present\", null]}";
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        List<String> vals = result.get("items");
+        assertEquals(2, vals.size());
+        assertTrue(vals.contains(null));
+        assertTrue(vals.contains("present"));
+    }
+
+    // ── flatten — object arrays ───────────────────────────────────────────────
+
+    @Test
+    public void flatArrayOfObjectsGroupsFieldsUnderSameKey() {
+        // All values for the same field across array elements land in one list
+        String json = "{\"terms\": [{\"code\": \"A\", \"message\": \"hello\"},"
+                + "{\"code\": \"B\", \"message\": \"world\"}]}";
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        // Sorted by full-element JSON: "A"-object sorts before "B"-object
+        assertEquals(List.of("A", "B"),          result.get("terms.code"));
+        assertEquals(List.of("hello", "world"),  result.get("terms.message"));
+        assertEquals(2, result.size());
+    }
+
+    @Test
+    public void flatArrayWithSortKeyUsesConfiguredField() {
+        String json = "{\"items\": [{\"id\": \"z\", \"val\": \"1\"}, {\"id\": \"a\", \"val\": \"2\"}]}";
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json, Map.of("items", "id"));
+        // Sorted by "id": "a" first, "z" second
+        assertEquals(List.of("a", "z"), result.get("items.id"));
+        assertEquals(List.of("2", "1"), result.get("items.val"));
+    }
+
+    @Test
+    public void flatNestedArrayCollectsUnderParentPrefix() {
+        // Array of arrays: each inner array's elements land in the same outer list
+        String json = "{\"matrix\": [[\"a\", \"b\"], [\"c\"]]}";
+        Map<String, List<String>> result = JsonFieldExtractor.flatten(json);
+        List<String> vals = result.get("matrix");
+        assertNotNull(vals);
+        assertEquals(3, vals.size());
+        assertTrue(vals.containsAll(List.of("a", "b", "c")));
+    }
+
+    // ── flatten — comparison symmetry ────────────────────────────────────────
+
+    @Test
+    public void flatScalarAndArraySizeMatchForComparison() {
+        // Human has a scalar, AI has the same value — lists are both size 1
+        Map<String, List<String>> human = JsonFieldExtractor.flatten("{\"status\": \"ok\"}");
+        Map<String, List<String>> ai    = JsonFieldExtractor.flatten("{\"status\": \"ok\"}");
+        assertEquals(human.get("status"), ai.get("status"));
+    }
+
+    @Test
+    public void flatArraySizesDifferWhenElementCountsDiffer() {
+        // Different number of items — lists have different sizes
+        Map<String, List<String>> human = JsonFieldExtractor.flatten("{\"tags\": [\"a\", \"b\"]}");
+        Map<String, List<String>> ai    = JsonFieldExtractor.flatten("{\"tags\": [\"a\"]}");
+        assertEquals(2, human.get("tags").size());
+        assertEquals(1, ai.get("tags").size());
     }
 
     // ── extractField — plain dot-notation ─────────────────────────────────────
@@ -168,7 +191,6 @@ public class JsonFieldExtractorTest {
 
     @Test
     public void extractFieldArrayIndexFirstElement() {
-        // Canonical configured path: queueImages[0].fileName
         String json = "{\"queueImages\":[{\"fileName\":\"photo.jpg\",\"size\":1024},"
                 + "{\"fileName\":\"thumb.jpg\",\"size\":256}]}";
         assertEquals("photo.jpg",

@@ -13,18 +13,23 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 
 /**
  * Flattens both JSON payloads in a matched pair and emits one
- * {@link TableRow} per field for the image_comparison_results output table.
+ * {@link TableRow} per field value for the image_comparison_results output table.
+ *
+ * <p>For scalar fields one row is emitted.  For array fields one row is emitted
+ * per element (positional comparison after sorting), all under the same
+ * {@code field_name} — no index suffix is added to the field name.
  *
  * <p>Payloads are Barricade-encrypted in the {@code GenericRecord}. This transform
  * decrypts them using {@code key_id} from the human record before flattening.
- * {@code is_match} is computed on plaintext. {@code human_value} and {@code ai_value}
- * are re-encrypted with Barricade before writing to BigQuery.
+ * {@code is_match} is computed on plaintext (case-insensitive).
+ * {@code human_value} and {@code ai_value} are re-encrypted before writing to BigQuery.
  *
  * <h3>ValueProvider fields</h3>
  * {@code firestoreCollection} and {@code kmsKeyPath} are {@link ValueProvider}s so
@@ -79,7 +84,7 @@ public class FlattenAndCompareFn
 
         String humanKeyId = str(human.get("key_id"));
         String aiKeyId    = str(ai.get("key_id"));
-        if (!Objects.equals(humanKeyId, aiKeyId)) {
+        if (!nullSafeEquals(humanKeyId, aiKeyId)) {
             LOG.warn("imageId='{}' has mismatched key_ids (human={}, ai={}) — using human key_id",
                     imageId, humanKeyId, aiKeyId);
         }
@@ -89,8 +94,8 @@ public class FlattenAndCompareFn
         String humanPayload = BarricadeEncryptionUtil.decrypt(keyId, str(human.get("payload")));
         String aiPayload    = BarricadeEncryptionUtil.decrypt(keyId, str(ai.get("payload")));
 
-        Map<String, String> humanFields = JsonFieldExtractor.flatten(humanPayload, arraySortKeys);
-        Map<String, String> aiFields    = JsonFieldExtractor.flatten(aiPayload, arraySortKeys);
+        Map<String, List<String>> humanFields = JsonFieldExtractor.flatten(humanPayload, arraySortKeys);
+        Map<String, List<String>> aiFields    = JsonFieldExtractor.flatten(aiPayload, arraySortKeys);
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty or unparseable for imageId='{}' — skipping", imageId);
@@ -102,35 +107,52 @@ public class FlattenAndCompareFn
         allFields.addAll(humanFields.keySet());
         allFields.addAll(aiFields.keySet());
 
-        String comparedAt = TimestampUtil.formatInstant(Instant.now());
+        String aiCreatedAt    = TimestampUtil.normalizeTimestamp(str(ai.get("created_at")));
+        String humanCreatedAt = TimestampUtil.normalizeTimestamp(str(human.get("created_at")));
+        String comparedAt     = TimestampUtil.formatInstant(Instant.now());
 
-        // ── Emit one row per field ────────────────────────────────────────────
+        // ── Emit one row per field value ──────────────────────────────────────
+        // Scalar fields → single row.
+        // Array fields  → one row per element (positional, after sorting).
+        // If one side has more elements than the other the extra positions are null.
+        int rowsEmitted = 0;
         for (String field : allFields) {
-            String humanVal = humanFields.get(field);
-            String aiVal    = aiFields.get(field);
+            List<String> humanVals = humanFields.getOrDefault(field, Collections.emptyList());
+            List<String> aiVals    = aiFields.getOrDefault(field, Collections.emptyList());
+            int count = Math.max(humanVals.size(), aiVals.size());
 
-            boolean isMatch          = humanVal == null ? aiVal == null
-                                                       : humanVal.equalsIgnoreCase(aiVal);
-            String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
-            String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);
+            for (int i = 0; i < count; i++) {
+                String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
+                String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
 
-            TableRow row = new TableRow()
-                    .set("image_id",         imageId)
-                    .set("key_id",           keyId)
-                    .set("ai_iteration",     iteration)
-                    .set("ai_created_at",    TimestampUtil.normalizeTimestamp(str(ai.get("created_at"))))
-                    .set("human_created_at", TimestampUtil.normalizeTimestamp(str(human.get("created_at"))))
-                    .set("field_name",       field)
-                    .set("human_value",      encryptedHumanVal)
-                    .set("ai_value",         encryptedAiVal)
-                    .set("is_match",         isMatch)
-                    .set("compared_at",      comparedAt);
+                boolean isMatch          = humanVal == null ? aiVal == null
+                                                            : humanVal.equalsIgnoreCase(aiVal);
+                String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
+                String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);
 
-            ctx.output(row);
+                TableRow row = new TableRow()
+                        .set("image_id",         imageId)
+                        .set("key_id",           keyId)
+                        .set("ai_iteration",     iteration)
+                        .set("ai_created_at",    aiCreatedAt)
+                        .set("human_created_at", humanCreatedAt)
+                        .set("field_name",       field)
+                        .set("human_value",      encryptedHumanVal)
+                        .set("ai_value",         encryptedAiVal)
+                        .set("is_match",         isMatch)
+                        .set("compared_at",      comparedAt);
+
+                ctx.output(row);
+                rowsEmitted++;
+            }
         }
 
-        LOG.info("Compared imageId='{}' iteration={} — {} fields emitted",
-                imageId, iteration, allFields.size());
+        LOG.info("Compared imageId='{}' iteration={} — {} rows emitted ({} distinct fields)",
+                imageId, iteration, rowsEmitted, allFields.size());
+    }
+
+    private static boolean nullSafeEquals(String a, String b) {
+        return a == null ? b == null : a.equals(b);
     }
 
     private static String str(Object value) {

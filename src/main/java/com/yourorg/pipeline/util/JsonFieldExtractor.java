@@ -16,21 +16,37 @@ import java.util.Map;
 
 /**
  * Utility that recursively flattens a JSON string into a map of
- * dot-notation field paths to string values.
+ * dot-notation field paths to lists of string values.
  *
- * Examples:
- *   {"a": "val"}              → {"a": "val"}
- *   {"a": {"b": "val"}}       → {"a.b": "val"}
- *   {"a": [1, 2]}             → {"a[0]": "1", "a[1]": "2"}
- *   {"a": [{"b": 1}]}         → {"a[0].b": "1"}
- *   {"a": [{"b":1},{"b":2}]}  → {"a[0].b": "1", "a[1].b": "2"}
- *   {"a": null}               → {"a": null}
+ * <h3>Scalar fields</h3>
+ * Each scalar field maps to a single-element list:
+ * <pre>
+ *   {"a": "val"}        → {"a": ["val"]}
+ *   {"a": {"b": "val"}} → {"a.b": ["val"]}
+ *   {"a": null}         → {"a": [null]}
+ * </pre>
  *
- * Each array element is emitted under its own indexed key (prefix[0], prefix[1], …)
- * so that every element can be compared independently in the output table.
- * Elements are sorted before indexing to make comparison order-insensitive.
- * The sort field per array path can be configured via the arraySortKeys map (dot-notation
- * path → field name). Falls back to full element JSON string sort when no key is configured.
+ * <h3>Array fields</h3>
+ * Every element in an array contributes one entry to the list for that field,
+ * preserving the field name without appending any index:
+ * <pre>
+ *   {"tags": ["x", "y"]}              → {"tags": ["x", "y"]}
+ *   {"items": [{"code":"A"},{"code":"B"}]}
+ *                                     → {"items.code": ["A", "B"]}
+ *   {"items": [{"code":"A","msg":"hi"},
+ *              {"code":"B","msg":"yo"}]}
+ *                                     → {"items.code": ["A", "B"],
+ *                                        "items.msg":  ["hi","yo"]}
+ * </pre>
+ *
+ * Elements are sorted before accumulation (by a configured sort key or by
+ * the full element JSON string) so that comparison is order-insensitive.
+ *
+ * <h3>Usage in FlattenAndCompareFn</h3>
+ * {@link com.yourorg.pipeline.transforms.FlattenAndCompareFn} iterates the
+ * lists positionally — element 0 of human vs element 0 of AI — and emits one
+ * BigQuery row per element, all under the same {@code field_name}.  If one side
+ * has more elements than the other the extra positions are treated as {@code null}.
  */
 public final class JsonFieldExtractor {
 
@@ -50,12 +66,6 @@ public final class JsonFieldExtractor {
      *   "a.b[2].c"                   → root.a.b (array) → element 2 → c
      * </pre>
      *
-     * <ul>
-     *   <li>Segments are split on {@code .}.</li>
-     *   <li>A segment of the form {@code field[n]} navigates into the named field
-     *       (which must be a JSON array) and then selects the element at index {@code n}.</li>
-     * </ul>
-     *
      * Returns {@code null} if the input is null/blank/malformed, any segment is absent
      * or resolves to a JSON null, an array index is out of bounds, or a type mismatch
      * occurs (e.g. expected object, found array).
@@ -68,7 +78,6 @@ public final class JsonFieldExtractor {
             for (String segment : fieldPath.split("\\.")) {
                 int bracketOpen = segment.indexOf('[');
                 if (bracketOpen >= 0) {
-                    // Segment like "queueImages[0]" — object field then array index.
                     int bracketClose = segment.indexOf(']', bracketOpen);
                     if (bracketClose < 0) {
                         LOG.warn("Malformed array index in segment '{}' of path '{}'",
@@ -79,7 +88,6 @@ public final class JsonFieldExtractor {
                     int    index     = Integer.parseInt(
                             segment.substring(bracketOpen + 1, bracketClose));
 
-                    // Step into the named field.
                     if (!current.isJsonObject()) {
                         LOG.warn("Expected JSON object at '{}' in path '{}', found: {}",
                                 fieldName, fieldPath, current.getClass().getSimpleName());
@@ -88,7 +96,6 @@ public final class JsonFieldExtractor {
                     current = current.getAsJsonObject().get(fieldName);
                     if (current == null || current.isJsonNull()) return null;
 
-                    // Step into the array at the given index.
                     if (!current.isJsonArray()) {
                         LOG.warn("Expected JSON array for '{}' in path '{}', found: {}",
                                 fieldName, fieldPath, current.getClass().getSimpleName());
@@ -104,7 +111,6 @@ public final class JsonFieldExtractor {
                     if (current == null || current.isJsonNull()) return null;
 
                 } else {
-                    // Plain field navigation.
                     if (!current.isJsonObject()) {
                         LOG.warn("Expected JSON object at segment '{}' in path '{}', found: {}",
                                 segment, fieldPath, current.getClass().getSimpleName());
@@ -126,19 +132,25 @@ public final class JsonFieldExtractor {
     /**
      * Flattens a JSON string using default sort (full element JSON string).
      */
-    public static Map<String, String> flatten(String json) {
+    public static Map<String, List<String>> flatten(String json) {
         return flatten(json, Collections.emptyMap());
     }
 
     /**
-     * Flattens a JSON string into a map of dot-notation paths → string values.
+     * Flattens a JSON string into a map of dot-notation paths → ordered lists of
+     * string values.
+     *
+     * <p>Scalar fields produce a single-element list.  Array fields produce a
+     * multi-element list — one entry per array element — all under the same key
+     * (no index suffix).  Elements are sorted before accumulation.
      *
      * @param json          raw JSON string
-     * @param arraySortKeys map of dot-notation array path → field name to sort elements by
-     * @return ordered map of flattened field paths to string values
+     * @param arraySortKeys map of dot-notation array path → field name to sort elements by;
+     *                      falls back to full element JSON string when the path is absent
+     * @return ordered map of flattened field paths to value lists
      */
-    public static Map<String, String> flatten(String json, Map<String, String> arraySortKeys) {
-        Map<String, String> result = new LinkedHashMap<>();
+    public static Map<String, List<String>> flatten(String json, Map<String, String> arraySortKeys) {
+        Map<String, List<String>> result = new LinkedHashMap<>();
         if (json == null || json.isBlank()) {
             return result;
         }
@@ -147,7 +159,9 @@ public final class JsonFieldExtractor {
             if (root.isJsonObject()) {
                 flattenObject(root.getAsJsonObject(), "", result, arraySortKeys);
             } else {
-                result.put("$root", root.isJsonNull() ? null : root.toString());
+                List<String> val = new ArrayList<>();
+                val.add(root.isJsonNull() ? null : root.toString());
+                result.put("$root", val);
             }
         } catch (Exception e) {
             LOG.warn("Failed to parse JSON payload, returning empty map. Error: {}", e.getMessage());
@@ -155,8 +169,10 @@ public final class JsonFieldExtractor {
         return result;
     }
 
+    // ── private helpers ───────────────────────────────────────────────────────
+
     private static void flattenObject(JsonObject obj, String prefix,
-                                      Map<String, String> result,
+                                      Map<String, List<String>> result,
                                       Map<String, String> arraySortKeys) {
         for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
             String key = prefix.isEmpty()
@@ -169,37 +185,44 @@ public final class JsonFieldExtractor {
             } else if (val.isJsonArray()) {
                 flattenArray(val.getAsJsonArray(), key, result, arraySortKeys);
             } else if (val.isJsonNull()) {
-                result.put(key, null);
+                result.computeIfAbsent(key, k -> new ArrayList<>()).add(null);
             } else {
-                result.put(key, val.getAsString());
+                result.computeIfAbsent(key, k -> new ArrayList<>()).add(val.getAsString());
             }
         }
     }
 
+    /**
+     * Flattens an array into {@code result}, appending each element's value(s) to the
+     * existing list for {@code prefix} (or to sub-keys for object elements).
+     *
+     * <p>Elements are sorted before accumulation so that positional comparison in
+     * {@code FlattenAndCompareFn} is order-insensitive.
+     */
     private static void flattenArray(JsonArray arr, String prefix,
-                                     Map<String, String> result,
+                                     Map<String, List<String>> result,
                                      Map<String, String> arraySortKeys) {
         List<JsonElement> elements = new ArrayList<>();
         arr.forEach(elements::add);
 
         // Sort by configured field for this path, or fall back to full element string.
-        // Sorting before indexing makes comparison order-insensitive.
         String sortField = arraySortKeys.get(prefix);
         elements.sort(Comparator.comparing(el -> sortValue(el, sortField)));
 
-        // Emit each element under its own indexed key: prefix[0], prefix[1], …
-        // This lets FlattenAndCompareFn compare every element independently.
-        for (int i = 0; i < elements.size(); i++) {
-            JsonElement el          = elements.get(i);
-            String      indexedKey  = prefix + "[" + i + "]";
+        for (JsonElement el : elements) {
             if (el.isJsonObject()) {
-                flattenObject(el.getAsJsonObject(), indexedKey, result, arraySortKeys);
+                // Flatten the object into a temporary map, then merge each key's values
+                // into the main result so all elements share the same field key.
+                Map<String, List<String>> temp = new LinkedHashMap<>();
+                flattenObject(el.getAsJsonObject(), prefix, temp, arraySortKeys);
+                temp.forEach((k, vals) ->
+                        result.computeIfAbsent(k, x -> new ArrayList<>()).addAll(vals));
             } else if (el.isJsonArray()) {
-                flattenArray(el.getAsJsonArray(), indexedKey, result, arraySortKeys);
+                flattenArray(el.getAsJsonArray(), prefix, result, arraySortKeys);
             } else if (el.isJsonNull()) {
-                result.put(indexedKey, null);
+                result.computeIfAbsent(prefix, k -> new ArrayList<>()).add(null);
             } else {
-                result.put(indexedKey, el.getAsString());
+                result.computeIfAbsent(prefix, k -> new ArrayList<>()).add(el.getAsString());
             }
         }
     }
