@@ -78,6 +78,9 @@ public final class TimestampUtil {
      *       {@code "2026-04-24T10:30:00.123456789Z"} (nanos truncated)</li>
      *   <li>BigQuery export format — {@code "2026-04-24 10:30:00 UTC"} or
      *       {@code "2026-04-24 10:30:00.123456 UTC"}</li>
+     *   <li>BigQuery colon-microseconds format — {@code "2024-10-08 15:26:28:46200 UTC"}
+     *       (BQ {@code readTableRows} returns TIMESTAMP with a colon before the fractional
+     *       seconds instead of a dot)</li>
      *   <li>Offset notation — {@code "2026-04-24T10:30:00+00:00"} or
      *       {@code "2026-04-24 10:30:00+00:00"}</li>
      * </ol>
@@ -104,7 +107,32 @@ public final class TimestampUtil {
             return formatInstant(Instant.parse(normalized));
         } catch (DateTimeParseException ignored) { }
 
-        // 3. Offset notation  ("2026-04-24T10:30:00+00:00" / with space)
+        // 3. BigQuery colon-microseconds  ("2024-10-08 15:26:28:46200 UTC")
+        //    BQ readTableRows() can return TIMESTAMP values where the fractional-seconds
+        //    separator is a colon rather than a dot, and leading zeros may be suppressed
+        //    (e.g. 046200 µs is emitted as 46200).  We:
+        //      a) strip " UTC"
+        //      b) find the *last* colon (the one before the microsecond digits)
+        //      c) left-pad the microsecond digits to exactly 6 so Instant.parse
+        //         does not misinterpret them as a decimal fraction
+        //      d) replace the colon with a dot and finish parsing
+        if (value.endsWith(" UTC")) {
+            try {
+                String withoutUtc = value.substring(0, value.length() - 4); // "2024-10-08 15:26:28:46200"
+                int lastColon = withoutUtc.lastIndexOf(':');
+                // Require the segment after the last colon to be all digits (microsecond field),
+                // and that there is still a colon before it (i.e. a real HH:MM:SS prefix).
+                String afterLastColon = withoutUtc.substring(lastColon + 1);
+                if (lastColon > 0 && !afterLastColon.isEmpty() && afterLastColon.chars().allMatch(Character::isDigit)) {
+                    // Left-pad to 6 digits: BQ may omit leading zeros in the µs field
+                    String micros  = String.format("%06d", Long.parseLong(afterLastColon));
+                    String withDot = withoutUtc.substring(0, lastColon) + "." + micros; // "2024-10-08 15:26:28.046200"
+                    return formatInstant(Instant.parse(withDot.replace(" ", "T") + "Z"));
+                }
+            } catch (DateTimeParseException | NumberFormatException ignored) { }
+        }
+
+        // 4. Offset notation  ("2026-04-24T10:30:00+00:00" / with space)
         try {
             String normalized = value.replace(" ", "T");
             return formatInstant(

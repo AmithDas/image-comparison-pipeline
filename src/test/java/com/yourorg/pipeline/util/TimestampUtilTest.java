@@ -69,6 +69,30 @@ public class TimestampUtilTest {
                 TimestampUtil.normalizeTimestamp("2026-04-24 10:30:00.123456 UTC"));
     }
 
+    // ── normalizeTimestamp — BigQuery colon-microseconds ─────────────────────
+
+    @Test
+    public void normalize_bqColonMicros() {
+        // Actual format returned by BQ readTableRows() for TIMESTAMP columns
+        assertEquals("2024-10-08T15:26:28.046200Z",
+                TimestampUtil.normalizeTimestamp("2024-10-08 15:26:28:46200 UTC"));
+    }
+
+    @Test
+    public void normalize_bqColonMicrosWholeSeconds() {
+        // Colon format without fractional part — last ':' is the HH:MM:SS separator,
+        // so this should still fall through to the ordinary BQ UTC parser.
+        assertEquals("2024-10-08T15:26:28.000000Z",
+                TimestampUtil.normalizeTimestamp("2024-10-08 15:26:28 UTC"));
+    }
+
+    @Test
+    public void normalize_bqColonMicrosSixDigits() {
+        // Six explicit digits after the colon
+        assertEquals("2024-10-08T15:26:28.123456Z",
+                TimestampUtil.normalizeTimestamp("2024-10-08 15:26:28:123456 UTC"));
+    }
+
     // ── normalizeTimestamp — offset notation ──────────────────────────────────
 
     @Test
