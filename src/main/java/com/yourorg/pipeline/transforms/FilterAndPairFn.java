@@ -289,9 +289,26 @@ public class FilterAndPairFn
         r.put("created_at",      TimestampUtil.normalizeTimestamp(str(row.get("created_at"))));
         r.put("first_seen_at",   TimestampUtil.normalizeTimestamp(str(row.get("first_seen_at"))));
         r.put("last_retried_at", TimestampUtil.normalizeTimestamp(str(row.get("last_retried_at"))));
-        r.put("retry_count",     row.get("retry_count") != null
-                ? ((Number) row.get("retry_count")).longValue() : 0L);
+        r.put("retry_count",     parseLong(row.get("retry_count")));
         return r;
+    }
+
+    /**
+     * Safely converts a BigQuery cell value to a {@code long}.
+     *
+     * <p>BigQuery's {@code readTableRows()} returns INTEGER columns as {@link String},
+     * not as {@link Number}, so a direct cast fails on the second (and subsequent) runs
+     * when the pending row is round-tripped through BQ.  This helper handles both types.
+     */
+    private static long parseLong(Object value) {
+        if (value == null) return 0L;
+        if (value instanceof Number) return ((Number) value).longValue();
+        try {
+            return Long.parseLong(value.toString().trim());
+        } catch (NumberFormatException e) {
+            LOG.warn("Could not parse retry_count '{}' as long — defaulting to 0", value);
+            return 0L;
+        }
     }
 
     private static String str(Object value) {

@@ -56,6 +56,17 @@ public class FilterAndPairFnTest {
     /** Creates a pending TableRow for a single pending record. */
     private static TableRow pendingRow(String imageId, String pendingType,
                                        String keyId, String createdAt, String firstSeenAt) {
+        return pendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt, 0L);
+    }
+
+    /**
+     * Overload that lets callers control {@code retry_count} and its Java type.
+     * Pass a {@link String} to simulate BQ's {@code readTableRows()} behaviour,
+     * which returns INTEGER columns as {@code String} rather than {@code Long}.
+     */
+    private static TableRow pendingRow(String imageId, String pendingType,
+                                       String keyId, String createdAt, String firstSeenAt,
+                                       Object retryCount) {
         return new TableRow()
                 .set("image_id",        imageId)
                 .set("pending_type",    pendingType)
@@ -64,7 +75,7 @@ public class FilterAndPairFnTest {
                 .set("created_at",      createdAt)
                 .set("first_seen_at",   firstSeenAt)
                 .set("last_retried_at", firstSeenAt)
-                .set("retry_count",     0L);
+                .set("retry_count",     retryCount);
     }
 
     /** Wires source + pending rows through CoGroupByKey → FilterAndPairFn. */
@@ -273,6 +284,47 @@ public class FilterAndPairFnTest {
             return null;
         });
 
+        pipeline.run().waitUntilFinish();
+    }
+
+    /**
+     * BQ's readTableRows() returns INTEGER columns as String, not Long.
+     * On the second execution the pending row read back from BQ will have
+     * retry_count = "1" (String).  This must not throw a ClassCastException.
+     *
+     * Expected: 1 MATCHED pair, human re-pended with retry_count incremented.
+     */
+    @Test
+    public void retryCountAsStringDoesNotThrow() {
+        TableRow human = sourceRow("img005", HUMAN_METHOD, "key1", "2026-04-03T10:00:00Z");
+        // Simulate BQ returning retry_count as a String (second run round-trip)
+        TableRow pendingAi = pendingRow("img005", "ai", "key1",
+                "2026-04-02T08:00:00Z", Instant.now().minusSeconds(3600).toString(),
+                "1" /* String, not Long */);
+
+        PCollectionTuple routed = runPipeline("img005",
+                List.of(human), List.of(pendingAi));
+
+        PAssert.that(matched(routed)).satisfies(pairs -> {
+            List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
+            pairs.forEach(list::add);
+            assertEquals("Expected 1 matched pair", 1, list.size());
+            assertEquals("img005::1", list.get(0).getKey());
+            return null;
+        });
+
+        // Human should be re-pended; retry_count on the NEW_PENDING record
+        // should be 2 (parsed "1" + 1 increment from metaRetryCount).
+        PAssert.that(newPending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals(1, list.size());
+            assertEquals("human", list.get(0).get("pending_type").toString());
+            assertEquals(2L, list.get(0).get("retry_count"));
+            return null;
+        });
+
+        PAssert.that(agedOut(routed)).empty();
         pipeline.run().waitUntilFinish();
     }
 }
