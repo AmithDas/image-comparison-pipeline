@@ -36,33 +36,73 @@ public class JsonFieldExtractorTest {
     }
 
     @Test
-    public void flatHandlesArrayValues() {
+    public void flatPrimitiveArrayEmitsIndexedKeys() {
         String json = "{\"tags\": [\"x\", \"y\"]}";
         Map<String, String> result = JsonFieldExtractor.flatten(json);
-        assertEquals("[\"x\",\"y\"]", result.get("tags"));
+        // Each element gets its own indexed key
+        assertEquals("x", result.get("tags[0]"));
+        assertEquals("y", result.get("tags[1]"));
+        assertEquals(2, result.size());
     }
 
     @Test
     public void flatArrayOrderIsInsensitive() {
+        // Elements are sorted before indexing, so the same logical set maps to the
+        // same indexed keys regardless of the original order.
         Map<String, String> r1 = JsonFieldExtractor.flatten("{\"tags\": [\"y\", \"x\"]}");
         Map<String, String> r2 = JsonFieldExtractor.flatten("{\"tags\": [\"x\", \"y\"]}");
-        assertEquals(r1.get("tags"), r2.get("tags"));
+        assertEquals(r1.get("tags[0]"), r2.get("tags[0]"));
+        assertEquals(r1.get("tags[1]"), r2.get("tags[1]"));
     }
 
     @Test
-    public void flatArrayOfObjectsMergesFieldsUnderParentKey() {
+    public void flatArrayOfObjectsEmitsIndexedDotKeys() {
         String json = "{\"terms\": [{\"code\": \"A\", \"message\": \"hello\"},"
                 + "{\"code\": \"B\", \"message\": \"world\"}]}";
         Map<String, String> result = JsonFieldExtractor.flatten(json);
-        assertTrue(result.containsKey("terms.code"));
-        assertTrue(result.containsKey("terms.message"));
+        // Sorted by full-element JSON string: "A" object sorts before "B"
+        assertEquals("A",     result.get("terms[0].code"));
+        assertEquals("hello", result.get("terms[0].message"));
+        assertEquals("B",     result.get("terms[1].code"));
+        assertEquals("world", result.get("terms[1].message"));
+        assertEquals(4, result.size());
     }
 
     @Test
-    public void flatSingleElementArrayStoredAsScalar() {
+    public void flatSingleElementArrayEmitsSingleIndexedKey() {
         String json = "{\"tags\": [\"only\"]}";
         Map<String, String> result = JsonFieldExtractor.flatten(json);
-        assertEquals("only", result.get("tags"));
+        assertEquals("only", result.get("tags[0]"));
+        assertEquals(1, result.size());
+    }
+
+    @Test
+    public void flatArrayNullElementEmitsIndexedNullKey() {
+        String json = "{\"items\": [null, \"present\"]}";
+        Map<String, String> result = JsonFieldExtractor.flatten(json);
+        // null sorts before "present" as a string
+        assertNull(result.get("items[0]"));
+        assertEquals("present", result.get("items[1]"));
+    }
+
+    @Test
+    public void flatNestedArrayEmitsDoublyIndexedKeys() {
+        // Array of arrays
+        String json = "{\"matrix\": [[\"a\", \"b\"], [\"c\"]]}";
+        Map<String, String> result = JsonFieldExtractor.flatten(json);
+        // Outer sorted by full JSON; inner sorted too
+        assertTrue(result.containsKey("matrix[0][0]"));
+        assertTrue(result.containsKey("matrix[0][1]"));
+        assertTrue(result.containsKey("matrix[1][0]"));
+    }
+
+    @Test
+    public void flatArrayWithSortKeyUsesConfiguredField() {
+        String json = "{\"items\": [{\"id\": \"z\", \"val\": 1}, {\"id\": \"a\", \"val\": 2}]}";
+        Map<String, String> result = JsonFieldExtractor.flatten(json, Map.of("items", "id"));
+        // Sorted by "id": "a" object first, "z" object second
+        assertEquals("a", result.get("items[0].id"));
+        assertEquals("z", result.get("items[1].id"));
     }
 
     @Test

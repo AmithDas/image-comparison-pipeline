@@ -2,7 +2,6 @@ package com.yourorg.pipeline.util;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
-import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.slf4j.Logger;
@@ -22,12 +21,14 @@ import java.util.Map;
  * Examples:
  *   {"a": "val"}              → {"a": "val"}
  *   {"a": {"b": "val"}}       → {"a.b": "val"}
- *   {"a": [1, 2]}             → {"a": "[\"1\",\"2\"]"}  (multiple values collected into JSON array)
- *   {"a": [{"b": 1}]}         → {"a.b": "1"}
- *   {"a": [{"b":1},{"b":2}]}  → {"a.b": "[\"1\",\"2\"]"}
+ *   {"a": [1, 2]}             → {"a[0]": "1", "a[1]": "2"}
+ *   {"a": [{"b": 1}]}         → {"a[0].b": "1"}
+ *   {"a": [{"b":1},{"b":2}]}  → {"a[0].b": "1", "a[1].b": "2"}
  *   {"a": null}               → {"a": null}
  *
- * Array elements are sorted before accumulation to make comparison order-insensitive.
+ * Each array element is emitted under its own indexed key (prefix[0], prefix[1], …)
+ * so that every element can be compared independently in the output table.
+ * Elements are sorted before indexing to make comparison order-insensitive.
  * The sort field per array path can be configured via the arraySortKeys map (dot-notation
  * path → field name). Falls back to full element JSON string sort when no key is configured.
  */
@@ -182,40 +183,25 @@ public final class JsonFieldExtractor {
         arr.forEach(elements::add);
 
         // Sort by configured field for this path, or fall back to full element string.
+        // Sorting before indexing makes comparison order-insensitive.
         String sortField = arraySortKeys.get(prefix);
         elements.sort(Comparator.comparing(el -> sortValue(el, sortField)));
 
-        // Flatten each element into a temp map, then merge into an accumulator.
-        // Keys that appear in multiple elements collect all values into a JSON array.
-        Map<String, List<String>> accumulated = new LinkedHashMap<>();
-        for (JsonElement el : elements) {
-            Map<String, String> elResult = new LinkedHashMap<>();
+        // Emit each element under its own indexed key: prefix[0], prefix[1], …
+        // This lets FlattenAndCompareFn compare every element independently.
+        for (int i = 0; i < elements.size(); i++) {
+            JsonElement el          = elements.get(i);
+            String      indexedKey  = prefix + "[" + i + "]";
             if (el.isJsonObject()) {
-                flattenObject(el.getAsJsonObject(), prefix, elResult, arraySortKeys);
+                flattenObject(el.getAsJsonObject(), indexedKey, result, arraySortKeys);
             } else if (el.isJsonArray()) {
-                flattenArray(el.getAsJsonArray(), prefix, elResult, arraySortKeys);
+                flattenArray(el.getAsJsonArray(), indexedKey, result, arraySortKeys);
             } else if (el.isJsonNull()) {
-                elResult.put(prefix, null);
+                result.put(indexedKey, null);
             } else {
-                elResult.put(prefix, el.getAsString());
+                result.put(indexedKey, el.getAsString());
             }
-            elResult.forEach((k, v) ->
-                    accumulated.computeIfAbsent(k, x -> new ArrayList<>()).add(v));
         }
-
-        // Write to result: single value as-is; multiple values as a JSON array string.
-        accumulated.forEach((k, values) -> {
-            if (values.size() == 1) {
-                result.put(k, values.get(0));
-            } else {
-                JsonArray jsonArr = new JsonArray();
-                values.forEach(v -> {
-                    if (v == null) jsonArr.add(JsonNull.INSTANCE);
-                    else jsonArr.add(v);
-                });
-                result.put(k, jsonArr.toString());
-            }
-        });
     }
 
     private static String sortValue(JsonElement el, String sortField) {

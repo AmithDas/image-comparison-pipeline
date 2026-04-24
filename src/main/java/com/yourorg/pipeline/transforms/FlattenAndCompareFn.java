@@ -14,7 +14,6 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -110,7 +109,8 @@ public class FlattenAndCompareFn
             String humanVal = humanFields.get(field);
             String aiVal    = aiFields.get(field);
 
-            boolean isMatch          = Objects.equals(humanVal, aiVal);
+            boolean isMatch          = humanVal == null ? aiVal == null
+                                                       : humanVal.equalsIgnoreCase(aiVal);
             String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
             String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);
 
