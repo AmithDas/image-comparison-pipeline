@@ -3,6 +3,7 @@ package com.yourorg.pipeline.transforms;
 import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
+import com.yourorg.pipeline.util.TimestampUtil;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
@@ -102,7 +103,7 @@ public class FlattenAndCompareFn
         allFields.addAll(humanFields.keySet());
         allFields.addAll(aiFields.keySet());
 
-        String comparedAt = Instant.now().toString();
+        String comparedAt = TimestampUtil.formatInstant(Instant.now());
 
         // ── Emit one row per field ────────────────────────────────────────────
         for (String field : allFields) {
@@ -117,8 +118,8 @@ public class FlattenAndCompareFn
                     .set("image_id",         imageId)
                     .set("key_id",           keyId)
                     .set("ai_iteration",     iteration)
-                    .set("ai_created_at",    str(ai.get("created_at")))
-                    .set("human_created_at", str(human.get("created_at")))
+                    .set("ai_created_at",    TimestampUtil.normalizeTimestamp(str(ai.get("created_at"))))
+                    .set("human_created_at", TimestampUtil.normalizeTimestamp(str(human.get("created_at"))))
                     .set("field_name",       field)
                     .set("human_value",      encryptedHumanVal)
                     .set("ai_value",         encryptedAiVal)

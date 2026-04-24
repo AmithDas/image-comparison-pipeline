@@ -166,9 +166,9 @@ public class FilterAndPairFnTest {
                         pair.getValue().getValue().get("created_at").toString());
             }
             assertEquals("Iteration 1 should be the earlier AI (08:00)",
-                    "2026-04-01T08:00:00Z", pairKeyToAiCreatedAt.get("img001::1"));
+                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::1"));
             assertEquals("Iteration 2 should be the later AI (09:00)",
-                    "2026-04-01T09:00:00Z", pairKeyToAiCreatedAt.get("img001::2"));
+                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::2"));
 
             return null;
         });

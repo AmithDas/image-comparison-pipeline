@@ -6,6 +6,7 @@ import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
 import com.yourorg.pipeline.util.SchemaRegistry;
 import com.yourorg.pipeline.util.SchemaUtil;
+import com.yourorg.pipeline.util.TimestampUtil;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.Pipeline;
@@ -387,7 +388,7 @@ public class ImageComparisonPipeline {
                 .set("payload",       str(r.get("payload")))
                 .set("created_at",    str(r.get("created_at")))
                 .set("first_seen_at", str(r.get("first_seen_at")))
-                .set("aged_out_at",   Instant.now().toString())
+                .set("aged_out_at",   TimestampUtil.formatInstant(Instant.now()))
                 .set("reason",        "No counterpart payload after "
                         + FilterAndPairFn.MAX_WAIT_DAYS + " days");
     }

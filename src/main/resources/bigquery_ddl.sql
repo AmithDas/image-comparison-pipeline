@@ -89,6 +89,35 @@ OPTIONS (
 );
 
 
+-- ------------------------------------------------------------
+-- 5. Pipeline run lookup table
+--    Drives the Airflow DAG: each row defines one Dataflow run's
+--    processing window.  The DAG picks the earliest PENDING row,
+--    marks it RUNNING before submission, then DONE or FAILED.
+--
+--    Populate this table before each pipeline window, e.g.:
+--
+--    INSERT INTO `your_project.your_dataset.lookup`
+--      (run_id, window_start, window_end, status)
+--    VALUES
+--      ('run-2026-04-23-00', '2026-04-23T00:00:00Z', '2026-04-23T03:00:00Z', 'PENDING'),
+--      ('run-2026-04-23-03', '2026-04-23T03:00:00Z', '2026-04-23T06:00:00Z', 'PENDING'),
+--      ('run-2026-04-23-06', '2026-04-23T06:00:00Z', '2026-04-23T09:00:00Z', 'PENDING');
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `your_project.your_dataset.lookup` (
+  run_id        STRING    NOT NULL,  -- unique run identifier, e.g. "run-2026-04-23-03"
+  window_start  TIMESTAMP NOT NULL,  -- inclusive start of the processing window
+  window_end    TIMESTAMP NOT NULL,  -- exclusive end of the processing window
+  status        STRING    NOT NULL   -- PENDING | RUNNING | DONE | FAILED
+)
+OPTIONS (
+  description = "Lookup table controlling which time windows the image-comparison "
+                "Dataflow pipeline processes.  The Airflow DAG picks the earliest "
+                "PENDING row, marks it RUNNING, then DONE or FAILED after the job "
+                "completes.  Insert rows here to schedule new pipeline runs."
+);
+
+
 -- ============================================================
 -- Useful monitoring queries
 -- ============================================================

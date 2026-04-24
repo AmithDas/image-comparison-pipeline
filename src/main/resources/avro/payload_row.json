@@ -7,6 +7,6 @@
     {"name": "key_id",       "type": "string"},
     {"name": "payload_type", "type": "string"},
     {"name": "payload",      "type": "string"},
-    {"name": "created_at",   "type": ["null", "string"], "default": null}
+    {"name": "created_at",   "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"}
   ]
 }

@@ -1,6 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.util.TimestampUtil;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
@@ -107,8 +108,11 @@ public class FilterAndPairFn
                 continue;
             }
 
+            // Normalize created_at on ingestion — source BQ rows may use
+            // "YYYY-MM-DD HH:MM:SS UTC" or other formats; we write RFC 3339.
+            String createdAtNorm = TimestampUtil.normalizeTimestamp((String) row.get("created_at"));
             GenericRecord p = newPayloadRow(imageId, keyId, payloadType,
-                    encryptedPayload, (String) row.get("created_at"));
+                    encryptedPayload, createdAtNorm);
             if ("human".equals(payloadType)) {
                 humanRows.add(p);
             } else {
@@ -270,8 +274,8 @@ public class FilterAndPairFn
         r.put("pending_type",    pendingType);
         r.put("payload",         payload);
         r.put("created_at",      createdAt);
-        r.put("first_seen_at",   firstSeen != null ? firstSeen.toString() : null);
-        r.put("last_retried_at", now.toString());
+        r.put("first_seen_at",   TimestampUtil.formatInstant(firstSeen));
+        r.put("last_retried_at", TimestampUtil.formatInstant(now));
         r.put("retry_count",     retryCount);
         return r;
     }
@@ -282,11 +286,9 @@ public class FilterAndPairFn
         r.put("key_id",          row.get("key_id"));
         r.put("pending_type",    row.get("pending_type"));
         r.put("payload",         row.get("payload"));
-        r.put("created_at",      row.get("created_at"));
-        r.put("first_seen_at",   row.get("first_seen_at") != null
-                ? row.get("first_seen_at").toString() : null);
-        r.put("last_retried_at", row.get("last_retried_at") != null
-                ? row.get("last_retried_at").toString() : null);
+        r.put("created_at",      TimestampUtil.normalizeTimestamp(str(row.get("created_at"))));
+        r.put("first_seen_at",   TimestampUtil.normalizeTimestamp(str(row.get("first_seen_at"))));
+        r.put("last_retried_at", TimestampUtil.normalizeTimestamp(str(row.get("last_retried_at"))));
         r.put("retry_count",     row.get("retry_count") != null
                 ? ((Number) row.get("retry_count")).longValue() : 0L);
         return r;
