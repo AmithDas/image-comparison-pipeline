@@ -289,52 +289,97 @@ public final class JsonFieldExtractor {
      * Derives the match-key value for an array element from a key specification.
      *
      * <h3>Key specification format</h3>
-     * The {@code keySpec} is a {@code -}-separated list of field names whose values
-     * are extracted from the element and joined with {@code -} to form a composite key.
+     * <ul>
+     *   <li>Components are separated by {@code -}.</li>
+     *   <li>Each component may be a simple field name <em>or</em> a dot-notation path
+     *       that navigates into nested objects/arrays.  When a path segment resolves to
+     *       an array, the <b>first element</b> of that array is used automatically.</li>
+     * </ul>
      *
      * <pre>
      *   keySpec = "code"
-     *     → element.code                              e.g. "T1"
+     *       → element.code                                 e.g. "T1"
      *
      *   keySpec = "accountnumber-customernumber-dateopened-code"
-     *     → element.accountnumber + "-" + element.customernumber
-     *       + "-" + element.dateopened + "-" + element.code
-     *                                               e.g. "ACC123-CUST456-2020-01-01-TL01"
+     *       → element.accountnumber + "-" + element.customernumber + ...
+     *                                                      e.g. "acc123-cust1-2020-01-01-tl01"
+     *
+     *   keySpec = "customerNumber-disputeCodes.code"
+     *       → element.customerNumber + "-" + element.disputeCodes[0].code
+     *                                                      e.g. "234-234"
      * </pre>
      *
-     * <p>If a component field is missing or null in the element, the literal string
-     * {@code "null"} is used for that component so the key remains well-defined and
-     * consistent between human and AI sides.
+     * <p>Missing or null components are substituted with the literal {@code "null"} so
+     * the key always has a defined, consistent value on both sides.
+     * The final key is lower-cased for case-insensitive matching.
      */
     private static String extractKeyValue(JsonElement el, String keySpec, String arrayPath) {
-        String[] keyFields = keySpec.split("-");
+        String[] components = keySpec.split("-");
         StringBuilder composedKey = new StringBuilder();
 
-        for (int i = 0; i < keyFields.length; i++) {
+        for (int i = 0; i < components.length; i++) {
             if (i > 0) composedKey.append("-");
-            String fieldName = keyFields[i].trim();
-
-            if (el.isJsonObject()) {
-                JsonElement keyEl = el.getAsJsonObject().get(fieldName);
-                if (keyEl != null && !keyEl.isJsonNull()) {
-                    composedKey.append(
-                            keyEl.isJsonPrimitive() ? keyEl.getAsString() : keyEl.toString());
-                } else {
-                    LOG.warn("Array '{}': element missing key field '{}' in key spec '{}' — using \"null\"",
-                            arrayPath, fieldName, keySpec);
-                    composedKey.append("null");
-                }
-            } else {
-                // Non-object element (primitive / nested array) — use full JSON as fallback
-                LOG.warn("Array '{}': element is not a JSON object, cannot extract key field '{}' — using element JSON",
-                        arrayPath, fieldName);
-                composedKey.append(el.toString());
-                break; // no point iterating further
-            }
+            String component = components[i].trim();
+            String value     = extractComponentValue(el, component, keySpec, arrayPath);
+            composedKey.append(value != null ? value : "null");
         }
 
-        // Normalise to lower-case so key matching is case-insensitive.
-        // e.g. human "ACC123" and AI "acc123" resolve to the same key "acc123".
+        // Lower-case for case-insensitive key matching.
         return composedKey.toString().toLowerCase();
+    }
+
+    /**
+     * Extracts a single key component value by navigating a dot-notation path.
+     *
+     * <p>At each dot-segment:
+     * <ol>
+     *   <li>If the current element is an object, navigate into the named field.</li>
+     *   <li>If the current element is an array, take its first element and then
+     *       navigate into the named field of that element.</li>
+     * </ol>
+     *
+     * <p>Returns {@code null} if the path cannot be resolved (missing field, empty
+     * array, or type mismatch).
+     */
+    private static String extractComponentValue(JsonElement el, String dotPath,
+                                                String keySpec, String arrayPath) {
+        JsonElement current = el;
+
+        for (String segment : dotPath.split("\\.")) {
+            if (current == null || current.isJsonNull()) return null;
+
+            // If we land on an array, take its first element before navigating further.
+            if (current.isJsonArray()) {
+                JsonArray arr = current.getAsJsonArray();
+                if (arr.isEmpty()) {
+                    LOG.warn("Array '{}': empty array at segment '{}' in key spec '{}'",
+                            arrayPath, segment, keySpec);
+                    return null;
+                }
+                current = arr.get(0);
+                if (current == null || current.isJsonNull()) return null;
+            }
+
+            if (!current.isJsonObject()) {
+                LOG.warn("Array '{}': expected object at segment '{}' in key spec '{}', found {}",
+                        arrayPath, segment, keySpec, current.getClass().getSimpleName());
+                return null;
+            }
+
+            current = current.getAsJsonObject().get(segment);
+        }
+
+        if (current == null || current.isJsonNull()) return null;
+
+        // If the resolved value is still an array (e.g. path ended at an array field),
+        // take the first element.
+        if (current.isJsonArray()) {
+            JsonArray arr = current.getAsJsonArray();
+            if (arr.isEmpty()) return null;
+            current = arr.get(0);
+        }
+
+        if (current == null || current.isJsonNull()) return null;
+        return current.isJsonPrimitive() ? current.getAsString() : current.toString();
     }
 }

@@ -324,4 +324,98 @@ public class JsonFieldExtractorTest {
     @Test public void extractFieldNullJsonReturnsNull()     { assertNull(JsonFieldExtractor.extractField(null,  "name")); }
     @Test public void extractFieldBlankJsonReturnsNull()    { assertNull(JsonFieldExtractor.extractField("  ", "name")); }
     @Test public void extractFieldMalformedJsonReturnsNull(){ assertNull(JsonFieldExtractor.extractField("{bad", "name")); }
+
+    // ── flatten — composite key with dot-notation path components ─────────────
+    // These tests cover extractComponentValue: dot-notation within a key component
+    // to navigate into nested objects/arrays (auto first-element for arrays).
+
+    @Test
+    public void flatCompositeKeyDotNotationNavigatesNestedArray() {
+        // customerNumber is a scalar; disputeCodes is an array of objects.
+        // Key spec "customerNumber-disputeCodes.code" should:
+        //   component 1 → element.customerNumber           → "234"
+        //   component 2 → element.disputeCodes[0].code     → "234"
+        //   composed key → "234-234"
+        String json = "{\"collections\":[{"
+                + "\"customerNumber\":\"234\","
+                + "\"disputeCodes\":[{\"code\":\"234\",\"message\":\"smsdfs\"}]"
+                + "}]}";
+
+        Map<String, List<FieldValue>> result = JsonFieldExtractor.flatten(
+                json, Map.of("collections", "customerNumber-disputeCodes.code"));
+
+        assertEquals(List.of("234-234"), keys(result, "collections.customerNumber"));
+    }
+
+    @Test
+    public void flatCompositeKeyDotNotationMissingNestedFieldUsesNull() {
+        // disputeCodes elements have no "code" field → component 2 should be "null"
+        String json = "{\"collections\":[{"
+                + "\"customerNumber\":\"234\","
+                + "\"disputeCodes\":[{\"message\":\"no-code-here\"}]"
+                + "}]}";
+
+        Map<String, List<FieldValue>> result = JsonFieldExtractor.flatten(
+                json, Map.of("collections", "customerNumber-disputeCodes.code"));
+
+        assertEquals(List.of("234-null"), keys(result, "collections.customerNumber"));
+    }
+
+    @Test
+    public void flatCompositeKeyDotNotationEmptyNestedArrayUsesNull() {
+        // disputeCodes is empty → first-element auto-select returns null → component is "null"
+        String json = "{\"collections\":[{"
+                + "\"customerNumber\":\"234\","
+                + "\"disputeCodes\":[]"
+                + "}]}";
+
+        Map<String, List<FieldValue>> result = JsonFieldExtractor.flatten(
+                json, Map.of("collections", "customerNumber-disputeCodes.code"));
+
+        assertEquals(List.of("234-null"), keys(result, "collections.customerNumber"));
+    }
+
+    @Test
+    public void flatCompositeKeyDotNotationMissingNestedObjectFieldUsesNull() {
+        // disputeCodes is absent entirely → component should be "null"
+        String json = "{\"collections\":[{\"customerNumber\":\"456\"}]}";
+
+        Map<String, List<FieldValue>> result = JsonFieldExtractor.flatten(
+                json, Map.of("collections", "customerNumber-disputeCodes.code"));
+
+        assertEquals(List.of("456-null"), keys(result, "collections.customerNumber"));
+    }
+
+    @Test
+    public void flatCompositeKeyDotNotationMultipleElements() {
+        // Two collection elements each with a different customerNumber and disputeCode.
+        String json = "{\"collections\":["
+                + "{\"customerNumber\":\"100\",\"disputeCodes\":[{\"code\":\"D1\"}]},"
+                + "{\"customerNumber\":\"200\",\"disputeCodes\":[{\"code\":\"D2\"}]}"
+                + "]}";
+
+        Map<String, List<FieldValue>> result = JsonFieldExtractor.flatten(
+                json, Map.of("collections", "customerNumber-disputeCodes.code"));
+
+        // Both composite keys should appear, order preserved (insertion order of elements)
+        List<String> keyList = keys(result, "collections.customerNumber");
+        assertEquals(2, keyList.size());
+        assertTrue(keyList.contains("100-d1"));
+        assertTrue(keyList.contains("200-d2"));
+    }
+
+    @Test
+    public void flatCompositeKeyDotNotationDeeplyNested() {
+        // Three-level path: element.outer.inner[0].id
+        // Key spec component: "outer.inner.id"
+        String json = "{\"items\":[{"
+                + "\"name\":\"foo\","
+                + "\"outer\":{\"inner\":[{\"id\":\"ID99\"}]}"
+                + "}]}";
+
+        Map<String, List<FieldValue>> result = JsonFieldExtractor.flatten(
+                json, Map.of("items", "name-outer.inner.id"));
+
+        assertEquals(List.of("foo-id99"), keys(result, "items.name"));
+    }
 }
