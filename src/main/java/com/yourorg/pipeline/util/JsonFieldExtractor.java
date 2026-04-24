@@ -248,8 +248,13 @@ public final class JsonFieldExtractor {
             // ── Key-based ────────────────────────────────────────────────────
             // Each element is tagged with its key value; the field path stays
             // plain (terms.code, not terms[A].code).
+            // If a parent key was inherited, prepend it so the child key is
+            // fully qualified (e.g. parent="sdf" + child="1" → "sdf-1").
             for (JsonElement el : elements) {
                 String keyValue = extractKeyValue(el, matchKeyField, prefix);
+                if (inheritedMatchKey != null) {
+                    keyValue = inheritedMatchKey + "-" + keyValue;
+                }
                 if (el.isJsonObject()) {
                     flattenObject(el.getAsJsonObject(), prefix, keyValue, result, arrayMatchKeys);
                 } else {
