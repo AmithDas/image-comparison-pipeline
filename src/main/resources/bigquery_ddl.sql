@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.image_comparison_results` 
   ai_iteration      INT64     NOT NULL,   -- 1-based, ordered by created_at ASC
   ai_created_at     TIMESTAMP,
   human_created_at  TIMESTAMP,
-  field_name        STRING    NOT NULL,   -- dot-notation path e.g. "metadata.label"
+  field_name        STRING    NOT NULL,   -- dot-notation path e.g. "terms.code"
+  array_key         STRING,              -- match-key value for keyed arrays (e.g. "A"); null for scalars
   human_value       STRING,              -- Barricade-encrypted; null if field absent in human payload
   ai_value          STRING,              -- Barricade-encrypted; null if field absent in AI payload
   is_match          BOOL      NOT NULL,  -- compared on plaintext before encryption

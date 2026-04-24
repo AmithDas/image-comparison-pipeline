@@ -144,12 +144,7 @@ public class ImageComparisonPipeline {
         ValueProvider<String> getHumanMethod();
         void setHumanMethod(ValueProvider<String> value);
 
-        @Description("Comma-separated sort keys per array path, e.g. 'terms=code,items=id'. "
-                + "Omit to sort by full element JSON string.")
-        ValueProvider<String> getArraySortKeys();
-        void setArraySortKeys(ValueProvider<String> value);
-
-        @Description("Dot-notation path to the image identifier field inside the decrypted payload. "
+@Description("Dot-notation path to the image identifier field inside the decrypted payload. "
                 + "Supports nested fields and array indexing, e.g. 'queueImages[0].fileName'. "
                 + "Rows where this field is absent or null are skipped.")
         @Default.String("queueImages[0].fileName")
@@ -323,7 +318,6 @@ public class ImageComparisonPipeline {
         PCollection<TableRow> comparisonResults = matched
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
-                                parseArraySortKeys(options.getArraySortKeys()),
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath())));
 
@@ -397,17 +391,5 @@ public class ImageComparisonPipeline {
         return value != null ? value.toString() : null;
     }
 
-    private static Map<String, String> parseArraySortKeys(ValueProvider<String> raw) {
-        if (raw == null || !raw.isAccessible() || raw.get() == null || raw.get().isBlank()) {
-            return Collections.emptyMap();
-        }
-        Map<String, String> map = new java.util.HashMap<>();
-        for (String entry : raw.get().split(",")) {
-            String[] parts = entry.split("=", 2);
-            if (parts.length == 2 && !parts[0].isBlank() && !parts[1].isBlank()) {
-                map.put(parts[0].trim(), parts[1].trim());
-            }
-        }
-        return map;
-    }
+
 }
