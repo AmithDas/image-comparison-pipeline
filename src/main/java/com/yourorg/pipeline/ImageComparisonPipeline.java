@@ -4,6 +4,7 @@ import com.google.api.services.bigquery.model.TableRow;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
+import com.yourorg.pipeline.transforms.OrphanCompareFn;
 import com.yourorg.pipeline.util.SchemaRegistry;
 import com.yourorg.pipeline.util.SchemaUtil;
 import com.yourorg.pipeline.util.TimestampUtil;
