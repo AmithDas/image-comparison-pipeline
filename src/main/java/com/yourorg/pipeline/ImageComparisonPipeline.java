@@ -134,6 +134,14 @@ public class ImageComparisonPipeline {
         ValueProvider<String> getDocproofOutputTable();
         void setDocproofOutputTable(ValueProvider<String> value);
 
+        @Description("BigQuery table for still-pending payload snapshot. "
+                + "Same schema as --outputTable. Truncated and rewritten on every run — "
+                + "records automatically disappear once their counterpart is matched. "
+                + "Format: project:dataset.table")
+        @Validation.Required
+        ValueProvider<String> getPendingSnapshotTable();
+        void setPendingSnapshotTable(ValueProvider<String> value);
+
         @Description("Inclusive start of the processing window (ISO-8601, e.g. 2026-04-16T00:00:00Z). "
                 + "Only source rows with created_at >= windowStart are read.")
         @Validation.Required
@@ -370,6 +378,45 @@ public class ImageComparisonPipeline {
                                 .to(options.getDeadLetterTable())
                                 .withSchema(SchemaUtil.deadLetterSchema())
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
+                                .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
+
+        // ── 12. Flatten aged-out payloads → mismatch rows in comparison tables ─
+        // Each field in the orphaned payload is emitted with one side null,
+        // making is_match=false for every row, so downstream queries can see
+        // exactly which fields were present on the orphaned side.
+        PCollection<KV<String, TableRow>> agedOutResults = agedOut
+                .apply("FlattenAgedOutPayloads",
+                        ParDo.of(new OrphanCompareFn(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath())));
+
+        writeRoute(agedOutResults, FlattenAndCompareFn.ROUTE_MAIN,
+                options.getOutputTable(), "WriteAgedOutMainResults");
+
+        writeRouteIfConfigured(agedOutResults, "authentication",
+                options.getAuthenticationOutputTable(), "WriteAgedOutAuthenticationResults");
+
+        writeRouteIfConfigured(agedOutResults, "docproof",
+                options.getDocproofOutputTable(), "WriteAgedOutDocproofResults");
+
+        // ── 13. Flatten still-pending payloads → dedicated snapshot table ────────
+        // Written with WRITE_TRUNCATE so the table always reflects the current
+        // pending state. When a counterpart is found in a future run, the record
+        // leaves the pending table and is automatically absent from the next
+        // snapshot — no manual cleanup needed.
+        newPending
+                .apply("FlattenPendingPayloads",
+                        ParDo.of(new OrphanCompareFn(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath())))
+                .apply("ExtractPendingRows",
+                        MapElements.into(TypeDescriptor.of(TableRow.class))
+                                   .via(KV::getValue))
+                .apply("WritePendingSnapshot",
+                        BigQueryIO.writeTableRows()
+                                .to(options.getPendingSnapshotTable())
+                                .withSchema(SchemaUtil.comparisonResultsSchema())
+                                .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
         LOG.info("Pipeline graph constructed successfully.");

@@ -72,7 +72,36 @@ OPTIONS (
 
 
 -- ------------------------------------------------------------
--- 4. Dead-letter table
+-- 4. Pending snapshot table
+--    Field-level mismatch rows for payloads still awaiting their counterpart.
+--    Truncated and rewritten on every pipeline run — records disappear
+--    automatically once their counterpart is matched.
+--    Same schema as image_comparison_results; ai_iteration = 0 for all rows.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_snapshot` (
+  image_id          STRING    NOT NULL,
+  key_id            STRING    NOT NULL,
+  ai_iteration      INT64     NOT NULL,   -- always 0 for pending snapshots
+  ai_created_at     TIMESTAMP,
+  human_created_at  TIMESTAMP,
+  field_name        STRING    NOT NULL,
+  array_key         STRING,
+  human_value       STRING,              -- populated if pending_type = 'human'
+  ai_value          STRING,              -- populated if pending_type = 'ai'
+  is_match          BOOL      NOT NULL,  -- always false
+  compared_at       TIMESTAMP NOT NULL
+)
+PARTITION BY DATE(compared_at)
+CLUSTER BY image_id, field_name
+OPTIONS (
+  description = "Field-level mismatch snapshot for still-pending payloads. "
+                "Full refresh (WRITE_TRUNCATE) on every pipeline run. "
+                "Records disappear once their counterpart is matched."
+);
+
+
+-- ------------------------------------------------------------
+-- 5. Dead-letter table
 --    Payloads that exceeded MAX_WAIT_DAYS without a counterpart.
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `your_project.your_dataset.dead_letter_comparisons` (

@@ -86,7 +86,7 @@ public class FlattenAndCompareFn
      *   );
      * </pre>
      */
-    private static final Map<String, String> SEGMENT_ROUTES = Map.of(
+    static final Map<String, String> SEGMENT_ROUTES = Map.of(
             // "authentication", "authentication",
             // "docproof",       "docproof"
     );
@@ -109,7 +109,7 @@ public class FlattenAndCompareFn
      *   <li>Nested array:  {@code "customerNumber-disputeCodes.code"}</li>
      * </ul>
      */
-    private static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
+    static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
             // "tradeline", "accountnumber-customernumber-dateopened-code",
             // "address",   "addresstype"
     );
