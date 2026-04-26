@@ -22,6 +22,7 @@ import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.Validation;
 import org.apache.beam.sdk.options.ValueProvider;
+import org.apache.beam.sdk.transforms.Filter;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
@@ -120,6 +121,18 @@ public class ImageComparisonPipeline {
         @Validation.Required
         ValueProvider<String> getDeadLetterTable();
         void setDeadLetterTable(ValueProvider<String> value);
+
+        @Description("Output BigQuery table for 'authentication' segment comparison rows. "
+                + "Same schema as --outputTable. Omit if authentication is not routed separately. "
+                + "Format: project:dataset.table")
+        ValueProvider<String> getAuthenticationOutputTable();
+        void setAuthenticationOutputTable(ValueProvider<String> value);
+
+        @Description("Output BigQuery table for 'docproof' segment comparison rows. "
+                + "Same schema as --outputTable. Omit if docproof is not routed separately. "
+                + "Format: project:dataset.table")
+        ValueProvider<String> getDocproofOutputTable();
+        void setDocproofOutputTable(ValueProvider<String> value);
 
         @Description("Inclusive start of the processing window (ISO-8601, e.g. 2026-04-16T00:00:00Z). "
                 + "Only source rows with created_at >= windowStart are read.")
@@ -315,20 +328,23 @@ public class ImageComparisonPipeline {
                 routed.get(FilterAndPairFn.AGED_OUT).setCoder(pendingCoder);
 
         // ── 8. Flatten JSON + field-level comparison ──────────────────────────
-        PCollection<TableRow> comparisonResults = matched
+        // Output: KV<route, TableRow> where route is "main", "authentication",
+        // "docproof", etc. as configured in FlattenAndCompareFn.SEGMENT_ROUTES.
+        PCollection<KV<String, TableRow>> routedResults = matched
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath())));
 
-        // ── 9. Write comparison results ───────────────────────────────────────
-        comparisonResults.apply(
-                "WriteComparisonResults",
-                BigQueryIO.writeTableRows()
-                        .to(options.getOutputTable())
-                        .withSchema(SchemaUtil.comparisonResultsSchema())
-                        .withWriteDisposition(WriteDisposition.WRITE_APPEND)
-                        .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
+        // ── 9. Write each route to its configured table ───────────────────────
+        writeRoute(routedResults, FlattenAndCompareFn.ROUTE_MAIN,
+                options.getOutputTable(), "WriteMainResults");
+
+        writeRouteIfConfigured(routedResults, "authentication",
+                options.getAuthenticationOutputTable(), "WriteAuthenticationResults");
+
+        writeRouteIfConfigured(routedResults, "docproof",
+                options.getDocproofOutputTable(), "WriteDocproofResults");
 
         // ── 10. Overwrite pending table (WRITE_TRUNCATE = implicit cleanup) ───
         newPending
@@ -391,5 +407,43 @@ public class ImageComparisonPipeline {
         return value != null ? value.toString() : null;
     }
 
+    // ── Route write helpers ───────────────────────────────────────────────────
 
+    /**
+     * Filters {@code routedResults} to rows matching {@code route} and writes
+     * them to {@code table}. Always executed — use for the mandatory main table.
+     */
+    private static void writeRoute(
+            PCollection<KV<String, TableRow>> routedResults,
+            String route,
+            ValueProvider<String> table,
+            String stepName) {
+        routedResults
+                .apply("Filter-" + stepName,
+                        Filter.by(kv -> route.equals(kv.getKey())))
+                .apply("Extract-" + stepName,
+                        MapElements.into(TypeDescriptor.of(TableRow.class))
+                                   .via(KV::getValue))
+                .apply(stepName,
+                        BigQueryIO.writeTableRows()
+                                .to(table)
+                                .withSchema(SchemaUtil.comparisonResultsSchema())
+                                .withWriteDisposition(WriteDisposition.WRITE_APPEND)
+                                .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
+    }
+
+    /**
+     * Same as {@link #writeRoute} but skipped entirely when {@code table} is
+     * null or blank — use for optional route tables.
+     */
+    private static void writeRouteIfConfigured(
+            PCollection<KV<String, TableRow>> routedResults,
+            String route,
+            ValueProvider<String> table,
+            String stepName) {
+        if (table == null) return;
+        String tableValue = table.get();
+        if (tableValue == null || tableValue.isBlank()) return;
+        writeRoute(routedResults, route, table, stepName);
+    }
 }

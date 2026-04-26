@@ -23,19 +23,31 @@ import java.util.TreeSet;
 
 /**
  * Flattens both JSON payloads in a matched pair and emits one
- * {@link TableRow} per field value for the image_comparison_results output table.
+ * {@code KV<String, TableRow>} per field value, where the {@code String} key
+ * is a <em>route name</em> that determines which BigQuery table the row is
+ * written to.
+ *
+ * <h3>Routing</h3>
+ * {@link #SEGMENT_ROUTES} maps top-level segment names to route names.
+ * Any segment not listed there falls back to the {@link #ROUTE_MAIN} route.
+ * The pipeline filters on the route key and writes each group to its own table.
+ *
+ * <pre>
+ *   SEGMENT_ROUTES = Map.of(
+ *       "authentication", "authentication",
+ *       "docproof",       "docproof"
+ *   );
+ *   // → field "authentication.status" → route "authentication"
+ *   // → field "docproof.type"         → route "docproof"
+ *   // → field "tradeline.code"        → route "main"   (not in map)
+ * </pre>
  *
  * <h3>Array comparison</h3>
  * <ul>
  *   <li><b>Top-level keyed segments</b> (configured in {@code ARRAY_MATCH_KEYS}): each
- *       element's composite key is derived from the configured field(s).  For each unique
- *       key across human and AI, comparison rows are emitted.  A key present on only one
- *       side produces mismatch rows with {@code null} on the other side.</li>
- *   <li><b>Child arrays</b> (nested inside a keyed segment, not in the map): elements
- *       automatically inherit the parent segment's key as {@code array_key}.  Within that
- *       key group, child elements are compared positionally after sorting.</li>
- *   <li><b>Positional arrays</b> (not in the map, no keyed parent): compared
- *       position-by-position after sorting.  {@code array_key} is {@code null}.</li>
+ *       element's composite key is derived from the configured field(s).</li>
+ *   <li><b>Child arrays</b>: automatically inherit the parent segment's key.</li>
+ *   <li><b>Positional arrays</b>: compared position-by-position after sorting.</li>
  *   <li><b>Scalar fields</b>: one row, {@code array_key} is {@code null}.</li>
  * </ul>
  *
@@ -45,36 +57,64 @@ import java.util.TreeSet;
  * writing to BigQuery.
  */
 public class FlattenAndCompareFn
-        extends DoFn<KV<String, KV<GenericRecord, GenericRecord>>, TableRow> {
+        extends DoFn<KV<String, KV<GenericRecord, GenericRecord>>, KV<String, TableRow>> {
 
     private static final Logger LOG = LoggerFactory.getLogger(FlattenAndCompareFn.class);
 
+    // ── Route names ───────────────────────────────────────────────────────────
+
+    /** Default route — segments not listed in {@link #SEGMENT_ROUTES}. */
+    public static final String ROUTE_MAIN = "main";
+
+    // ── Segment → route mapping ───────────────────────────────────────────────
+
     /**
-     * Top-level segment keys only.  Child arrays inside a segment automatically
+     * Maps a top-level segment name to a route name.
+     *
+     * <p>The segment is the first dot-notation component of the field path
+     * (e.g. {@code "authentication"} from {@code "authentication.status"}).
+     * Scalar fields (no dot) use the field name itself as the segment.
+     *
+     * <p>Segments not listed here are routed to {@link #ROUTE_MAIN}.
+     * Adding a new table requires only a new entry here and a corresponding
+     * pipeline option + write step in {@code ImageComparisonPipeline}.
+     *
+     * <pre>
+     *   SEGMENT_ROUTES = Map.of(
+     *       "authentication", "authentication",
+     *       "docproof",       "docproof"
+     *   );
+     * </pre>
+     */
+    private static final Map<String, String> SEGMENT_ROUTES = Map.of(
+            // "authentication", "authentication",
+            // "docproof",       "docproof"
+    );
+
+    // ── Array match keys ──────────────────────────────────────────────────────
+
+    /**
+     * Top-level segment keys only. Child arrays inside a segment automatically
      * inherit the segment's derived key — they do not need their own entry here.
      *
      * <h3>Map key</h3>
-     * Dot-notation path to a top-level array segment, e.g. {@code "tradeline"},
-     * {@code "address"}.
+     * Dot-notation path to a top-level array segment, e.g. {@code "tradeline"}.
      *
      * <h3>Map value — key specification</h3>
-     * A {@code -}-separated list of field names whose values are extracted from each
-     * element and joined (lower-cased) to form the composite {@code array_key}:
+     * A {@code -}-separated list of field names (supports dot-notation for nested
+     * paths) whose values are joined (lower-cased) to form the {@code array_key}:
      * <ul>
      *   <li>Single field:  {@code "code"}</li>
      *   <li>Composite:     {@code "accountnumber-customernumber-dateopened-code"}</li>
+     *   <li>Nested array:  {@code "customerNumber-disputeCodes.code"}</li>
      * </ul>
-     *
-     * <p>Child arrays (e.g. {@code tradeline.paymentHistory}) are compared positionally
-     * within each parent key group and share the parent's {@code array_key}.
-     *
-     * <p>Arrays not listed here (and with no keyed parent) fall back to global
-     * positional comparison with {@code array_key = null}.
      */
     private static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
             // "tradeline", "accountnumber-customernumber-dateopened-code",
             // "address",   "addresstype"
     );
+
+    // ── Constructor ───────────────────────────────────────────────────────────
 
     private final ValueProvider<String> firestoreCollection;
     private final ValueProvider<String> kmsKeyPath;
@@ -91,6 +131,8 @@ public class FlattenAndCompareFn
                 firestoreCollection.get(),
                 kmsKeyPath.get());
     }
+
+    // ── Processing ────────────────────────────────────────────────────────────
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
@@ -153,16 +195,10 @@ public class FlattenAndCompareFn
             List<FieldValue> aiEntries =
                     aiFields.getOrDefault(field, Collections.emptyList());
 
-            // Determine mode: if any entry carries a non-null matchKey → key-based.
             boolean keyed = humanEntries.stream().anyMatch(fv -> fv.matchKey != null)
                          || aiEntries.stream().anyMatch(fv -> fv.matchKey != null);
 
             if (keyed) {
-                // ── Key-based matching ────────────────────────────────────────
-                // Group by matchKey.  Top-level keyed elements have exactly one
-                // entry per key.  Child arrays that inherited a parent key may have
-                // multiple entries under the same key — those are compared positionally
-                // within the group.
                 Map<String, List<String>> humanGroups = groupByKey(humanEntries);
                 Map<String, List<String>> aiGroups    = groupByKey(aiEntries);
 
@@ -188,7 +224,6 @@ public class FlattenAndCompareFn
                 }
 
             } else {
-                // ── Positional matching ───────────────────────────────────────
                 int count = Math.max(humanEntries.size(), aiEntries.size());
                 for (int i = 0; i < count; i++) {
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
@@ -218,26 +253,30 @@ public class FlattenAndCompareFn
         String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
         String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);
 
-        ctx.output(new TableRow()
+        TableRow row = new TableRow()
                 .set("image_id",         imageId)
                 .set("key_id",           keyId)
                 .set("ai_iteration",     iteration)
                 .set("ai_created_at",    aiCreatedAt)
                 .set("human_created_at", humanCreatedAt)
                 .set("field_name",       field)
-                .set("array_key",        arrayKey)        // null for scalars / positional arrays
+                .set("array_key",        arrayKey)
                 .set("human_value",      encryptedHumanVal)
                 .set("ai_value",         encryptedAiVal)
                 .set("is_match",         isMatch)
-                .set("compared_at",      comparedAt));
+                .set("compared_at",      comparedAt);
+
+        // Derive the top-level segment and look up its route.
+        String segment = field.contains(".")
+                ? field.substring(0, field.indexOf('.'))
+                : field;
+        String route = SEGMENT_ROUTES.getOrDefault(segment, ROUTE_MAIN);
+
+        ctx.output(KV.of(route, row));
     }
 
     /**
      * Groups {@link FieldValue} entries by their {@code matchKey}.
-     *
-     * <p>Top-level keyed elements produce a single-entry list per key.
-     * Child array elements that inherited a parent key produce a multi-entry list —
-     * those are compared positionally within the group by the caller.
      */
     private static Map<String, List<String>> groupByKey(List<FieldValue> entries) {
         Map<String, List<String>> groups = new LinkedHashMap<>();
