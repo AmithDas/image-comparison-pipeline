@@ -101,8 +101,8 @@ public final class AvroToTableRowConverter {
         }
 
         // ── Custom "bqType":"TIMESTAMP" property ──────────────────────────────
-        JsonElement bqTypeProp = actual.getJsonProp("bqType");
-        if (bqTypeProp != null && "TIMESTAMP".equals(bqTypeProp.getAsString())) {
+        Object bqTypeProp = actual.getObjectProp("bqType");
+        if (bqTypeProp != null && "TIMESTAMP".equals(bqTypeProp.toString())) {
             return TimestampUtil.normalizeTimestamp(value.toString());
         }
 

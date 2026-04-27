@@ -61,35 +61,8 @@ public class FlattenAndCompareFn
 
     private static final Logger LOG = LoggerFactory.getLogger(FlattenAndCompareFn.class);
 
-    // ── Route names ───────────────────────────────────────────────────────────
-
-    /** Default route — segments not listed in {@link #SEGMENT_ROUTES}. */
+    /** Default route name — used when no specific route is configured. */
     public static final String ROUTE_MAIN = "main";
-
-    // ── Segment → route mapping ───────────────────────────────────────────────
-
-    /**
-     * Maps a top-level segment name to a route name.
-     *
-     * <p>The segment is the first dot-notation component of the field path
-     * (e.g. {@code "authentication"} from {@code "authentication.status"}).
-     * Scalar fields (no dot) use the field name itself as the segment.
-     *
-     * <p>Segments not listed here are routed to {@link #ROUTE_MAIN}.
-     * Adding a new table requires only a new entry here and a corresponding
-     * pipeline option + write step in {@code ImageComparisonPipeline}.
-     *
-     * <pre>
-     *   SEGMENT_ROUTES = Map.of(
-     *       "authentication", "authentication",
-     *       "docproof",       "docproof"
-     *   );
-     * </pre>
-     */
-    static final Map<String, String> SEGMENT_ROUTES = Map.of(
-            // "authentication", "authentication",
-            // "docproof",       "docproof"
-    );
 
     // ── Array match keys ──────────────────────────────────────────────────────
 
@@ -136,18 +109,20 @@ public class FlattenAndCompareFn
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
+        // Pair key format: "imageId::routeName::iteration"
         String pairKey = ctx.element().getKey();
         String[] parts = pairKey.split("::");
 
-        if (parts.length != 2) {
+        if (parts.length != 3) {
             LOG.warn("Unexpected pairKey format: '{}' — skipping", pairKey);
             return;
         }
 
-        String imageId = parts[0];
+        String imageId   = parts[0];
+        String routeName = parts[1];
         int iteration;
         try {
-            iteration = Integer.parseInt(parts[1]);
+            iteration = Integer.parseInt(parts[2]);
         } catch (NumberFormatException e) {
             LOG.warn("Could not parse iteration from pairKey '{}' — skipping", pairKey);
             return;
@@ -216,7 +191,7 @@ public class FlattenAndCompareFn
                     for (int i = 0; i < count; i++) {
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
-                        emitRow(ctx, imageId, keyId, iteration,
+                        emitRow(ctx, imageId, routeName, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, comparedAt,
                                 field, matchKey, humanVal, aiVal);
                         rowsEmitted++;
@@ -228,7 +203,7 @@ public class FlattenAndCompareFn
                 for (int i = 0; i < count; i++) {
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
-                    emitRow(ctx, imageId, keyId, iteration,
+                    emitRow(ctx, imageId, routeName, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, comparedAt,
                             field, null, humanVal, aiVal);
                     rowsEmitted++;
@@ -243,7 +218,7 @@ public class FlattenAndCompareFn
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private void emitRow(ProcessContext ctx,
-                         String imageId, String keyId, int iteration,
+                         String imageId, String routeName, String keyId, int iteration,
                          String aiCreatedAt, String humanCreatedAt, String comparedAt,
                          String field, String arrayKey,
                          String humanVal, String aiVal) {
@@ -266,13 +241,8 @@ public class FlattenAndCompareFn
                 .set("is_match",         isMatch)
                 .set("compared_at",      comparedAt);
 
-        // Derive the top-level segment and look up its route.
-        String segment = field.contains(".")
-                ? field.substring(0, field.indexOf('.'))
-                : field;
-        String route = SEGMENT_ROUTES.getOrDefault(segment, ROUTE_MAIN);
-
-        ctx.output(KV.of(route, row));
+        // Route is derived from the pair key — no field-prefix lookup needed.
+        ctx.output(KV.of(routeName, row));
     }
 
     /**

@@ -54,17 +54,20 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     private final ValueProvider<String> firestoreCollection;
     private final ValueProvider<String> kmsKeyPath;
     private final ValueProvider<String> imageNameField;
+    private final String                routeName;     // included in output key
     private final String                filterField;   // null → no filter
     private final String                filterValue;
 
     private DecryptAndKeyFn(ValueProvider<String> firestoreCollection,
                              ValueProvider<String> kmsKeyPath,
                              ValueProvider<String> imageNameField,
+                             String routeName,
                              String filterField,
                              String filterValue) {
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
         this.imageNameField      = imageNameField;
+        this.routeName           = routeName;
         this.filterField         = filterField;
         this.filterValue         = filterValue;
     }
@@ -74,8 +77,10 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     /** No payload filter — suitable for AI rows. */
     public static DecryptAndKeyFn forAi(ValueProvider<String> firestoreCollection,
                                          ValueProvider<String> kmsKeyPath,
-                                         ValueProvider<String> imageNameField) {
-        return new DecryptAndKeyFn(firestoreCollection, kmsKeyPath, imageNameField, null, null);
+                                         ValueProvider<String> imageNameField,
+                                         String routeName) {
+        return new DecryptAndKeyFn(
+                firestoreCollection, kmsKeyPath, imageNameField, routeName, null, null);
     }
 
     /**
@@ -85,10 +90,12 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     public static DecryptAndKeyFn forHuman(ValueProvider<String> firestoreCollection,
                                             ValueProvider<String> kmsKeyPath,
                                             ValueProvider<String> imageNameField,
+                                            String routeName,
                                             String filterField,
                                             String filterValue) {
         return new DecryptAndKeyFn(
-                firestoreCollection, kmsKeyPath, imageNameField, filterField, filterValue);
+                firestoreCollection, kmsKeyPath, imageNameField,
+                routeName, filterField, filterValue);
     }
 
     // ── Beam lifecycle ────────────────────────────────────────────────────────
@@ -123,6 +130,7 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
             return;
         }
 
-        ctx.output(KV.of(imageName, row));
+        // Key format: "imageId::routeName" — groups each route independently.
+        ctx.output(KV.of(imageName + "::" + routeName, row));
     }
 }

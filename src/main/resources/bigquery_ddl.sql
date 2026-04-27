@@ -56,6 +56,7 @@ OPTIONS (
 CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_comparisons` (
   image_id         STRING    NOT NULL,
   key_id           STRING    NOT NULL,   -- Barricade encryption key identifier
+  route            STRING    NOT NULL,   -- pipeline route e.g. 'main', 'authentication', 'docproof'
   pending_type     STRING    NOT NULL,   -- 'human' or 'ai'
   payload          STRING    NOT NULL,   -- Barricade-encrypted payload
   created_at       TIMESTAMP,           -- original created_at from source table

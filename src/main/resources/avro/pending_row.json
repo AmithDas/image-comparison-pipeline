@@ -5,6 +5,7 @@
   "fields": [
     {"name": "image_id",        "type": ["null", "string"], "default": null},
     {"name": "key_id",          "type": "string"},
+    {"name": "route",           "type": "string"},
     {"name": "pending_type",    "type": "string"},
     {"name": "payload",         "type": "string"},
     {"name": "created_at",      "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},

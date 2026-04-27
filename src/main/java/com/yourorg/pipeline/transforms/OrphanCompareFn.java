@@ -61,12 +61,14 @@ public class OrphanCompareFn extends DoFn<GenericRecord, KV<String, TableRow>> {
     public void processElement(ProcessContext ctx) {
         GenericRecord record = ctx.element();
 
-        String imageId    = str(record.get("image_id"));
-        String keyId      = str(record.get("key_id"));
+        String imageId     = str(record.get("image_id"));
+        String keyId       = str(record.get("key_id"));
+        String routeName   = str(record.get("route"));
+        if (routeName == null || routeName.isBlank()) routeName = FlattenAndCompareFn.ROUTE_MAIN;
         String pendingType = str(record.get("pending_type")); // "human" or "ai"
-        String payload    = str(record.get("payload"));
-        String createdAt  = TimestampUtil.normalizeTimestamp(str(record.get("created_at")));
-        String comparedAt = TimestampUtil.formatInstant(Instant.now());
+        String payload     = str(record.get("payload"));
+        String createdAt   = TimestampUtil.normalizeTimestamp(str(record.get("created_at")));
+        String comparedAt  = TimestampUtil.formatInstant(Instant.now());
 
         if (imageId == null || keyId == null || pendingType == null || payload == null) {
             LOG.warn("Skipping orphan record — missing required fields: imageId={}", imageId);
@@ -114,14 +116,8 @@ public class OrphanCompareFn extends DoFn<GenericRecord, KV<String, TableRow>> {
                         .set("is_match",         false)       // always false — one side absent
                         .set("compared_at",      comparedAt);
 
-                // Route by top-level segment — same logic as FlattenAndCompareFn.
-                String segment = fieldName.contains(".")
-                        ? fieldName.substring(0, fieldName.indexOf('.'))
-                        : fieldName;
-                String route = FlattenAndCompareFn.SEGMENT_ROUTES.getOrDefault(
-                        segment, FlattenAndCompareFn.ROUTE_MAIN);
-
-                ctx.output(KV.of(route, row));
+                // Route is derived from the pending record — same route as when originally pended.
+                ctx.output(KV.of(routeName, row));
                 rowsEmitted++;
             }
         }
