@@ -1,6 +1,7 @@
 package com.yourorg.pipeline;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
@@ -23,6 +24,7 @@ import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.options.Validation;
 import org.apache.beam.sdk.options.ValueProvider;
+import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.WithKeys;
@@ -31,35 +33,41 @@ import org.apache.beam.sdk.transforms.join.CoGroupByKey;
 import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import java.time.Instant;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Entry point for the Image Comparison Dataflow pipeline.
  *
- * <p>The pipeline is intentionally route-agnostic: it processes one AI/human
- * method pair and writes results to one output table. Segment separation
- * (authentication, docproof, etc.) is handled by the DAG, which runs a
- * separate Dataflow job per segment, each with its own parameters.
+ * <p>All segments (main, authentication, docproof, …) are processed in a single
+ * Dataflow job.  Source rows are routed to the correct segment by their {@code method}
+ * column value.  All comparison results are written to <b>one shared table</b> with a
+ * {@code segment} column so downstream queries can filter by segment.
  *
  * <p>Pipeline overview:
  * <ol>
- *   <li>Read windowed AI and human rows from BigQuery source tables.</li>
- *   <li>Read current pending state from {@code pending_comparisons}.</li>
- *   <li>Decrypt each source row, extract the image identifier, and co-group with pending.</li>
- *   <li>Run {@link FilterAndPairFn}: merge source + pending, check eligibility,
- *       route to MATCHED / NEW_PENDING / AGED_OUT.</li>
- *   <li>Run {@link FlattenAndCompareFn} on MATCHED pairs → field-level comparison rows.</li>
- *   <li>Write results to {@code --outputTable}.</li>
- *   <li>Overwrite {@code pending_comparisons} with still-pending rows (WRITE_TRUNCATE).</li>
+ *   <li>Read windowed AI and human rows (all segments) from BigQuery source tables.</li>
+ *   <li>Decrypt each row; derive segment from its {@code method} column; key as
+ *       {@code "imageId::segment"}.</li>
+ *   <li>Read pending state from {@code pending_comparisons}; key as
+ *       {@code "imageId::segment"}.</li>
+ *   <li>Co-group source + pending by {@code "imageId::segment"}.</li>
+ *   <li>Run {@link FilterAndPairFn}: classify AI vs human, match pairs,
+ *       emit MATCHED / NEW_PENDING / AGED_OUT.</li>
+ *   <li>Run {@link FlattenAndCompareFn} on MATCHED pairs → field-level rows
+ *       with {@code segment} field.</li>
+ *   <li>Write all results to one {@code --outputTable}.</li>
+ *   <li>Overwrite {@code pending_comparisons} (WRITE_TRUNCATE).</li>
  *   <li>Append aged-out rows to {@code dead_letter_comparisons}.</li>
- *   <li>Flatten orphaned payloads → mismatch rows in the output table.</li>
+ *   <li>Flatten orphaned payloads → mismatch rows with {@code segment} in output table.</li>
  *   <li>Flatten still-pending payloads → snapshot table (WRITE_TRUNCATE).</li>
  * </ol>
  *
@@ -76,8 +84,7 @@ import java.time.Instant;
  *       --pendingSnapshotTable=project:dataset.pending_snapshot \
  *       --windowStart=2026-04-16T00:00:00Z \
  *       --windowEnd=2026-04-17T00:00:00Z \
- *       --aiMethod=aimetadata \
- *       --humanMethod=controller.SubmitDispute \
+ *       --segmentConfigs='[{\"name\":\"main\",\"aiMethod\":\"aimetadata\",\"humanMethod\":\"controller.SubmitDispute\"},{\"name\":\"authentication\",\"aiMethod\":\"auth.ai\",\"humanMethod\":\"auth.human\"}]' \
  *       --firestoreCollection=dek_store \
  *       --kmsKeyPath=projects/p/locations/l/keyRings/r/cryptoKeys/k"
  * </pre>
@@ -100,63 +107,62 @@ public class ImageComparisonPipeline {
         ValueProvider<String> getHumanSourceTable();
         void setHumanSourceTable(ValueProvider<String> value);
 
-        @Description("Output BigQuery table for field-level comparison results. "
+        @Description("Single output BigQuery table for all field-level comparison results. "
+                + "Contains a 'segment' column to distinguish segments. "
                 + "Format: project:dataset.table")
         @Validation.Required
         ValueProvider<String> getOutputTable();
         void setOutputTable(ValueProvider<String> value);
 
-        @Description("BigQuery table used as a durable pending state store. "
+        @Description("BigQuery table for pending state (rows awaiting their counterpart). "
                 + "Format: project:dataset.table")
         @Validation.Required
         ValueProvider<String> getPendingTable();
         void setPendingTable(ValueProvider<String> value);
 
-        @Description("BigQuery table for payloads that exceeded the maximum wait "
-                + "threshold (default 7 days). Format: project:dataset.table")
+        @Description("BigQuery table for payloads that exceeded the max wait threshold. "
+                + "Format: project:dataset.table")
         @Validation.Required
         ValueProvider<String> getDeadLetterTable();
         void setDeadLetterTable(ValueProvider<String> value);
 
-        @Description("BigQuery table for the still-pending payload snapshot. "
-                + "Truncated and rewritten on every run. Format: project:dataset.table")
+        @Description("BigQuery table for the still-pending payload snapshot (WRITE_TRUNCATE). "
+                + "Format: project:dataset.table")
         @Validation.Required
         ValueProvider<String> getPendingSnapshotTable();
         void setPendingSnapshotTable(ValueProvider<String> value);
 
-        @Description("Inclusive start of the processing window (ISO-8601, e.g. 2026-04-16T00:00:00Z).")
+        @Description("Inclusive start of the processing window (ISO-8601).")
         @Validation.Required
         ValueProvider<String> getWindowStart();
         void setWindowStart(ValueProvider<String> value);
 
-        @Description("Exclusive end of the processing window (ISO-8601, e.g. 2026-04-17T00:00:00Z).")
+        @Description("Exclusive end of the processing window (ISO-8601).")
         @Validation.Required
         ValueProvider<String> getWindowEnd();
         void setWindowEnd(ValueProvider<String> value);
 
-        @Description("Value of the 'method' column that identifies an AI payload.")
+        @Description(
+                "JSON array of segment configurations. Each entry must have: "
+                + "name (segment identifier written to the 'segment' column), "
+                + "aiMethod (method column value for AI rows), "
+                + "humanMethod (method column value for human rows). "
+                + "Example: [{\"name\":\"main\",\"aiMethod\":\"aimetadata\","
+                + "\"humanMethod\":\"controller.SubmitDispute\"}]")
         @Validation.Required
-        ValueProvider<String> getAiMethod();
-        void setAiMethod(ValueProvider<String> value);
+        ValueProvider<String> getSegmentConfigs();
+        void setSegmentConfigs(ValueProvider<String> value);
 
-        @Description("Value of the 'method' column that identifies a human payload.")
-        @Validation.Required
-        ValueProvider<String> getHumanMethod();
-        void setHumanMethod(ValueProvider<String> value);
-
-        @Description("Dot-notation path to the image identifier field inside the decrypted payload, "
-                + "e.g. 'queueImages[0].fileName'. Rows where this field is absent are skipped.")
+        @Description("Dot-notation path to the image identifier field inside the decrypted payload.")
         @Default.String("queueImages[0].fileName")
         ValueProvider<String> getImageNameField();
         void setImageNameField(ValueProvider<String> value);
 
-        @Description("Dot-notation JSON field name to filter human rows on. "
-                + "Only rows where this field equals --humanFilterValue are processed. "
-                + "Omit to skip filtering.")
+        @Description("Dot-notation JSON field name to filter human rows on. Omit to skip.")
         ValueProvider<String> getHumanFilterField();
         void setHumanFilterField(ValueProvider<String> value);
 
-        @Description("Expected value for --humanFilterField. Required when --humanFilterField is set.")
+        @Description("Expected value for --humanFilterField.")
         ValueProvider<String> getHumanFilterValue();
         void setHumanFilterValue(ValueProvider<String> value);
 
@@ -165,7 +171,7 @@ public class ImageComparisonPipeline {
         ValueProvider<String> getFirestoreCollection();
         void setFirestoreCollection(ValueProvider<String> value);
 
-        @Description("Full Cloud KMS CryptoKey resource path used to unwrap DEKs. "
+        @Description("Full Cloud KMS CryptoKey resource path. "
                 + "Format: projects/P/locations/L/keyRings/R/cryptoKeys/K")
         @Validation.Required
         ValueProvider<String> getKmsKeyPath();
@@ -192,78 +198,106 @@ public class ImageComparisonPipeline {
         Schema payloadSchema    = registry.get(SchemaRegistry.PAYLOAD_ROW);
         Schema pendingSchema    = registry.get(SchemaRegistry.PENDING_ROW);
 
+        // ── Parse segment configs ─────────────────────────────────────────────
+        List<SegmentConfig> segments     = SegmentConfig.parse(options.getSegmentConfigs().get());
+        Map<String, String> methodToSide = SegmentConfig.buildMethodToSideMap(segments);
+        LOG.info("Pipeline configured with {} segment(s): {}",
+                segments.size(), segments.stream().map(s -> s.name).toList());
+
         String aiTable     = options.getAiSourceTable().get().replace(':', '.');
         String humanTable  = options.getHumanSourceTable().get().replace(':', '.');
+        String pendingTable = options.getPendingTable().get().replace(':', '.');
         String windowStart = options.getWindowStart().get();
         String windowEnd   = options.getWindowEnd().get();
-        String aiMethod    = options.getAiMethod().get();
-        String humanMethod = options.getHumanMethod().get();
 
         String filterField = options.getHumanFilterField() != null
                 ? options.getHumanFilterField().get() : null;
         String filterValue = options.getHumanFilterValue() != null
                 ? options.getHumanFilterValue().get() : null;
 
-        // ── 1. Read AI source rows, key by imageId ────────────────────────────
-        String aiQuery = String.format(
-                "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'"
-                        + " AND method = '%s'",
-                aiTable, windowStart, windowEnd, aiMethod);
+        // ── 1 & 2. Per-segment source and pending reads ───────────────────────
+        // Each segment gets its own BQ query (method = '...') so routing is done
+        // at the query level, not at runtime.  All results are flattened into two
+        // shared PCollections before co-grouping.
+        PCollectionList<KV<String, TableRow>> sourceParts  = PCollectionList.empty(pipeline);
+        PCollectionList<KV<String, TableRow>> pendingParts = PCollectionList.empty(pipeline);
 
-        PCollection<KV<String, TableRow>> keyedAi = pipeline
-                .apply("ReadAiSource",
-                        BigQueryIO.readTableRows().fromQuery(aiQuery).usingStandardSql())
-                .apply("KeyAiByImageId",
-                        ParDo.of(DecryptAndKeyFn.forAi(
-                                options.getFirestoreCollection(),
-                                options.getKmsKeyPath(),
-                                options.getImageNameField())));
+        for (SegmentConfig seg : segments) {
 
-        // ── 2. Read human source rows, key by imageId ─────────────────────────
-        String humanQuery = String.format(
-                "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'"
-                        + " AND method = '%s'",
-                humanTable, windowStart, windowEnd, humanMethod);
+            // ── AI source rows for this segment ───────────────────────────────
+            String aiQuery = String.format(
+                    "SELECT * FROM `%s`"
+                            + " WHERE created_at >= '%s' AND created_at < '%s'"
+                            + " AND method = '%s'",
+                    aiTable, windowStart, windowEnd, seg.aiMethod);
 
-        PCollection<KV<String, TableRow>> keyedHuman = pipeline
-                .apply("ReadHumanSource",
-                        BigQueryIO.readTableRows().fromQuery(humanQuery).usingStandardSql())
-                .apply("KeyHumanByImageId",
-                        ParDo.of(DecryptAndKeyFn.forHuman(
-                                options.getFirestoreCollection(),
-                                options.getKmsKeyPath(),
-                                options.getImageNameField(),
-                                filterField, filterValue)));
+            PCollection<KV<String, TableRow>> keyedAi = pipeline
+                    .apply("ReadAi-" + seg.name,
+                            BigQueryIO.readTableRows().fromQuery(aiQuery).usingStandardSql())
+                    .apply("KeyAi-" + seg.name,
+                            ParDo.of(DecryptAndKeyFn.forAi(
+                                    options.getFirestoreCollection(),
+                                    options.getKmsKeyPath(),
+                                    options.getImageNameField(),
+                                    seg.name)));
 
-        // ── 3. Read pending table, key by imageId ─────────────────────────────
-        String pendingQuery = String.format(
-                "SELECT * FROM `%s`"
-                        + " WHERE first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
-                        + " INTERVAL %d DAY)",
-                options.getPendingTable().get().replace(':', '.'),
-                FilterAndPairFn.MAX_WAIT_DAYS);
+            // ── Human source rows for this segment ────────────────────────────
+            String humanQuery = String.format(
+                    "SELECT * FROM `%s`"
+                            + " WHERE created_at >= '%s' AND created_at < '%s'"
+                            + " AND method = '%s'",
+                    humanTable, windowStart, windowEnd, seg.humanMethod);
 
-        PCollection<KV<String, TableRow>> keyedPending = pipeline
-                .apply("ReadPendingTable",
-                        BigQueryIO.readTableRows()
-                                .fromQuery(pendingQuery)
-                                .usingStandardSql())
-                .apply("KeyPendingByImageId",
-                        WithKeys.of((TableRow row) -> (String) row.get("image_id"))
-                                .withKeyType(TypeDescriptors.strings()));
+            PCollection<KV<String, TableRow>> keyedHuman = pipeline
+                    .apply("ReadHuman-" + seg.name,
+                            BigQueryIO.readTableRows().fromQuery(humanQuery).usingStandardSql())
+                    .apply("KeyHuman-" + seg.name,
+                            ParDo.of(DecryptAndKeyFn.forHuman(
+                                    options.getFirestoreCollection(),
+                                    options.getKmsKeyPath(),
+                                    options.getImageNameField(),
+                                    seg.name,
+                                    filterField, filterValue)));
 
-        // ── 4. Co-group source + pending by imageId ───────────────────────────
+            // ── Pending rows for this segment ─────────────────────────────────
+            String pendingQuery = String.format(
+                    "SELECT * FROM `%s`"
+                            + " WHERE segment = '%s'"
+                            + " AND first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
+                            + " INTERVAL %d DAY)",
+                    pendingTable, seg.name, FilterAndPairFn.MAX_WAIT_DAYS);
+
+            PCollection<KV<String, TableRow>> keyedPending = pipeline
+                    .apply("ReadPending-" + seg.name,
+                            BigQueryIO.readTableRows()
+                                    .fromQuery(pendingQuery)
+                                    .usingStandardSql())
+                    .apply("KeyPending-" + seg.name,
+                            WithKeys.of((TableRow row) ->
+                                    row.get("image_id") + "::" + seg.name)
+                                    .withKeyType(TypeDescriptors.strings()));
+
+            sourceParts  = sourceParts.and(keyedAi).and(keyedHuman);
+            pendingParts = pendingParts.and(keyedPending);
+        }
+
+        PCollection<KV<String, TableRow>> keyedSource =
+                sourceParts.apply("FlattenSourceRows", Flatten.pCollections());
+
+        PCollection<KV<String, TableRow>> keyedPending =
+                pendingParts.apply("FlattenPendingRows", Flatten.pCollections());
+
+        // ── 4. Co-group source + pending by "imageId::segment" ────────────────
         PCollection<KV<String, CoGbkResult>> coGrouped =
                 KeyedPCollectionTuple
-                        .of(FilterAndPairFn.SOURCE_TAG, keyedAi)
-                        .and(FilterAndPairFn.SOURCE_TAG, keyedHuman)
+                        .of(FilterAndPairFn.SOURCE_TAG, keyedSource)
                         .and(FilterAndPairFn.PENDING_TAG, keyedPending)
-                        .apply("CoGroupByImageId", CoGroupByKey.create());
+                        .apply("CoGroupByImageIdAndSegment", CoGroupByKey.create());
 
         // ── 5. Filter & pair ──────────────────────────────────────────────────
         PCollectionTuple routed = coGrouped.apply(
                 "FilterAndPair",
-                ParDo.of(new FilterAndPairFn(aiMethod, humanMethod, payloadSchema, pendingSchema))
+                ParDo.of(new FilterAndPairFn(methodToSide, payloadSchema, pendingSchema))
                      .withOutputTags(
                              FilterAndPairFn.MATCHED,
                              TupleTagList
@@ -292,7 +326,7 @@ public class ImageComparisonPipeline {
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath())));
 
-        // ── 7. Write comparison results ───────────────────────────────────────
+        // ── 7. Write comparison results to single shared table ────────────────
         comparisonResults
                 .apply("WriteResults",
                         BigQueryIO.writeTableRows()
@@ -301,7 +335,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 8. Overwrite pending table (WRITE_TRUNCATE = implicit cleanup) ────
+        // ── 8. Overwrite pending table (WRITE_TRUNCATE) ───────────────────────
         newPending
                 .apply("MapPendingToTableRow",
                         MapElements.into(TypeDescriptor.of(TableRow.class))
@@ -325,7 +359,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 10. Flatten aged-out payloads → mismatch rows ─────────────────────
+        // ── 10. Flatten aged-out payloads → mismatch rows in shared table ─────
         agedOut
                 .apply("FlattenAgedOutPayloads",
                         ParDo.of(new OrphanCompareFn(
@@ -360,6 +394,8 @@ public class ImageComparisonPipeline {
         return new TableRow()
                 .set("image_id",        str(r.get("image_id")))
                 .set("key_id",          str(r.get("key_id")))
+                .set("segment",         str(r.get("segment")) != null
+                        ? str(r.get("segment")) : "main")
                 .set("pending_type",    str(r.get("pending_type")))
                 .set("payload",         str(r.get("payload")))
                 .set("created_at",      str(r.get("created_at")))
@@ -373,6 +409,8 @@ public class ImageComparisonPipeline {
         return new TableRow()
                 .set("image_id",      str(r.get("image_id")))
                 .set("key_id",        str(r.get("key_id")))
+                .set("segment",       str(r.get("segment")) != null
+                        ? str(r.get("segment")) : "main")
                 .set("pending_type",  str(r.get("pending_type")))
                 .set("payload",       str(r.get("payload")))
                 .set("created_at",    str(r.get("created_at")))

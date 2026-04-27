@@ -22,22 +22,24 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * Flattens both JSON payloads in a matched pair and emits one
- * {@link TableRow} per field value.
+ * Flattens both JSON payloads in a matched pair and emits one {@link TableRow}
+ * per field value, including a {@code segment} column for downstream filtering.
+ *
+ * <h3>Pair key format</h3>
+ * {@code "imageId::segment::iteration"} — all three parts are embedded in the
+ * pair key set by {@link FilterAndPairFn}.
  *
  * <h3>Array comparison</h3>
  * <ul>
- *   <li><b>Top-level keyed segments</b> (configured in {@code ARRAY_MATCH_KEYS}): each
- *       element's composite key is derived from the configured field(s).</li>
- *   <li><b>Child arrays</b>: automatically inherit the parent segment's key.</li>
- *   <li><b>Positional arrays</b>: compared position-by-position after sorting.</li>
+ *   <li><b>Keyed segments</b> ({@code ARRAY_MATCH_KEYS}): matched by composite key.</li>
+ *   <li><b>Child arrays</b>: inherit the parent segment's key.</li>
+ *   <li><b>Positional arrays</b>: compared position-by-position.</li>
  *   <li><b>Scalar fields</b>: one row, {@code array_key} is {@code null}.</li>
  * </ul>
  *
  * <h3>String comparison</h3>
- * {@code is_match} is computed on plaintext using case-insensitive equality.
- * {@code human_value} and {@code ai_value} are re-encrypted with Barricade before
- * writing to BigQuery.
+ * {@code is_match} is computed on plaintext (case-insensitive).
+ * Values are re-encrypted before writing to BigQuery.
  */
 public class FlattenAndCompareFn
         extends DoFn<KV<String, KV<GenericRecord, GenericRecord>>, TableRow> {
@@ -46,22 +48,6 @@ public class FlattenAndCompareFn
 
     // ── Array match keys ──────────────────────────────────────────────────────
 
-    /**
-     * Top-level segment keys only. Child arrays inside a segment automatically
-     * inherit the segment's derived key — they do not need their own entry here.
-     *
-     * <h3>Map key</h3>
-     * Dot-notation path to a top-level array segment, e.g. {@code "tradeline"}.
-     *
-     * <h3>Map value — key specification</h3>
-     * A {@code -}-separated list of field names (supports dot-notation for nested
-     * paths) whose values are joined (lower-cased) to form the {@code array_key}:
-     * <ul>
-     *   <li>Single field:  {@code "code"}</li>
-     *   <li>Composite:     {@code "accountnumber-customernumber-dateopened-code"}</li>
-     *   <li>Nested array:  {@code "customerNumber-disputeCodes.code"}</li>
-     * </ul>
-     */
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
             // "tradeline", "accountnumber-customernumber-dateopened-code",
             // "address",   "addresstype"
@@ -89,19 +75,20 @@ public class FlattenAndCompareFn
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
-        // Pair key format: "imageId::iteration"
+        // Pair key format: "imageId::segment::iteration"
         String pairKey = ctx.element().getKey();
-        String[] parts = pairKey.split("::", 2);
+        String[] parts = pairKey.split("::", 3);
 
-        if (parts.length != 2) {
+        if (parts.length != 3) {
             LOG.warn("Unexpected pairKey format: '{}' — skipping", pairKey);
             return;
         }
 
-        String imageId = parts[0];
-        int iteration;
+        String imageId  = parts[0];
+        String segment  = parts[1];
+        int    iteration;
         try {
-            iteration = Integer.parseInt(parts[1]);
+            iteration = Integer.parseInt(parts[2]);
         } catch (NumberFormatException e) {
             LOG.warn("Could not parse iteration from pairKey '{}' — skipping", pairKey);
             return;
@@ -113,12 +100,11 @@ public class FlattenAndCompareFn
         String humanKeyId = str(human.get("key_id"));
         String aiKeyId    = str(ai.get("key_id"));
         if (!nullSafeEquals(humanKeyId, aiKeyId)) {
-            LOG.warn("imageId='{}' has mismatched key_ids (human={}, ai={}) — using human key_id",
-                    imageId, humanKeyId, aiKeyId);
+            LOG.warn("imageId='{}' segment='{}' mismatched key_ids (human={}, ai={}) — using human",
+                    imageId, segment, humanKeyId, aiKeyId);
         }
         String keyId = humanKeyId;
 
-        // ── Decrypt payloads, then flatten ────────────────────────────────────
         String humanPayload = BarricadeEncryptionUtil.decrypt(keyId, str(human.get("payload")));
         String aiPayload    = BarricadeEncryptionUtil.decrypt(keyId, str(ai.get("payload")));
 
@@ -128,11 +114,11 @@ public class FlattenAndCompareFn
                 JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS);
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
-            LOG.warn("Both payloads empty or unparseable for imageId='{}' — skipping", imageId);
+            LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",
+                    imageId, segment);
             return;
         }
 
-        // ── Union of all field names ──────────────────────────────────────────
         Set<String> allFields = new TreeSet<>();
         allFields.addAll(humanFields.keySet());
         allFields.addAll(aiFields.keySet());
@@ -155,7 +141,6 @@ public class FlattenAndCompareFn
             if (keyed) {
                 Map<String, List<String>> humanGroups = groupByKey(humanEntries);
                 Map<String, List<String>> aiGroups    = groupByKey(aiEntries);
-
                 Set<String> allMatchKeys = new TreeSet<>();
                 allMatchKeys.addAll(humanGroups.keySet());
                 allMatchKeys.addAll(aiGroups.keySet());
@@ -166,23 +151,21 @@ public class FlattenAndCompareFn
                     List<String> aiVals =
                             aiGroups.getOrDefault(matchKey, Collections.emptyList());
                     int count = Math.max(humanVals.size(), aiVals.size());
-
                     for (int i = 0; i < count; i++) {
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
-                        emitRow(ctx, imageId, keyId, iteration,
+                        emitRow(ctx, imageId, segment, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, comparedAt,
                                 field, matchKey, humanVal, aiVal);
                         rowsEmitted++;
                     }
                 }
-
             } else {
                 int count = Math.max(humanEntries.size(), aiEntries.size());
                 for (int i = 0; i < count; i++) {
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
-                    emitRow(ctx, imageId, keyId, iteration,
+                    emitRow(ctx, imageId, segment, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, comparedAt,
                             field, null, humanVal, aiVal);
                     rowsEmitted++;
@@ -190,14 +173,14 @@ public class FlattenAndCompareFn
             }
         }
 
-        LOG.info("Compared imageId='{}' iteration={} — {} rows emitted ({} distinct fields)",
-                imageId, iteration, rowsEmitted, allFields.size());
+        LOG.info("Compared imageId='{}' segment='{}' iteration={} — {} rows ({} fields)",
+                imageId, segment, iteration, rowsEmitted, allFields.size());
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private void emitRow(ProcessContext ctx,
-                         String imageId, String keyId, int iteration,
+                         String imageId, String segment, String keyId, int iteration,
                          String aiCreatedAt, String humanCreatedAt, String comparedAt,
                          String field, String arrayKey,
                          String humanVal, String aiVal) {
@@ -210,6 +193,7 @@ public class FlattenAndCompareFn
         ctx.output(new TableRow()
                 .set("image_id",         imageId)
                 .set("key_id",           keyId)
+                .set("segment",          segment)
                 .set("ai_iteration",     iteration)
                 .set("ai_created_at",    aiCreatedAt)
                 .set("human_created_at", humanCreatedAt)

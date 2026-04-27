@@ -23,6 +23,9 @@ import java.util.Map;
  * row where one side carries the actual value and the other side is {@code null},
  * making {@code is_match = false} for every row.
  *
+ * <p>The {@code segment} value is read from the pending {@link GenericRecord} so
+ * that orphan rows can be filtered by segment in the shared comparison table.
+ *
  * <h3>Side assignment</h3>
  * <ul>
  *   <li>{@code pending_type = "human"} → {@code human_value} = field value,
@@ -57,6 +60,7 @@ public class OrphanCompareFn extends DoFn<GenericRecord, TableRow> {
 
         String imageId     = str(record.get("image_id"));
         String keyId       = str(record.get("key_id"));
+        String segment     = str(record.get("segment"));
         String pendingType = str(record.get("pending_type")); // "human" or "ai"
         String payload     = str(record.get("payload"));
         String createdAt   = TimestampUtil.normalizeTimestamp(str(record.get("created_at")));
@@ -66,53 +70,55 @@ public class OrphanCompareFn extends DoFn<GenericRecord, TableRow> {
             LOG.warn("Skipping orphan record — missing required fields: imageId={}", imageId);
             return;
         }
+        if (segment == null || segment.isBlank()) {
+            segment = "main";
+        }
 
         boolean isHuman = "human".equalsIgnoreCase(pendingType);
 
-        // Decrypt and flatten the orphaned payload
         String decrypted = BarricadeEncryptionUtil.decrypt(keyId, payload);
         Map<String, List<FieldValue>> fields =
                 JsonFieldExtractor.flatten(decrypted, FlattenAndCompareFn.ARRAY_MATCH_KEYS);
 
         if (fields.isEmpty()) {
-            LOG.warn("Orphaned payload for imageId='{}' is empty or unparseable — skipping", imageId);
+            LOG.warn("Orphaned payload for imageId='{}' segment='{}' is empty — skipping",
+                    imageId, segment);
             return;
         }
 
         int rowsEmitted = 0;
 
         for (Map.Entry<String, List<FieldValue>> entry : fields.entrySet()) {
-            String fieldName = entry.getKey();
-            List<FieldValue> entries = entry.getValue();
+            String fieldName     = entry.getKey();
+            List<FieldValue> fvs = entry.getValue();
 
-            for (FieldValue fv : entries) {
+            for (FieldValue fv : fvs) {
                 String encryptedValue = BarricadeEncryptionUtil.encrypt(keyId, fv.value);
 
-                // Assign value to the correct side; the absent side is null.
-                String humanValue = isHuman ? encryptedValue : null;
-                String aiValue    = isHuman ? null : encryptedValue;
-
+                String humanValue     = isHuman ? encryptedValue : null;
+                String aiValue        = isHuman ? null : encryptedValue;
                 String humanCreatedAt = isHuman ? createdAt : null;
                 String aiCreatedAt    = isHuman ? null : createdAt;
 
                 ctx.output(new TableRow()
                         .set("image_id",         imageId)
                         .set("key_id",           keyId)
-                        .set("ai_iteration",     0)           // no matched AI iteration
+                        .set("segment",          segment)
+                        .set("ai_iteration",     0)
                         .set("ai_created_at",    aiCreatedAt)
                         .set("human_created_at", humanCreatedAt)
                         .set("field_name",       fieldName)
-                        .set("array_key",        fv.matchKey) // null for scalars/positional
+                        .set("array_key",        fv.matchKey)
                         .set("human_value",      humanValue)
                         .set("ai_value",         aiValue)
-                        .set("is_match",         false)       // always false — one side absent
+                        .set("is_match",         false)
                         .set("compared_at",      comparedAt));
                 rowsEmitted++;
             }
         }
 
-        LOG.info("Orphan imageId='{}' pendingType='{}' — {} mismatch rows emitted",
-                imageId, pendingType, rowsEmitted);
+        LOG.info("Orphan imageId='{}' segment='{}' pendingType='{}' — {} mismatch rows",
+                imageId, segment, pendingType, rowsEmitted);
     }
 
     private static String str(Object value) {

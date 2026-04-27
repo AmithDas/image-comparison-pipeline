@@ -1,5 +1,5 @@
 {
-  "_comment": "Image Comparison Pipeline — DAG configuration. Each segment (main, authentication, docproof, etc.) runs as a separate Dataflow job. Add a new segment by copying an existing entry in the 'segments' array.",
+  "_comment": "Image Comparison Pipeline — DAG configuration. One Dataflow job handles all segments. Add a new segment by appending to the 'segments' array — no Java code changes needed.",
 
   "project_id": "your-gcp-project",
   "region":     "us-central1",
@@ -8,46 +8,43 @@
 
   "lookup_table": "your-project:your_dataset.lookup",
 
-  "shared": {
-    "_comment": "Tables and settings shared across all segment jobs.",
-    "ai_source_table":   "your-project:ai_dataset.ai_payloads",
-    "human_source_table":"your-project:human_dataset.human_payloads",
-    "dead_letter_table": "your-project:dataset.dead_letter_comparisons",
-    "image_name_field":  "queueImages[0].fileName",
-    "firestore_collection": "dek_store",
-    "kms_key_path": "projects/p/locations/l/keyRings/r/cryptoKeys/k",
+  "pipeline": {
+    "_comment": "All segments write to the same output tables. Use the 'segment' column to filter in BigQuery.",
+
+    "ai_source_table":        "your-project:ai_dataset.ai_payloads",
+    "human_source_table":     "your-project:human_dataset.human_payloads",
+    "output_table":           "your-project:dataset.comparison_results",
+    "pending_table":          "your-project:dataset.pending_comparisons",
+    "dead_letter_table":      "your-project:dataset.dead_letter_comparisons",
+    "pending_snapshot_table": "your-project:dataset.pending_snapshot",
+
+    "image_name_field":      "queueImages[0].fileName",
+    "firestore_collection":  "dek_store",
+    "kms_key_path":          "projects/p/locations/l/keyRings/r/cryptoKeys/k",
 
     "_comment_filter": "Leave human_filter_field blank to disable payload filtering.",
     "human_filter_field": "",
-    "human_filter_value": ""
-  },
+    "human_filter_value": "",
 
-  "segments": [
-    {
-      "name":                  "main",
-      "ai_method":             "aimetadata",
-      "human_method":          "controller.SubmitDispute",
-      "output_table":          "your-project:dataset.main_results",
-      "pending_table":         "your-project:dataset.main_pending_comparisons",
-      "pending_snapshot_table":"your-project:dataset.main_pending_snapshot"
-    },
-    {
-      "name":                  "authentication",
-      "ai_method":             "auth.ai",
-      "human_method":          "auth.human",
-      "output_table":          "your-project:dataset.auth_results",
-      "pending_table":         "your-project:dataset.auth_pending_comparisons",
-      "pending_snapshot_table":"your-project:dataset.auth_pending_snapshot"
-    },
-    {
-      "name":                  "docproof",
-      "ai_method":             "docproof.ai",
-      "human_method":          "docproof.human",
-      "output_table":          "your-project:dataset.docproof_results",
-      "pending_table":         "your-project:dataset.docproof_pending_comparisons",
-      "pending_snapshot_table":"your-project:dataset.docproof_pending_snapshot"
-    }
-  ],
+    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. Source rows whose method does not match any entry are silently dropped.",
+    "segments": [
+      {
+        "name":        "main",
+        "aiMethod":    "aimetadata",
+        "humanMethod": "controller.SubmitDispute"
+      },
+      {
+        "name":        "authentication",
+        "aiMethod":    "auth.ai",
+        "humanMethod": "auth.human"
+      },
+      {
+        "name":        "docproof",
+        "aiMethod":    "docproof.ai",
+        "humanMethod": "docproof.human"
+      }
+    ]
+  },
 
   "dataflow": {
     "service_account":  "pipeline-sa@your-project.iam.gserviceaccount.com",

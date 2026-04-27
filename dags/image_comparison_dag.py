@@ -1,14 +1,17 @@
 """
 Image Comparison Pipeline — Airflow DAG  (Classic Dataflow Template)
 =====================================================================
-Runs one Dataflow job per segment (main, authentication, docproof, …) every
-3 hours. Each job is completely independent — it has its own method pair,
-output table, pending table, and pending-snapshot table.
+Runs a single Dataflow job every 3 hours that processes all segments
+(main, authentication, docproof, …) in one pass.
+
+Source rows are routed to their segment by the 'method' column value.
+All results land in one shared BigQuery table with a 'segment' column
+for downstream filtering.
 
 All configuration lives in:
   dags/config/image_comparison_config.json
 
-To add a new segment, append an entry to the "segments" array in that file.
+To add a new segment, append an entry to pipeline.segments in that file.
 No Python or Java changes are needed.
 
 Lookup table contract
@@ -18,22 +21,14 @@ Lookup table contract
   window_end    TIMESTAMP  NOT NULL   exclusive end of the processing window
   status        STRING     NOT NULL   PENDING | RUNNING | DONE | FAILED
 
-DAG run lifecycle  (per scheduled tick)
-────────────────────────────────────────
-  fetch_window
-      │
-      ├─ mark_running
-      │       │
-      │       ├─ run_dataflow_<segment1>  ─┐
-      │       ├─ run_dataflow_<segment2>   ├─ mark_done
-      │       └─ run_dataflow_<segmentN>  ─┘   (on all success)
-      │                                     mark_failed
-      │                                       (on any failure)
+DAG run lifecycle
+─────────────────
+  fetch_window → mark_running → run_dataflow → mark_done
+                                      ↓ (on failure)
+                                   mark_failed
 
-  • Segment Dataflow jobs run in parallel.
-  • max_active_runs=1 prevents overlapping DAG runs.
-  • wait_until_finished=True on each job ensures the DAG waits for all jobs
-    to complete before marking the window DONE or FAILED.
+  • No PENDING row → DAG run completes as SKIPPED (no alert).
+  • max_active_runs=1 prevents overlapping windows.
 
 Classic Template — how to compile and stage
 ───────────────────────────────────────────
@@ -68,9 +63,8 @@ _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "image_comparis
 with open(_CONFIG_PATH) as _f:
     _CFG = json.load(_f)
 
-_SHARED   = _CFG["shared"]
+_PIPE     = _CFG["pipeline"]
 _DATAFLOW = _CFG["dataflow"]
-_SEGMENTS = _CFG["segments"]
 
 PROJECT_ID        = _CFG["project_id"]
 REGION            = _CFG["region"]
@@ -79,6 +73,13 @@ LOOKUP_TABLE      = _CFG["lookup_table"]
 
 _LOOKUP_TABLE_SQL = LOOKUP_TABLE.replace(":", ".", 1)
 
+# The pipeline expects segmentConfigs as a JSON string — serialise the list from config.
+# Strip comment keys (starting with '_') before passing to Java.
+_SEGMENT_CONFIGS_JSON = json.dumps([
+    {k: v for k, v in seg.items() if not k.startswith("_")}
+    for seg in _PIPE["segments"]
+])
+
 # ── Task 1: fetch next pending window ────────────────────────────────────────
 
 def fetch_window(**context) -> None:
@@ -86,8 +87,7 @@ def fetch_window(**context) -> None:
     Queries the lookup table for the earliest PENDING run and pushes
     run_id, window_start, and window_end into XCom.
 
-    Raises AirflowSkipException when no PENDING row exists so the DAG run
-    completes as SKIPPED rather than FAILED.
+    Raises AirflowSkipException when no PENDING row exists.
     """
     hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
 
@@ -131,33 +131,29 @@ def _bq_query_config(sql: str) -> dict:
 
 # ── Dataflow parameters ───────────────────────────────────────────────────────
 
-def _dataflow_parameters(segment: dict) -> dict:
+def _dataflow_parameters() -> dict:
     """
-    Builds parameters for one segment's Dataflow job.
-    Shared settings come from config["shared"]; per-segment overrides come from
-    the segment entry itself.
+    Builds the Dataflow Classic Template parameter dict from config.
+    windowStart / windowEnd are resolved at task-run time via Jinja XCom refs.
+    segmentConfigs is a JSON string listing all segments with their method pairs.
     """
     params = {
-        # Shared source / infra
-        "aiSourceTable":        _SHARED["ai_source_table"],
-        "humanSourceTable":     _SHARED["human_source_table"],
-        "deadLetterTable":      _SHARED["dead_letter_table"],
-        "imageNameField":       _SHARED["image_name_field"],
-        "firestoreCollection":  _SHARED["firestore_collection"],
-        "kmsKeyPath":           _SHARED["kms_key_path"],
-        # Window (XCom, resolved at task-run time)
+        "aiSourceTable":        _PIPE["ai_source_table"],
+        "humanSourceTable":     _PIPE["human_source_table"],
+        "outputTable":          _PIPE["output_table"],
+        "pendingTable":         _PIPE["pending_table"],
+        "deadLetterTable":      _PIPE["dead_letter_table"],
+        "pendingSnapshotTable": _PIPE["pending_snapshot_table"],
         "windowStart": "{{ ti.xcom_pull(task_ids='fetch_window', key='window_start') }}",
         "windowEnd":   "{{ ti.xcom_pull(task_ids='fetch_window', key='window_end') }}",
-        # Per-segment
-        "aiMethod":             segment["ai_method"],
-        "humanMethod":          segment["human_method"],
-        "outputTable":          segment["output_table"],
-        "pendingTable":         segment["pending_table"],
-        "pendingSnapshotTable": segment["pending_snapshot_table"],
+        "segmentConfigs":       _SEGMENT_CONFIGS_JSON,
+        "imageNameField":       _PIPE["image_name_field"],
+        "firestoreCollection":  _PIPE["firestore_collection"],
+        "kmsKeyPath":           _PIPE["kms_key_path"],
     }
-    if _SHARED.get("human_filter_field") and _SHARED.get("human_filter_value"):
-        params["humanFilterField"] = _SHARED["human_filter_field"]
-        params["humanFilterValue"] = _SHARED["human_filter_value"]
+    if _PIPE.get("human_filter_field") and _PIPE.get("human_filter_value"):
+        params["humanFilterField"] = _PIPE["human_filter_field"]
+        params["humanFilterValue"] = _PIPE["human_filter_value"]
     return params
 
 
@@ -185,7 +181,7 @@ default_args = {
 with DAG(
     dag_id="image_comparison_pipeline",
     description=(
-        "Runs one Dataflow job per segment every 3 hours. "
+        "Single Dataflow job processes all segments every 3 hours. "
         "Config lives in dags/config/image_comparison_config.json."
     ),
     default_args=default_args,
@@ -197,13 +193,11 @@ with DAG(
     tags=["dataflow", "image-comparison", "data-platform"],
 ) as dag:
 
-    # ── 1. Fetch window ───────────────────────────────────────────────────────
     fetch_window_task = PythonOperator(
         task_id="fetch_window",
         python_callable=fetch_window,
     )
 
-    # ── 2. Mark window as RUNNING ─────────────────────────────────────────────
     mark_running = BigQueryInsertJobOperator(
         task_id="mark_running",
         configuration=_bq_query_config(_update_status_query("RUNNING")),
@@ -211,28 +205,22 @@ with DAG(
         gcp_conn_id="google_cloud_default",
     )
 
-    # ── 3. One Dataflow job per segment (run in parallel) ─────────────────────
-    dataflow_tasks = []
-    for segment in _SEGMENTS:
-        seg_name = segment["name"]
-        task = DataflowTemplatedJobStartOperator(
-            task_id=f"run_dataflow_{seg_name}",
-            template=TEMPLATE_GCS_PATH,
-            job_name=(
-                f"ic-{seg_name}-"
-                "{{ ti.xcom_pull(task_ids='fetch_window', key='window_start')"
-                "| replace(':', '-') | replace('T', '-') | replace('Z', '') | replace(' ', '-') }}"
-            ),
-            project_id=PROJECT_ID,
-            location=REGION,
-            parameters=_dataflow_parameters(segment),
-            dataflow_default_options=_dataflow_options(),
-            wait_until_finished=True,
-            gcp_conn_id="google_cloud_default",
-        )
-        dataflow_tasks.append(task)
+    run_dataflow = DataflowTemplatedJobStartOperator(
+        task_id="run_dataflow",
+        template=TEMPLATE_GCS_PATH,
+        job_name=(
+            "ic-pipeline-"
+            "{{ ti.xcom_pull(task_ids='fetch_window', key='window_start')"
+            "| replace(':', '-') | replace('T', '-') | replace('Z', '') | replace(' ', '-') }}"
+        ),
+        project_id=PROJECT_ID,
+        location=REGION,
+        parameters=_dataflow_parameters(),
+        dataflow_default_options=_dataflow_options(),
+        wait_until_finished=True,
+        gcp_conn_id="google_cloud_default",
+    )
 
-    # ── 4a. Mark DONE when all segment jobs succeed ───────────────────────────
     mark_done = BigQueryInsertJobOperator(
         task_id="mark_done",
         configuration=_bq_query_config(_update_status_query("DONE")),
@@ -241,7 +229,6 @@ with DAG(
         trigger_rule=TriggerRule.ALL_SUCCESS,
     )
 
-    # ── 4b. Mark FAILED if any segment job fails ──────────────────────────────
     mark_failed = BigQueryInsertJobOperator(
         task_id="mark_failed",
         configuration=_bq_query_config(_update_status_query("FAILED")),
@@ -250,5 +237,4 @@ with DAG(
         trigger_rule=TriggerRule.ONE_FAILED,
     )
 
-    # ── Dependency chain ──────────────────────────────────────────────────────
-    fetch_window_task >> mark_running >> dataflow_tasks >> [mark_done, mark_failed]
+    fetch_window_task >> mark_running >> run_dataflow >> [mark_done, mark_failed]

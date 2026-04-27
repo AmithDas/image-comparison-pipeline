@@ -23,28 +23,23 @@ import java.util.Map;
 /**
  * Core eligibility and pairing transform.
  *
- * <p>One human payload is matched against every AI iteration for the same
- * {@code image_name}. Each AI iteration produces an independent MATCHED pair
- * and therefore an independent set of comparison rows in the output table.
+ * <p>Input key format: {@code "imageId::segment"}.  One human payload is matched
+ * against every AI iteration for the same {@code imageId} within the same
+ * {@code segment}.  Each AI iteration produces an independent MATCHED pair.
  *
- * <p>Pairing rules (per {@code image_name} per run):
+ * <p>Pairing rules (per key per run):
  * <ul>
- *   <li><b>Human + N AI iterations present</b> → emit N MATCHED pairs, one per AI
- *       iteration (sorted by {@code created_at}; iteration number = sort position).
- *       Human is re-pended so late-arriving AI iterations in future runs can still
- *       match against it.</li>
+ *   <li><b>Human + N AI iterations present</b> → emit N MATCHED pairs (sorted by
+ *       {@code created_at}; iteration number = sort position).
+ *       Human is re-pended so late-arriving AI iterations can still match it.</li>
  *   <li><b>Human only</b> → pend human; wait for AI iterations.</li>
  *   <li><b>AI iterations only</b> → restored pending human (if present) is matched;
- *       otherwise pend each AI iteration independently and wait for human.</li>
+ *       otherwise pend each AI iteration and wait for human.</li>
  *   <li><b>Pending row(s) aged out (≥ MAX_WAIT_DAYS)</b> → route to dead-letter.</li>
  * </ul>
  *
  * <p>AI vs human classification uses the {@code method} column compared against the
- * {@code aiMethod} and {@code humanMethod} values supplied at construction time.
- *
- * <p>Schemas for {@link GenericRecord} construction are injected via the constructor
- * rather than accessed from a static registry, keeping the DoFn self-contained and
- * testable without classpath schema files.
+ * {@code methodToSide} map supplied at construction time.
  */
 public class FilterAndPairFn
         extends DoFn<KV<String, CoGbkResult>,
@@ -54,23 +49,21 @@ public class FilterAndPairFn
 
     public static final int MAX_WAIT_DAYS = 7;
 
-    private final String aiMethod;
-    private final String humanMethod;
+    /** method → "ai" or "human", covering every segment. */
+    private final Map<String, String> methodToSide;
     private final Schema payloadSchema;
     private final Schema pendingSchema;
 
     /**
-     * @param aiMethod      value of the {@code method} column that identifies an AI payload
-     * @param humanMethod   value of the {@code method} column that identifies a human payload
+     * @param methodToSide  map of method column value → "ai" or "human",
+     *                      built via {@link com.yourorg.pipeline.config.SegmentConfig#buildMethodToSideMap}
      * @param payloadSchema Avro schema for intermediate {@code PayloadRow} records
      * @param pendingSchema Avro schema for intermediate {@code PendingRow} records
      */
-    public FilterAndPairFn(String aiMethod,
-                            String humanMethod,
+    public FilterAndPairFn(Map<String, String> methodToSide,
                             Schema payloadSchema,
                             Schema pendingSchema) {
-        this.aiMethod      = aiMethod;
-        this.humanMethod   = humanMethod;
+        this.methodToSide  = methodToSide;
         this.payloadSchema = payloadSchema;
         this.pendingSchema = pendingSchema;
     }
@@ -89,10 +82,14 @@ public class FilterAndPairFn
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
-        String imageId     = ctx.element().getKey();
+        // Key format: "imageId::segment"
+        String fullKey  = ctx.element().getKey();
+        String[] keyParts = fullKey.split("::", 2);
+        String imageId   = keyParts[0];
+        String segment   = keyParts.length > 1 ? keyParts[1] : "main";
         CoGbkResult result = ctx.element().getValue();
 
-        // ── Partition source rows by type ────────────────────────────────────
+        // ── Partition source rows by side ────────────────────────────────────
         List<GenericRecord> humanRows = new ArrayList<>();
         List<GenericRecord> aiRows    = new ArrayList<>();
 
@@ -101,20 +98,16 @@ public class FilterAndPairFn
             String keyId            = (String) row.get("key_id");
             String method           = (String) row.get("method");
 
-            String payloadType;
-            if (aiMethod.equals(method)) {
-                payloadType = "ai";
-            } else if (humanMethod.equals(method)) {
-                payloadType = "human";
-            } else {
-                LOG.warn("Unrecognised method '{}' for imageId={} — skipping", method, imageId);
+            String side = methodToSide.get(method);
+            if (side == null) {
+                LOG.warn("Unrecognised method '{}' for imageId={} segment={} — skipping",
+                        method, imageId, segment);
                 continue;
             }
 
             String createdAtNorm = TimestampUtil.normalizeTimestamp((String) row.get("created_at"));
-            GenericRecord p = newPayloadRow(imageId, keyId, payloadType,
-                    encryptedPayload, createdAtNorm);
-            if ("human".equals(payloadType)) {
+            GenericRecord p = newPayloadRow(imageId, keyId, side, encryptedPayload, createdAtNorm);
+            if ("human".equals(side)) {
                 humanRows.add(p);
             } else {
                 aiRows.add(p);
@@ -122,14 +115,12 @@ public class FilterAndPairFn
         }
 
         if (humanRows.size() > 1) {
-            LOG.warn("imageId={} has {} human rows — using the earliest by created_at",
-                    imageId, humanRows.size());
+            LOG.warn("imageId={} segment={} has {} human rows — using the earliest by created_at",
+                    imageId, segment, humanRows.size());
             humanRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
         }
 
         // ── Restore pending rows ──────────────────────────────────────────────
-        // Key: "type:created_at" → original pending GenericRecord
-        // Used to carry forward first_seen_at and retry_count per iteration.
         Map<String, GenericRecord> pendingMeta = new HashMap<>();
 
         for (TableRow pendingRow : result.getAll(PENDING_TAG)) {
@@ -143,12 +134,12 @@ public class FilterAndPairFn
             if ("human".equals(pendingType) && humanRows.isEmpty()) {
                 humanRows.add(newPayloadRow(imageId, pendingKeyId, "human",
                         str(p.get("payload")), createdAt));
-                LOG.debug("Restored pending human payload for imageId={}", imageId);
+                LOG.debug("Restored pending human for imageId={} segment={}", imageId, segment);
             } else if ("ai".equals(pendingType)) {
                 aiRows.add(newPayloadRow(imageId, pendingKeyId, "ai",
                         str(p.get("payload")), createdAt));
-                LOG.debug("Restored pending AI iteration (created_at={}) for imageId={}",
-                        createdAt, imageId);
+                LOG.debug("Restored pending AI (created_at={}) for imageId={} segment={}",
+                        createdAt, imageId, segment);
             }
         }
 
@@ -156,68 +147,67 @@ public class FilterAndPairFn
         boolean humanPresent = !humanRows.isEmpty();
         boolean anyAiPresent = !aiRows.isEmpty();
 
-        // Sort AI rows by created_at for stable iteration numbering across all states.
         aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
 
         if (humanPresent && anyAiPresent) {
-            // ── State 1: human + N AI iterations → emit one MATCHED per AI ──
+            // ── State 1: human + N AI → emit one MATCHED per AI ──────────────
             GenericRecord human = humanRows.get(0);
             for (int i = 0; i < aiRows.size(); i++) {
-                // Pair key: "imageId::iteration"
-                String pairKey = imageId + "::" + (i + 1);
+                // Pair key: "imageId::segment::iteration"
+                String pairKey = imageId + "::" + segment + "::" + (i + 1);
                 ctx.output(MATCHED, KV.of(pairKey, KV.of(human, aiRows.get(i))));
             }
-            LOG.info("Matched imageId={} — {} AI iteration(s) emitted for comparison",
-                    imageId, aiRows.size());
+            LOG.info("Matched imageId={} segment={} — {} AI iteration(s)",
+                    imageId, segment, aiRows.size());
 
-            // Keep human in pending so late-arriving AI iterations in future runs
-            // can still be matched against it (up to MAX_WAIT_DAYS).
+            // Re-pend human for late-arriving AI iterations.
             String        humanCreatedAt = str(human.get("created_at"));
             GenericRecord humanMeta      = pendingMeta.get("human:" + humanCreatedAt);
             Instant       firstSeen      = metaFirstSeen(humanMeta, now);
             long          retryCount     = metaRetryCount(humanMeta);
             long          daysWaited     = ChronoUnit.DAYS.between(firstSeen, now);
-            emitPendingOrAgedOut(ctx, imageId, str(human.get("key_id")), "human",
+            emitPendingOrAgedOut(ctx, imageId, segment, str(human.get("key_id")), "human",
                     str(human.get("payload")), humanCreatedAt,
                     firstSeen, now, retryCount, daysWaited);
 
         } else if (humanPresent) {
-            // ── State 2: human present, no AI yet → pend human ──────────────
+            // ── State 2: human only → pend ───────────────────────────────────
             GenericRecord human     = humanRows.get(0);
             String        createdAt = str(human.get("created_at"));
             GenericRecord meta      = pendingMeta.get("human:" + createdAt);
             Instant firstSeen       = metaFirstSeen(meta, now);
             long retryCount         = metaRetryCount(meta);
             long daysWaited         = ChronoUnit.DAYS.between(firstSeen, now);
-            LOG.info("Human-only imageId={} — pending AI (days waited={})", imageId, daysWaited);
-            emitPendingOrAgedOut(ctx, imageId, str(human.get("key_id")), "human",
+            LOG.info("Human-only imageId={} segment={} — pending AI (days waited={})",
+                    imageId, segment, daysWaited);
+            emitPendingOrAgedOut(ctx, imageId, segment, str(human.get("key_id")), "human",
                     str(human.get("payload")), createdAt,
                     firstSeen, now, retryCount, daysWaited);
 
         } else if (anyAiPresent) {
-            // ── State 3: one or more AI iterations, no human → pend each ────
+            // ── State 3: AI only → pend each iteration ───────────────────────
             for (GenericRecord ai : aiRows) {
                 String        createdAt = str(ai.get("created_at"));
                 GenericRecord meta      = pendingMeta.get("ai:" + createdAt);
                 Instant firstSeen       = metaFirstSeen(meta, now);
                 long retryCount         = metaRetryCount(meta);
                 long daysWaited         = ChronoUnit.DAYS.between(firstSeen, now);
-                LOG.info("AI-only imageId={} (created_at={}) — pending human (days waited={})",
-                        imageId, createdAt, daysWaited);
-                emitPendingOrAgedOut(ctx, imageId, str(ai.get("key_id")), "ai",
+                LOG.info("AI-only imageId={} segment={} (created_at={}) — pending human (days waited={})",
+                        imageId, segment, createdAt, daysWaited);
+                emitPendingOrAgedOut(ctx, imageId, segment, str(ai.get("key_id")), "ai",
                         str(ai.get("payload")), createdAt,
                         firstSeen, now, retryCount, daysWaited);
             }
 
         } else if (!pendingMeta.isEmpty()) {
-            // ── State 4: no source rows, pending rows exist but unrestorable ─
+            // ── State 4: no source rows, check pending for age-out ────────────
             for (GenericRecord p : pendingMeta.values()) {
                 Instant firstSeen = metaFirstSeen(p, now);
                 long daysWaited   = ChronoUnit.DAYS.between(firstSeen, now);
                 if (daysWaited >= MAX_WAIT_DAYS) {
-                    LOG.warn("imageId={} pending row (type={}) aged out after {} days — dead-letter",
-                            imageId, str(p.get("pending_type")), daysWaited);
-                    ctx.output(AGED_OUT, newPendingRow(imageId,
+                    LOG.warn("imageId={} segment={} pending row (type={}) aged out after {} days",
+                            imageId, segment, str(p.get("pending_type")), daysWaited);
+                    ctx.output(AGED_OUT, newPendingRow(imageId, segment,
                             str(p.get("key_id")), str(p.get("pending_type")),
                             str(p.get("payload")), str(p.get("created_at")),
                             firstSeen, now, metaRetryCount(p)));
@@ -229,12 +219,12 @@ public class FilterAndPairFn
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private void emitPendingOrAgedOut(ProcessContext ctx,
-                                       String imageId,
+                                       String imageId, String segment,
                                        String keyId, String pendingType,
                                        String payload, String createdAt,
                                        Instant firstSeen, Instant now,
                                        long retryCount, long daysWaited) {
-        GenericRecord row = newPendingRow(imageId, keyId, pendingType,
+        GenericRecord row = newPendingRow(imageId, segment, keyId, pendingType,
                 payload, createdAt, firstSeen, now, retryCount);
         if (daysWaited >= MAX_WAIT_DAYS) {
             ctx.output(AGED_OUT, row);
@@ -267,7 +257,7 @@ public class FilterAndPairFn
         return r;
     }
 
-    private GenericRecord newPendingRow(String imageId,
+    private GenericRecord newPendingRow(String imageId, String segment,
                                          String keyId, String pendingType,
                                          String payload, String createdAt,
                                          Instant firstSeen, Instant now,
@@ -275,6 +265,7 @@ public class FilterAndPairFn
         GenericRecord r = new GenericData.Record(pendingSchema);
         r.put("image_id",        imageId);
         r.put("key_id",          keyId);
+        r.put("segment",         segment);
         r.put("pending_type",    pendingType);
         r.put("payload",         payload);
         r.put("created_at",      createdAt);
@@ -288,6 +279,7 @@ public class FilterAndPairFn
         GenericRecord r = new GenericData.Record(pendingSchema);
         r.put("image_id",        row.get("image_id"));
         r.put("key_id",          row.get("key_id"));
+        r.put("segment",         row.get("segment") != null ? row.get("segment") : "main");
         r.put("pending_type",    row.get("pending_type"));
         r.put("payload",         row.get("payload"));
         r.put("created_at",      TimestampUtil.normalizeTimestamp(str(row.get("created_at"))));
@@ -297,12 +289,6 @@ public class FilterAndPairFn
         return r;
     }
 
-    /**
-     * Safely converts a BigQuery cell value to a {@code long}.
-     * BigQuery's {@code readTableRows()} returns INTEGER columns as {@link String},
-     * not as {@link Number}, so a direct cast fails on subsequent runs when the
-     * pending row is round-tripped through BQ.
-     */
     private static long parseLong(Object value) {
         if (value == null) return 0L;
         if (value instanceof Number) return ((Number) value).longValue();

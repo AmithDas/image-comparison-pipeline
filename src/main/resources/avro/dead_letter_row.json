@@ -4,6 +4,8 @@
   "namespace": "com.yourorg.pipeline",
   "fields": [
     {"name": "image_id",      "type": "string"},
+    {"name": "key_id",        "type": ["null", "string"], "default": null},
+    {"name": "segment",       "type": "string"},
     {"name": "pending_type",  "type": "string"},
     {"name": "payload",       "type": ["null", "string"], "default": null},
     {"name": "created_at",    "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
