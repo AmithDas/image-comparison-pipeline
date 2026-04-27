@@ -25,18 +25,6 @@ import org.slf4j.LoggerFactory;
  *                                     filterField, filterValue))
  * </pre>
  *
- * <h3>ValueProvider fields</h3>
- * {@code firestoreCollection}, {@code kmsKeyPath}, and {@code imageNameField} are
- * {@link ValueProvider}s so that they can be wired directly from pipeline options
- * and resolved lazily on each Dataflow worker in {@code @Setup} / {@code @ProcessElement}.
- * {@code filterField} and {@code filterValue} are plain {@link String}s — they are
- * optional and always resolved at graph-construction time.
- *
- * <h3>Image name field path</h3>
- * {@code imageNameField} is a dot-notation path with optional array indexing, e.g.
- * {@code "queueImages[0].fileName"} or {@code "metadata.imageId"}.
- * Rows where the path resolves to null or is absent are dropped with a WARN log.
- *
  * <h3>Payload filter</h3>
  * When {@code filterField} is non-blank, only rows where
  * {@code filterField == filterValue} in the decrypted payload are forwarded.
@@ -54,20 +42,17 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     private final ValueProvider<String> firestoreCollection;
     private final ValueProvider<String> kmsKeyPath;
     private final ValueProvider<String> imageNameField;
-    private final String                routeName;     // included in output key
     private final String                filterField;   // null → no filter
     private final String                filterValue;
 
     private DecryptAndKeyFn(ValueProvider<String> firestoreCollection,
                              ValueProvider<String> kmsKeyPath,
                              ValueProvider<String> imageNameField,
-                             String routeName,
                              String filterField,
                              String filterValue) {
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
         this.imageNameField      = imageNameField;
-        this.routeName           = routeName;
         this.filterField         = filterField;
         this.filterValue         = filterValue;
     }
@@ -77,10 +62,8 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     /** No payload filter — suitable for AI rows. */
     public static DecryptAndKeyFn forAi(ValueProvider<String> firestoreCollection,
                                          ValueProvider<String> kmsKeyPath,
-                                         ValueProvider<String> imageNameField,
-                                         String routeName) {
-        return new DecryptAndKeyFn(
-                firestoreCollection, kmsKeyPath, imageNameField, routeName, null, null);
+                                         ValueProvider<String> imageNameField) {
+        return new DecryptAndKeyFn(firestoreCollection, kmsKeyPath, imageNameField, null, null);
     }
 
     /**
@@ -90,12 +73,10 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     public static DecryptAndKeyFn forHuman(ValueProvider<String> firestoreCollection,
                                             ValueProvider<String> kmsKeyPath,
                                             ValueProvider<String> imageNameField,
-                                            String routeName,
                                             String filterField,
                                             String filterValue) {
         return new DecryptAndKeyFn(
-                firestoreCollection, kmsKeyPath, imageNameField,
-                routeName, filterField, filterValue);
+                firestoreCollection, kmsKeyPath, imageNameField, filterField, filterValue);
     }
 
     // ── Beam lifecycle ────────────────────────────────────────────────────────
@@ -130,7 +111,6 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
             return;
         }
 
-        // Key format: "imageId::routeName" — groups each route independently.
-        ctx.output(KV.of(imageName + "::" + routeName, row));
+        ctx.output(KV.of(imageName, row));
     }
 }

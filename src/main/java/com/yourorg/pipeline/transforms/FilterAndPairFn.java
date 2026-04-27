@@ -39,6 +39,9 @@ import java.util.Map;
  *   <li><b>Pending row(s) aged out (≥ MAX_WAIT_DAYS)</b> → route to dead-letter.</li>
  * </ul>
  *
+ * <p>AI vs human classification uses the {@code method} column compared against the
+ * {@code aiMethod} and {@code humanMethod} values supplied at construction time.
+ *
  * <p>Schemas for {@link GenericRecord} construction are injected via the constructor
  * rather than accessed from a static registry, keeping the DoFn self-contained and
  * testable without classpath schema files.
@@ -51,24 +54,23 @@ public class FilterAndPairFn
 
     public static final int MAX_WAIT_DAYS = 7;
 
-    /**
-     * Map of {@code method} column value → side ("ai" or "human").
-     * Built from all route configs so every method across all routes is recognised.
-     */
-    private final Map<String, String> methodToSide;
+    private final String aiMethod;
+    private final String humanMethod;
     private final Schema payloadSchema;
     private final Schema pendingSchema;
 
     /**
-     * @param methodToSide  map of method column value → "ai" or "human",
-     *                      built via {@link com.yourorg.pipeline.config.RouteConfig#buildMethodToSideMap}
+     * @param aiMethod      value of the {@code method} column that identifies an AI payload
+     * @param humanMethod   value of the {@code method} column that identifies a human payload
      * @param payloadSchema Avro schema for intermediate {@code PayloadRow} records
      * @param pendingSchema Avro schema for intermediate {@code PendingRow} records
      */
-    public FilterAndPairFn(Map<String, String> methodToSide,
+    public FilterAndPairFn(String aiMethod,
+                            String humanMethod,
                             Schema payloadSchema,
                             Schema pendingSchema) {
-        this.methodToSide  = methodToSide;
+        this.aiMethod      = aiMethod;
+        this.humanMethod   = humanMethod;
         this.payloadSchema = payloadSchema;
         this.pendingSchema = pendingSchema;
     }
@@ -87,11 +89,7 @@ public class FilterAndPairFn
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
-        // Key format: "imageId::routeName"
-        String fullKey  = ctx.element().getKey();
-        String[] keyParts = fullKey.split("::", 2);
-        String imageId  = keyParts[0];
-        String routeName = keyParts.length > 1 ? keyParts[1] : "main";
+        String imageId     = ctx.element().getKey();
         CoGbkResult result = ctx.element().getValue();
 
         // ── Partition source rows by type ────────────────────────────────────
@@ -103,15 +101,16 @@ public class FilterAndPairFn
             String keyId            = (String) row.get("key_id");
             String method           = (String) row.get("method");
 
-            String payloadType = methodToSide.get(method);
-            if (payloadType == null) {
-                LOG.warn("Unrecognised method '{}' for imageId={} route={} — skipping",
-                        method, imageId, routeName);
+            String payloadType;
+            if (aiMethod.equals(method)) {
+                payloadType = "ai";
+            } else if (humanMethod.equals(method)) {
+                payloadType = "human";
+            } else {
+                LOG.warn("Unrecognised method '{}' for imageId={} — skipping", method, imageId);
                 continue;
             }
 
-            // Normalize created_at on ingestion — source BQ rows may use
-            // "YYYY-MM-DD HH:MM:SS UTC" or other formats; we write RFC 3339.
             String createdAtNorm = TimestampUtil.normalizeTimestamp((String) row.get("created_at"));
             GenericRecord p = newPayloadRow(imageId, keyId, payloadType,
                     encryptedPayload, createdAtNorm);
@@ -164,8 +163,8 @@ public class FilterAndPairFn
             // ── State 1: human + N AI iterations → emit one MATCHED per AI ──
             GenericRecord human = humanRows.get(0);
             for (int i = 0; i < aiRows.size(); i++) {
-                // Pair key: "imageId::routeName::iteration"
-                String pairKey = imageId + "::" + routeName + "::" + (i + 1);
+                // Pair key: "imageId::iteration"
+                String pairKey = imageId + "::" + (i + 1);
                 ctx.output(MATCHED, KV.of(pairKey, KV.of(human, aiRows.get(i))));
             }
             LOG.info("Matched imageId={} — {} AI iteration(s) emitted for comparison",
@@ -178,7 +177,7 @@ public class FilterAndPairFn
             Instant       firstSeen      = metaFirstSeen(humanMeta, now);
             long          retryCount     = metaRetryCount(humanMeta);
             long          daysWaited     = ChronoUnit.DAYS.between(firstSeen, now);
-            emitPendingOrAgedOut(ctx, imageId, routeName, str(human.get("key_id")), "human",
+            emitPendingOrAgedOut(ctx, imageId, str(human.get("key_id")), "human",
                     str(human.get("payload")), humanCreatedAt,
                     firstSeen, now, retryCount, daysWaited);
 
@@ -190,9 +189,8 @@ public class FilterAndPairFn
             Instant firstSeen       = metaFirstSeen(meta, now);
             long retryCount         = metaRetryCount(meta);
             long daysWaited         = ChronoUnit.DAYS.between(firstSeen, now);
-            LOG.info("Human-only imageId={} route={} — pending AI (days waited={})",
-                    imageId, routeName, daysWaited);
-            emitPendingOrAgedOut(ctx, imageId, routeName, str(human.get("key_id")), "human",
+            LOG.info("Human-only imageId={} — pending AI (days waited={})", imageId, daysWaited);
+            emitPendingOrAgedOut(ctx, imageId, str(human.get("key_id")), "human",
                     str(human.get("payload")), createdAt,
                     firstSeen, now, retryCount, daysWaited);
 
@@ -204,9 +202,9 @@ public class FilterAndPairFn
                 Instant firstSeen       = metaFirstSeen(meta, now);
                 long retryCount         = metaRetryCount(meta);
                 long daysWaited         = ChronoUnit.DAYS.between(firstSeen, now);
-                LOG.info("AI-only imageId={} route={} (created_at={}) — pending human (days waited={})",
-                        imageId, routeName, createdAt, daysWaited);
-                emitPendingOrAgedOut(ctx, imageId, routeName, str(ai.get("key_id")), "ai",
+                LOG.info("AI-only imageId={} (created_at={}) — pending human (days waited={})",
+                        imageId, createdAt, daysWaited);
+                emitPendingOrAgedOut(ctx, imageId, str(ai.get("key_id")), "ai",
                         str(ai.get("payload")), createdAt,
                         firstSeen, now, retryCount, daysWaited);
             }
@@ -217,9 +215,9 @@ public class FilterAndPairFn
                 Instant firstSeen = metaFirstSeen(p, now);
                 long daysWaited   = ChronoUnit.DAYS.between(firstSeen, now);
                 if (daysWaited >= MAX_WAIT_DAYS) {
-                    LOG.warn("imageId={} route={} pending row (type={}) aged out after {} days — dead-letter",
-                            imageId, routeName, str(p.get("pending_type")), daysWaited);
-                    ctx.output(AGED_OUT, newPendingRow(imageId, routeName,
+                    LOG.warn("imageId={} pending row (type={}) aged out after {} days — dead-letter",
+                            imageId, str(p.get("pending_type")), daysWaited);
+                    ctx.output(AGED_OUT, newPendingRow(imageId,
                             str(p.get("key_id")), str(p.get("pending_type")),
                             str(p.get("payload")), str(p.get("created_at")),
                             firstSeen, now, metaRetryCount(p)));
@@ -231,12 +229,12 @@ public class FilterAndPairFn
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private void emitPendingOrAgedOut(ProcessContext ctx,
-                                       String imageId, String routeName,
+                                       String imageId,
                                        String keyId, String pendingType,
                                        String payload, String createdAt,
                                        Instant firstSeen, Instant now,
                                        long retryCount, long daysWaited) {
-        GenericRecord row = newPendingRow(imageId, routeName, keyId, pendingType,
+        GenericRecord row = newPendingRow(imageId, keyId, pendingType,
                 payload, createdAt, firstSeen, now, retryCount);
         if (daysWaited >= MAX_WAIT_DAYS) {
             ctx.output(AGED_OUT, row);
@@ -269,7 +267,7 @@ public class FilterAndPairFn
         return r;
     }
 
-    private GenericRecord newPendingRow(String imageId, String routeName,
+    private GenericRecord newPendingRow(String imageId,
                                          String keyId, String pendingType,
                                          String payload, String createdAt,
                                          Instant firstSeen, Instant now,
@@ -277,7 +275,6 @@ public class FilterAndPairFn
         GenericRecord r = new GenericData.Record(pendingSchema);
         r.put("image_id",        imageId);
         r.put("key_id",          keyId);
-        r.put("route",           routeName);
         r.put("pending_type",    pendingType);
         r.put("payload",         payload);
         r.put("created_at",      createdAt);
@@ -291,7 +288,6 @@ public class FilterAndPairFn
         GenericRecord r = new GenericData.Record(pendingSchema);
         r.put("image_id",        row.get("image_id"));
         r.put("key_id",          row.get("key_id"));
-        r.put("route",           row.get("route") != null ? row.get("route") : "main");
         r.put("pending_type",    row.get("pending_type"));
         r.put("payload",         row.get("payload"));
         r.put("created_at",      TimestampUtil.normalizeTimestamp(str(row.get("created_at"))));
@@ -303,10 +299,9 @@ public class FilterAndPairFn
 
     /**
      * Safely converts a BigQuery cell value to a {@code long}.
-     *
-     * <p>BigQuery's {@code readTableRows()} returns INTEGER columns as {@link String},
-     * not as {@link Number}, so a direct cast fails on the second (and subsequent) runs
-     * when the pending row is round-tripped through BQ.  This helper handles both types.
+     * BigQuery's {@code readTableRows()} returns INTEGER columns as {@link String},
+     * not as {@link Number}, so a direct cast fails on subsequent runs when the
+     * pending row is round-tripped through BQ.
      */
     private static long parseLong(Object value) {
         if (value == null) return 0L;

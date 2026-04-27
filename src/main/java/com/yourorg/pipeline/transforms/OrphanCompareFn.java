@@ -8,7 +8,6 @@ import com.yourorg.pipeline.util.TimestampUtil;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.values.KV;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,7 +19,7 @@ import java.util.Map;
  * Produces field-level mismatch rows for orphaned (unmatched) payloads.
  *
  * <p>An orphaned payload is one that aged out of the pending table without ever
- * finding its counterpart.  Every field in the payload is emitted as a comparison
+ * finding its counterpart. Every field in the payload is emitted as a comparison
  * row where one side carries the actual value and the other side is {@code null},
  * making {@code is_match = false} for every row.
  *
@@ -31,13 +30,8 @@ import java.util.Map;
  *   <li>{@code pending_type = "ai"} → {@code human_value} = {@code null},
  *       {@code ai_value} = field value</li>
  * </ul>
- *
- * <h3>Routing</h3>
- * Rows are routed to the same named tables as {@link FlattenAndCompareFn} using
- * {@link FlattenAndCompareFn#SEGMENT_ROUTES} — the output type is identical
- * ({@code KV<String, TableRow>}).
  */
-public class OrphanCompareFn extends DoFn<GenericRecord, KV<String, TableRow>> {
+public class OrphanCompareFn extends DoFn<GenericRecord, TableRow> {
 
     private static final Logger LOG = LoggerFactory.getLogger(OrphanCompareFn.class);
 
@@ -63,8 +57,6 @@ public class OrphanCompareFn extends DoFn<GenericRecord, KV<String, TableRow>> {
 
         String imageId     = str(record.get("image_id"));
         String keyId       = str(record.get("key_id"));
-        String routeName   = str(record.get("route"));
-        if (routeName == null || routeName.isBlank()) routeName = FlattenAndCompareFn.ROUTE_MAIN;
         String pendingType = str(record.get("pending_type")); // "human" or "ai"
         String payload     = str(record.get("payload"));
         String createdAt   = TimestampUtil.normalizeTimestamp(str(record.get("created_at")));
@@ -103,7 +95,7 @@ public class OrphanCompareFn extends DoFn<GenericRecord, KV<String, TableRow>> {
                 String humanCreatedAt = isHuman ? createdAt : null;
                 String aiCreatedAt    = isHuman ? null : createdAt;
 
-                TableRow row = new TableRow()
+                ctx.output(new TableRow()
                         .set("image_id",         imageId)
                         .set("key_id",           keyId)
                         .set("ai_iteration",     0)           // no matched AI iteration
@@ -114,10 +106,7 @@ public class OrphanCompareFn extends DoFn<GenericRecord, KV<String, TableRow>> {
                         .set("human_value",      humanValue)
                         .set("ai_value",         aiValue)
                         .set("is_match",         false)       // always false — one side absent
-                        .set("compared_at",      comparedAt);
-
-                // Route is derived from the pending record — same route as when originally pended.
-                ctx.output(KV.of(routeName, row));
+                        .set("compared_at",      comparedAt));
                 rowsEmitted++;
             }
         }

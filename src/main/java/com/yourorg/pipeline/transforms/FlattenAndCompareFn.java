@@ -23,24 +23,7 @@ import java.util.TreeSet;
 
 /**
  * Flattens both JSON payloads in a matched pair and emits one
- * {@code KV<String, TableRow>} per field value, where the {@code String} key
- * is a <em>route name</em> that determines which BigQuery table the row is
- * written to.
- *
- * <h3>Routing</h3>
- * {@link #SEGMENT_ROUTES} maps top-level segment names to route names.
- * Any segment not listed there falls back to the {@link #ROUTE_MAIN} route.
- * The pipeline filters on the route key and writes each group to its own table.
- *
- * <pre>
- *   SEGMENT_ROUTES = Map.of(
- *       "authentication", "authentication",
- *       "docproof",       "docproof"
- *   );
- *   // → field "authentication.status" → route "authentication"
- *   // → field "docproof.type"         → route "docproof"
- *   // → field "tradeline.code"        → route "main"   (not in map)
- * </pre>
+ * {@link TableRow} per field value.
  *
  * <h3>Array comparison</h3>
  * <ul>
@@ -57,12 +40,9 @@ import java.util.TreeSet;
  * writing to BigQuery.
  */
 public class FlattenAndCompareFn
-        extends DoFn<KV<String, KV<GenericRecord, GenericRecord>>, KV<String, TableRow>> {
+        extends DoFn<KV<String, KV<GenericRecord, GenericRecord>>, TableRow> {
 
     private static final Logger LOG = LoggerFactory.getLogger(FlattenAndCompareFn.class);
-
-    /** Default route name — used when no specific route is configured. */
-    public static final String ROUTE_MAIN = "main";
 
     // ── Array match keys ──────────────────────────────────────────────────────
 
@@ -109,20 +89,19 @@ public class FlattenAndCompareFn
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
-        // Pair key format: "imageId::routeName::iteration"
+        // Pair key format: "imageId::iteration"
         String pairKey = ctx.element().getKey();
-        String[] parts = pairKey.split("::");
+        String[] parts = pairKey.split("::", 2);
 
-        if (parts.length != 3) {
+        if (parts.length != 2) {
             LOG.warn("Unexpected pairKey format: '{}' — skipping", pairKey);
             return;
         }
 
-        String imageId   = parts[0];
-        String routeName = parts[1];
+        String imageId = parts[0];
         int iteration;
         try {
-            iteration = Integer.parseInt(parts[2]);
+            iteration = Integer.parseInt(parts[1]);
         } catch (NumberFormatException e) {
             LOG.warn("Could not parse iteration from pairKey '{}' — skipping", pairKey);
             return;
@@ -191,7 +170,7 @@ public class FlattenAndCompareFn
                     for (int i = 0; i < count; i++) {
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
-                        emitRow(ctx, imageId, routeName, keyId, iteration,
+                        emitRow(ctx, imageId, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, comparedAt,
                                 field, matchKey, humanVal, aiVal);
                         rowsEmitted++;
@@ -203,7 +182,7 @@ public class FlattenAndCompareFn
                 for (int i = 0; i < count; i++) {
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
-                    emitRow(ctx, imageId, routeName, keyId, iteration,
+                    emitRow(ctx, imageId, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, comparedAt,
                             field, null, humanVal, aiVal);
                     rowsEmitted++;
@@ -218,7 +197,7 @@ public class FlattenAndCompareFn
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private void emitRow(ProcessContext ctx,
-                         String imageId, String routeName, String keyId, int iteration,
+                         String imageId, String keyId, int iteration,
                          String aiCreatedAt, String humanCreatedAt, String comparedAt,
                          String field, String arrayKey,
                          String humanVal, String aiVal) {
@@ -228,7 +207,7 @@ public class FlattenAndCompareFn
         String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
         String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);
 
-        TableRow row = new TableRow()
+        ctx.output(new TableRow()
                 .set("image_id",         imageId)
                 .set("key_id",           keyId)
                 .set("ai_iteration",     iteration)
@@ -239,15 +218,9 @@ public class FlattenAndCompareFn
                 .set("human_value",      encryptedHumanVal)
                 .set("ai_value",         encryptedAiVal)
                 .set("is_match",         isMatch)
-                .set("compared_at",      comparedAt);
-
-        // Route is derived from the pair key — no field-prefix lookup needed.
-        ctx.output(KV.of(routeName, row));
+                .set("compared_at",      comparedAt));
     }
 
-    /**
-     * Groups {@link FieldValue} entries by their {@code matchKey}.
-     */
     private static Map<String, List<String>> groupByKey(List<FieldValue> entries) {
         Map<String, List<String>> groups = new LinkedHashMap<>();
         for (FieldValue fv : entries) {

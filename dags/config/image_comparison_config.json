@@ -1,5 +1,5 @@
 {
-  "_comment": "Image Comparison Pipeline — DAG configuration. Edit this file to change routes, tables, or Dataflow settings. No Python/DAG edits needed.",
+  "_comment": "Image Comparison Pipeline — DAG configuration. Each segment (main, authentication, docproof, etc.) runs as a separate Dataflow job. Add a new segment by copying an existing entry in the 'segments' array.",
 
   "project_id": "your-gcp-project",
   "region":     "us-central1",
@@ -8,49 +8,52 @@
 
   "lookup_table": "your-project:your_dataset.lookup",
 
-  "pipeline": {
-    "ai_source_table":        "your-project:ai_dataset.ai_payloads",
-    "human_source_table":     "your-project:human_dataset.human_payloads",
-    "pending_table":          "your-project:dataset.pending_comparisons",
-    "dead_letter_table":      "your-project:dataset.dead_letter_comparisons",
-    "pending_snapshot_table": "your-project:dataset.pending_snapshot",
-
-    "image_name_field":      "queueImages[0].fileName",
-    "firestore_collection":  "dek_store",
-    "kms_key_path":          "projects/p/locations/l/keyRings/r/cryptoKeys/k",
+  "shared": {
+    "_comment": "Tables and settings shared across all segment jobs.",
+    "ai_source_table":   "your-project:ai_dataset.ai_payloads",
+    "human_source_table":"your-project:human_dataset.human_payloads",
+    "dead_letter_table": "your-project:dataset.dead_letter_comparisons",
+    "image_name_field":  "queueImages[0].fileName",
+    "firestore_collection": "dek_store",
+    "kms_key_path": "projects/p/locations/l/keyRings/r/cryptoKeys/k",
 
     "_comment_filter": "Leave human_filter_field blank to disable payload filtering.",
     "human_filter_field": "",
-    "human_filter_value": "",
-
-    "_comment_routes": "Each route must have a unique 'route' name. Add or remove entries here to manage routes — no code changes required.",
-    "route_configs": [
-      {
-        "route":       "main",
-        "aiMethod":    "aimetadata",
-        "humanMethod": "controller.SubmitDispute",
-        "outputTable": "your-project:dataset.main_results"
-      },
-      {
-        "route":       "authentication",
-        "aiMethod":    "auth.ai",
-        "humanMethod": "auth.human",
-        "outputTable": "your-project:dataset.auth_results"
-      },
-      {
-        "route":       "docproof",
-        "aiMethod":    "docproof.ai",
-        "humanMethod": "docproof.human",
-        "outputTable": "your-project:dataset.docproof_results"
-      }
-    ]
+    "human_filter_value": ""
   },
 
+  "segments": [
+    {
+      "name":                  "main",
+      "ai_method":             "aimetadata",
+      "human_method":          "controller.SubmitDispute",
+      "output_table":          "your-project:dataset.main_results",
+      "pending_table":         "your-project:dataset.main_pending_comparisons",
+      "pending_snapshot_table":"your-project:dataset.main_pending_snapshot"
+    },
+    {
+      "name":                  "authentication",
+      "ai_method":             "auth.ai",
+      "human_method":          "auth.human",
+      "output_table":          "your-project:dataset.auth_results",
+      "pending_table":         "your-project:dataset.auth_pending_comparisons",
+      "pending_snapshot_table":"your-project:dataset.auth_pending_snapshot"
+    },
+    {
+      "name":                  "docproof",
+      "ai_method":             "docproof.ai",
+      "human_method":          "docproof.human",
+      "output_table":          "your-project:dataset.docproof_results",
+      "pending_table":         "your-project:dataset.docproof_pending_comparisons",
+      "pending_snapshot_table":"your-project:dataset.docproof_pending_snapshot"
+    }
+  ],
+
   "dataflow": {
-    "service_account":   "pipeline-sa@your-project.iam.gserviceaccount.com",
-    "temp_location":     "gs://your-bucket/tmp",
-    "staging_location":  "gs://your-bucket/staging",
-    "max_workers":       20,
-    "ip_configuration":  "WORKER_IP_PRIVATE"
+    "service_account":  "pipeline-sa@your-project.iam.gserviceaccount.com",
+    "temp_location":    "gs://your-bucket/tmp",
+    "staging_location": "gs://your-bucket/staging",
+    "max_workers":      20,
+    "ip_configuration": "WORKER_IP_PRIVATE"
   }
 }
