@@ -1,6 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 import org.apache.beam.sdk.options.ValueProvider;
@@ -9,24 +10,28 @@ import org.apache.beam.sdk.values.KV;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
  * Decrypts the {@code payload} of a source {@link TableRow}, applies an optional
  * payload-field filter, extracts the image identifier via a configurable path, and
  * emits {@code KV<"imageId::segment", row>} for downstream co-grouping.
  *
- * <p>The segment name is fixed at construction time — one instance is created per
- * segment, each fed from a dedicated BQ query filtered to that segment's method value.
- * This keeps routing explicit and avoids any runtime method-to-segment lookup.
+ * <p>The segment name is resolved at runtime by looking up the row's {@code method}
+ * column in the segment config map. Rows whose method does not match any configured
+ * segment are silently dropped.
  *
  * <h3>Usage</h3>
  * <pre>
- *   // AI rows for the "authentication" segment
+ *   // AI rows — all segments in one pass
  *   ParDo.of(DecryptAndKeyFn.forAi(firestoreCollection, kmsKeyPath,
- *                                   imageNameField, "authentication"))
+ *                                   imageNameField, segmentConfigs))
  *
  *   // Human rows with optional payload filter
  *   ParDo.of(DecryptAndKeyFn.forHuman(firestoreCollection, kmsKeyPath,
- *                                      imageNameField, "authentication",
+ *                                      imageNameField, segmentConfigs,
  *                                      filterField, filterValue))
  * </pre>
  *
@@ -42,20 +47,26 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     private final ValueProvider<String> firestoreCollection;
     private final ValueProvider<String> kmsKeyPath;
     private final ValueProvider<String> imageNameField;
-    private final String                segment;       // fixed per instance
-    private final String                filterField;   // null → no filter
-    private final String                filterValue;
+    private final ValueProvider<String> segmentConfigsJson;
+    private final ValueProvider<String> filterField;  // null → no filter
+    private final ValueProvider<String> filterValue;
+
+    // Resolved in @Setup; transient so they are re-initialized on each worker.
+    private transient Map<String, String> methodToSegment;
+    private transient String resolvedFilterField;
+    private transient String resolvedFilterValue;
+    private transient String resolvedImageNameField;
 
     private DecryptAndKeyFn(ValueProvider<String> firestoreCollection,
                              ValueProvider<String> kmsKeyPath,
                              ValueProvider<String> imageNameField,
-                             String segment,
-                             String filterField,
-                             String filterValue) {
+                             ValueProvider<String> segmentConfigsJson,
+                             ValueProvider<String> filterField,
+                             ValueProvider<String> filterValue) {
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
         this.imageNameField      = imageNameField;
-        this.segment             = segment;
+        this.segmentConfigsJson  = segmentConfigsJson;
         this.filterField         = filterField;
         this.filterValue         = filterValue;
     }
@@ -66,9 +77,9 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     public static DecryptAndKeyFn forAi(ValueProvider<String> firestoreCollection,
                                          ValueProvider<String> kmsKeyPath,
                                          ValueProvider<String> imageNameField,
-                                         String segment) {
+                                         ValueProvider<String> segmentConfigsJson) {
         return new DecryptAndKeyFn(
-                firestoreCollection, kmsKeyPath, imageNameField, segment, null, null);
+                firestoreCollection, kmsKeyPath, imageNameField, segmentConfigsJson, null, null);
     }
 
     /**
@@ -78,12 +89,12 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     public static DecryptAndKeyFn forHuman(ValueProvider<String> firestoreCollection,
                                             ValueProvider<String> kmsKeyPath,
                                             ValueProvider<String> imageNameField,
-                                            String segment,
-                                            String filterField,
-                                            String filterValue) {
+                                            ValueProvider<String> segmentConfigsJson,
+                                            ValueProvider<String> filterField,
+                                            ValueProvider<String> filterValue) {
         return new DecryptAndKeyFn(
                 firestoreCollection, kmsKeyPath, imageNameField,
-                segment, filterField, filterValue);
+                segmentConfigsJson, filterField, filterValue);
     }
 
     // ── Beam lifecycle ────────────────────────────────────────────────────────
@@ -93,28 +104,46 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
         BarricadeEncryptionUtil.configure(
                 firestoreCollection.get(),
                 kmsKeyPath.get());
+
+        List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
+        methodToSegment = new HashMap<>();
+        for (SegmentConfig s : segments) {
+            methodToSegment.put(s.aiMethod,    s.name);
+            methodToSegment.put(s.humanMethod, s.name);
+        }
+
+        resolvedFilterField    = filterField  != null ? filterField.get()  : null;
+        resolvedFilterValue    = filterValue  != null ? filterValue.get()  : null;
+        resolvedImageNameField = imageNameField.get();
     }
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
         TableRow row    = ctx.element();
-        String   keyId  = (String) row.get("key_id");
+        String   method = (String) row.get("method");
+        String   segment = methodToSegment.get(method);
+
+        if (segment == null) {
+            return; // method not in any configured segment — drop
+        }
+
+        String keyId     = (String) row.get("key_id");
         String decrypted = BarricadeEncryptionUtil.decrypt(keyId, (String) row.get("payload"));
 
         // Optional payload-field filter (typically applied to human rows).
-        if (filterField != null && !filterField.isBlank()) {
-            String actual = JsonFieldExtractor.extractField(decrypted, filterField);
-            if (!filterValue.equals(actual)) {
+        if (resolvedFilterField != null && !resolvedFilterField.isBlank()) {
+            String actual = JsonFieldExtractor.extractField(decrypted, resolvedFilterField);
+            if (!resolvedFilterValue.equals(actual)) {
                 LOG.debug("Skipping row: payload.{} = '{}', expected '{}'",
-                        filterField, actual, filterValue);
+                        resolvedFilterField, actual, resolvedFilterValue);
                 return;
             }
         }
 
-        String imageName = JsonFieldExtractor.extractField(decrypted, imageNameField.get());
+        String imageName = JsonFieldExtractor.extractField(decrypted, resolvedImageNameField);
         if (imageName == null || imageName.isBlank()) {
             LOG.warn("Skipping row: field '{}' is absent or null for key_id={}",
-                    imageNameField.get(), keyId);
+                    resolvedImageNameField, keyId);
             return;
         }
 

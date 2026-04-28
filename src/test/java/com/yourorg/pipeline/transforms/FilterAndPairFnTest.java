@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.beam.sdk.options.ValueProvider;
 
 import static org.junit.Assert.*;
 
@@ -99,13 +100,15 @@ public class FilterAndPairFnTest {
         }
 
         SchemaRegistry registry = SchemaRegistry.getInstance();
+        String segJson = "[{\"name\":\"main\",\"aiMethod\":\"" + AI_METHOD
+                + "\",\"humanMethod\":\"" + HUMAN_METHOD + "\"}]";
         return KeyedPCollectionTuple
                 .of(FilterAndPairFn.SOURCE_TAG, keyedSource)
                 .and(FilterAndPairFn.PENDING_TAG, keyedPending)
                 .apply("CoGroup", CoGroupByKey.create())
                 .apply("FilterAndPair",
                         ParDo.of(new FilterAndPairFn(
-                                        AI_METHOD, HUMAN_METHOD,
+                                        ValueProvider.StaticValueProvider.of(segJson),
                                         registry.get(SchemaRegistry.PAYLOAD_ROW),
                                         registry.get(SchemaRegistry.PENDING_ROW)))
                              .withOutputTags(FilterAndPairFn.MATCHED,

@@ -1,7 +1,6 @@
 package com.yourorg.pipeline;
 
 import com.google.api.services.bigquery.model.TableRow;
-import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
@@ -40,9 +39,8 @@ import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import java.io.Serializable;
 import java.time.Instant;
-import java.util.List;
-import java.util.Map;
 
 /**
  * Entry point for the Image Comparison Dataflow pipeline.
@@ -198,94 +196,56 @@ public class ImageComparisonPipeline {
         Schema payloadSchema    = registry.get(SchemaRegistry.PAYLOAD_ROW);
         Schema pendingSchema    = registry.get(SchemaRegistry.PENDING_ROW);
 
-        // ── Parse segment configs ─────────────────────────────────────────────
-        List<SegmentConfig> segments     = SegmentConfig.parse(options.getSegmentConfigs().get());
-        Map<String, String> methodToSide = SegmentConfig.buildMethodToSideMap(segments);
-        LOG.info("Pipeline configured with {} segment(s): {}",
-                segments.size(), segments.stream().map(s -> s.name).toList());
+        // ── ValueProvider-based queries ───────────────────────────────────────
+        // Composed as ValueProviders so this method never calls ValueProvider.get(),
+        // which would throw IllegalStateException during Classic Template staging.
+        ValueProvider<String> aiQuery     = new SourceTableQueryProvider(
+                options.getAiSourceTable(), options.getWindowStart(), options.getWindowEnd());
+        ValueProvider<String> humanQuery  = new SourceTableQueryProvider(
+                options.getHumanSourceTable(), options.getWindowStart(), options.getWindowEnd());
+        ValueProvider<String> pendingQuery = new PendingTableQueryProvider(
+                options.getPendingTable());
 
-        String aiTable     = options.getAiSourceTable().get().replace(':', '.');
-        String humanTable  = options.getHumanSourceTable().get().replace(':', '.');
-        String pendingTable = options.getPendingTable().get().replace(':', '.');
-        String windowStart = options.getWindowStart().get();
-        String windowEnd   = options.getWindowEnd().get();
+        // ── 1. Read AI source rows (all segments, all methods in window) ───────
+        PCollection<KV<String, TableRow>> keyedAi = pipeline
+                .apply("ReadAI",
+                        BigQueryIO.readTableRows().fromQuery(aiQuery).usingStandardSql())
+                .apply("DecryptKeyAI",
+                        ParDo.of(DecryptAndKeyFn.forAi(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath(),
+                                options.getImageNameField(),
+                                options.getSegmentConfigs())));
 
-        String filterField = options.getHumanFilterField() != null
-                ? options.getHumanFilterField().get() : null;
-        String filterValue = options.getHumanFilterValue() != null
-                ? options.getHumanFilterValue().get() : null;
+        // ── 2. Read human source rows (all segments, all methods in window) ────
+        PCollection<KV<String, TableRow>> keyedHuman = pipeline
+                .apply("ReadHuman",
+                        BigQueryIO.readTableRows().fromQuery(humanQuery).usingStandardSql())
+                .apply("DecryptKeyHuman",
+                        ParDo.of(DecryptAndKeyFn.forHuman(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath(),
+                                options.getImageNameField(),
+                                options.getSegmentConfigs(),
+                                options.getHumanFilterField(),
+                                options.getHumanFilterValue())));
 
-        // ── 1 & 2. Per-segment source and pending reads ───────────────────────
-        // Each segment gets its own BQ query (method = '...') so routing is done
-        // at the query level, not at runtime.  All results are flattened into two
-        // shared PCollections before co-grouping.
-        PCollectionList<KV<String, TableRow>> sourceParts  = PCollectionList.empty(pipeline);
-        PCollectionList<KV<String, TableRow>> pendingParts = PCollectionList.empty(pipeline);
-
-        for (SegmentConfig seg : segments) {
-
-            // ── AI source rows for this segment ───────────────────────────────
-            String aiQuery = String.format(
-                    "SELECT * FROM `%s`"
-                            + " WHERE created_at >= '%s' AND created_at < '%s'"
-                            + " AND method = '%s'",
-                    aiTable, windowStart, windowEnd, seg.aiMethod);
-
-            PCollection<KV<String, TableRow>> keyedAi = pipeline
-                    .apply("ReadAi-" + seg.name,
-                            BigQueryIO.readTableRows().fromQuery(aiQuery).usingStandardSql())
-                    .apply("KeyAi-" + seg.name,
-                            ParDo.of(DecryptAndKeyFn.forAi(
-                                    options.getFirestoreCollection(),
-                                    options.getKmsKeyPath(),
-                                    options.getImageNameField(),
-                                    seg.name)));
-
-            // ── Human source rows for this segment ────────────────────────────
-            String humanQuery = String.format(
-                    "SELECT * FROM `%s`"
-                            + " WHERE created_at >= '%s' AND created_at < '%s'"
-                            + " AND method = '%s'",
-                    humanTable, windowStart, windowEnd, seg.humanMethod);
-
-            PCollection<KV<String, TableRow>> keyedHuman = pipeline
-                    .apply("ReadHuman-" + seg.name,
-                            BigQueryIO.readTableRows().fromQuery(humanQuery).usingStandardSql())
-                    .apply("KeyHuman-" + seg.name,
-                            ParDo.of(DecryptAndKeyFn.forHuman(
-                                    options.getFirestoreCollection(),
-                                    options.getKmsKeyPath(),
-                                    options.getImageNameField(),
-                                    seg.name,
-                                    filterField, filterValue)));
-
-            // ── Pending rows for this segment ─────────────────────────────────
-            String pendingQuery = String.format(
-                    "SELECT * FROM `%s`"
-                            + " WHERE segment = '%s'"
-                            + " AND first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
-                            + " INTERVAL %d DAY)",
-                    pendingTable, seg.name, FilterAndPairFn.MAX_WAIT_DAYS);
-
-            PCollection<KV<String, TableRow>> keyedPending = pipeline
-                    .apply("ReadPending-" + seg.name,
-                            BigQueryIO.readTableRows()
-                                    .fromQuery(pendingQuery)
-                                    .usingStandardSql())
-                    .apply("KeyPending-" + seg.name,
-                            WithKeys.of((TableRow row) ->
-                                    row.get("image_id") + "::" + seg.name)
-                                    .withKeyType(TypeDescriptors.strings()));
-
-            sourceParts  = sourceParts.and(keyedAi).and(keyedHuman);
-            pendingParts = pendingParts.and(keyedPending);
-        }
+        // ── 3. Read pending rows (all segments) ────────────────────────────────
+        PCollection<KV<String, TableRow>> keyedPending = pipeline
+                .apply("ReadPending",
+                        BigQueryIO.readTableRows()
+                                .fromQuery(pendingQuery)
+                                .usingStandardSql())
+                .apply("KeyPending",
+                        WithKeys.of((TableRow row) -> {
+                            Object seg = row.get("segment");
+                            return row.get("image_id") + "::"
+                                    + (seg != null ? seg.toString() : "main");
+                        }).withKeyType(TypeDescriptors.strings()));
 
         PCollection<KV<String, TableRow>> keyedSource =
-                sourceParts.apply("FlattenSourceRows", Flatten.pCollections());
-
-        PCollection<KV<String, TableRow>> keyedPending =
-                pendingParts.apply("FlattenPendingRows", Flatten.pCollections());
+                PCollectionList.of(keyedAi).and(keyedHuman)
+                               .apply("FlattenSourceRows", Flatten.pCollections());
 
         // ── 4. Co-group source + pending by "imageId::segment" ────────────────
         PCollection<KV<String, CoGbkResult>> coGrouped =
@@ -297,7 +257,8 @@ public class ImageComparisonPipeline {
         // ── 5. Filter & pair ──────────────────────────────────────────────────
         PCollectionTuple routed = coGrouped.apply(
                 "FilterAndPair",
-                ParDo.of(new FilterAndPairFn(methodToSide, payloadSchema, pendingSchema))
+                ParDo.of(new FilterAndPairFn(
+                                options.getSegmentConfigs(), payloadSchema, pendingSchema))
                      .withOutputTags(
                              FilterAndPairFn.MATCHED,
                              TupleTagList
@@ -422,5 +383,64 @@ public class ImageComparisonPipeline {
 
     private static String str(Object value) {
         return value != null ? value.toString() : null;
+    }
+
+    // ── ValueProvider-based BigQuery query builders ───────────────────────────
+    // These implement ValueProvider<String> so BigQueryIO can resolve the query
+    // string at runtime, keeping buildPipeline() free of ValueProvider.get() calls.
+
+    private static final class SourceTableQueryProvider
+            implements ValueProvider<String>, Serializable {
+
+        private final ValueProvider<String> table;
+        private final ValueProvider<String> windowStart;
+        private final ValueProvider<String> windowEnd;
+
+        SourceTableQueryProvider(ValueProvider<String> table,
+                                  ValueProvider<String> windowStart,
+                                  ValueProvider<String> windowEnd) {
+            this.table       = table;
+            this.windowStart = windowStart;
+            this.windowEnd   = windowEnd;
+        }
+
+        @Override
+        public String get() {
+            return String.format(
+                    "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'",
+                    table.get().replace(':', '.'),
+                    windowStart.get(),
+                    windowEnd.get());
+        }
+
+        @Override
+        public boolean isAccessible() {
+            return table.isAccessible() && windowStart.isAccessible() && windowEnd.isAccessible();
+        }
+    }
+
+    private static final class PendingTableQueryProvider
+            implements ValueProvider<String>, Serializable {
+
+        private final ValueProvider<String> table;
+
+        PendingTableQueryProvider(ValueProvider<String> table) {
+            this.table = table;
+        }
+
+        @Override
+        public String get() {
+            return String.format(
+                    "SELECT * FROM `%s`"
+                    + " WHERE first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
+                    + " INTERVAL %d DAY)",
+                    table.get().replace(':', '.'),
+                    FilterAndPairFn.MAX_WAIT_DAYS);
+        }
+
+        @Override
+        public boolean isAccessible() {
+            return table.isAccessible();
+        }
     }
 }

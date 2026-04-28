@@ -1,10 +1,12 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.TimestampUtil;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.join.CoGbkResult;
 import org.apache.beam.sdk.values.KV;
@@ -49,23 +51,25 @@ public class FilterAndPairFn
 
     public static final int MAX_WAIT_DAYS = 7;
 
-    /** method → "ai" or "human", covering every segment. */
-    private final Map<String, String> methodToSide;
+    private final ValueProvider<String> segmentConfigsJson;
     private final Schema payloadSchema;
     private final Schema pendingSchema;
 
-    /**
-     * @param methodToSide  map of method column value → "ai" or "human",
-     *                      built via {@link com.yourorg.pipeline.config.SegmentConfig#buildMethodToSideMap}
-     * @param payloadSchema Avro schema for intermediate {@code PayloadRow} records
-     * @param pendingSchema Avro schema for intermediate {@code PendingRow} records
-     */
-    public FilterAndPairFn(Map<String, String> methodToSide,
+    // Resolved in @Setup; transient so it is re-initialized on each worker.
+    private transient Map<String, String> methodToSide;
+
+    public FilterAndPairFn(ValueProvider<String> segmentConfigsJson,
                             Schema payloadSchema,
                             Schema pendingSchema) {
-        this.methodToSide  = methodToSide;
-        this.payloadSchema = payloadSchema;
-        this.pendingSchema = pendingSchema;
+        this.segmentConfigsJson = segmentConfigsJson;
+        this.payloadSchema      = payloadSchema;
+        this.pendingSchema      = pendingSchema;
+    }
+
+    @Setup
+    public void setup() {
+        List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
+        methodToSide = SegmentConfig.buildMethodToSideMap(segments);
     }
 
     // ── CoGroupByKey input tags ───────────────────────────────────────────────
