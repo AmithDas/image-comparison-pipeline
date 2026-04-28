@@ -1,6 +1,7 @@
 package com.yourorg.pipeline;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
@@ -41,6 +42,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import java.io.Serializable;
 import java.time.Instant;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Entry point for the Image Comparison Dataflow pipeline.
@@ -230,12 +234,17 @@ public class ImageComparisonPipeline {
                                 options.getHumanFilterField(),
                                 options.getHumanFilterValue())));
 
-        // ── 3. Read pending rows (all segments) ────────────────────────────────
+        // ── 3. Read pending rows (configured segments only) ───────────────────
+        // Filters out rows whose segment is not in the current segmentConfigs so
+        // that rows belonging to other segments are not accidentally dropped by the
+        // WRITE_TRUNCATE pending-table write at the end of this run.
         PCollection<KV<String, TableRow>> keyedPending = pipeline
                 .apply("ReadPending",
                         BigQueryIO.readTableRows()
                                 .fromQuery(pendingQuery)
                                 .usingStandardSql())
+                .apply("FilterPendingBySegment",
+                        ParDo.of(new FilterPendingBySegmentFn(options.getSegmentConfigs())))
                 .apply("KeyPending",
                         WithKeys.of((TableRow row) -> {
                             Object seg = row.get("segment");
@@ -383,6 +392,42 @@ public class ImageComparisonPipeline {
 
     private static String str(Object value) {
         return value != null ? value.toString() : null;
+    }
+
+    // ── Pending-row segment filter ────────────────────────────────────────────
+
+    /**
+     * Drops pending {@link TableRow}s whose {@code segment} column is not listed
+     * in the current {@code segmentConfigs}.  Without this filter, rows for other
+     * segments would be read, find no source counterpart, and be silently lost
+     * when the pending table is rewritten with WRITE_TRUNCATE.
+     */
+    private static final class FilterPendingBySegmentFn
+            extends DoFn<TableRow, TableRow> {
+
+        private final ValueProvider<String> segmentConfigsJson;
+        private transient Set<String> validSegmentNames;
+
+        FilterPendingBySegmentFn(ValueProvider<String> segmentConfigsJson) {
+            this.segmentConfigsJson = segmentConfigsJson;
+        }
+
+        @Setup
+        public void setup() {
+            List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
+            validSegmentNames = segments.stream()
+                    .map(s -> s.name)
+                    .collect(Collectors.toSet());
+        }
+
+        @ProcessElement
+        public void processElement(ProcessContext ctx) {
+            Object seg = ctx.element().get("segment");
+            String segment = seg != null ? seg.toString() : "main";
+            if (validSegmentNames.contains(segment)) {
+                ctx.output(ctx.element());
+            }
+        }
     }
 
     // ── ValueProvider-based BigQuery query builders ───────────────────────────
