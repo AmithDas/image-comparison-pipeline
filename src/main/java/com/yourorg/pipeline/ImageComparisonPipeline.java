@@ -43,7 +43,6 @@ import org.slf4j.LoggerFactory;
 import java.io.Serializable;
 import java.time.Instant;
 import java.util.List;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -204,11 +203,13 @@ public class ImageComparisonPipeline {
         // Composed as ValueProviders so this method never calls ValueProvider.get(),
         // which would throw IllegalStateException during Classic Template staging.
         ValueProvider<String> aiQuery     = new SourceTableQueryProvider(
-                options.getAiSourceTable(), options.getWindowStart(), options.getWindowEnd());
+                options.getAiSourceTable(), options.getWindowStart(), options.getWindowEnd(),
+                options.getSegmentConfigs(), true);
         ValueProvider<String> humanQuery  = new SourceTableQueryProvider(
-                options.getHumanSourceTable(), options.getWindowStart(), options.getWindowEnd());
+                options.getHumanSourceTable(), options.getWindowStart(), options.getWindowEnd(),
+                options.getSegmentConfigs(), false);
         ValueProvider<String> pendingQuery = new PendingTableQueryProvider(
-                options.getPendingTable());
+                options.getPendingTable(), options.getSegmentConfigs());
 
         // ── 1. Read AI source rows (all segments, all methods in window) ───────
         PCollection<KV<String, TableRow>> keyedAi = pipeline
@@ -234,17 +235,15 @@ public class ImageComparisonPipeline {
                                 options.getHumanFilterField(),
                                 options.getHumanFilterValue())));
 
-        // ── 3. Read pending rows (configured segments only) ───────────────────
-        // Filters out rows whose segment is not in the current segmentConfigs so
-        // that rows belonging to other segments are not accidentally dropped by the
-        // WRITE_TRUNCATE pending-table write at the end of this run.
+        // ── 3. Read pending rows (configured segments only, within age window) ─
+        // The segment IN (...) clause in pendingQuery restricts the read to rows
+        // belonging to this run's segments, so WRITE_TRUNCATE cannot accidentally
+        // delete pending state that belongs to other segments.
         PCollection<KV<String, TableRow>> keyedPending = pipeline
                 .apply("ReadPending",
                         BigQueryIO.readTableRows()
                                 .fromQuery(pendingQuery)
                                 .usingStandardSql())
-                .apply("FilterPendingBySegment",
-                        ParDo.of(new FilterPendingBySegmentFn(options.getSegmentConfigs())))
                 .apply("KeyPending",
                         WithKeys.of((TableRow row) -> {
                             Object seg = row.get("segment");
@@ -394,45 +393,11 @@ public class ImageComparisonPipeline {
         return value != null ? value.toString() : null;
     }
 
-    // ── Pending-row segment filter ────────────────────────────────────────────
-
-    /**
-     * Drops pending {@link TableRow}s whose {@code segment} column is not listed
-     * in the current {@code segmentConfigs}.  Without this filter, rows for other
-     * segments would be read, find no source counterpart, and be silently lost
-     * when the pending table is rewritten with WRITE_TRUNCATE.
-     */
-    private static final class FilterPendingBySegmentFn
-            extends DoFn<TableRow, TableRow> {
-
-        private final ValueProvider<String> segmentConfigsJson;
-        private transient Set<String> validSegmentNames;
-
-        FilterPendingBySegmentFn(ValueProvider<String> segmentConfigsJson) {
-            this.segmentConfigsJson = segmentConfigsJson;
-        }
-
-        @Setup
-        public void setup() {
-            List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
-            validSegmentNames = segments.stream()
-                    .map(s -> s.name)
-                    .collect(Collectors.toSet());
-        }
-
-        @ProcessElement
-        public void processElement(ProcessContext ctx) {
-            Object seg = ctx.element().get("segment");
-            String segment = seg != null ? seg.toString() : "main";
-            if (validSegmentNames.contains(segment)) {
-                ctx.output(ctx.element());
-            }
-        }
-    }
-
     // ── ValueProvider-based BigQuery query builders ───────────────────────────
-    // These implement ValueProvider<String> so BigQueryIO can resolve the query
-    // string at runtime, keeping buildPipeline() free of ValueProvider.get() calls.
+    // Implement ValueProvider<String> so BigQueryIO resolves the query at runtime,
+    // keeping buildPipeline() free of ValueProvider.get() calls.
+    // segmentConfigs is parsed inside get() to embed the method/segment IN clause
+    // directly in SQL, pushing filtering down to BigQuery.
 
     private static final class SourceTableQueryProvider
             implements ValueProvider<String>, Serializable {
@@ -440,27 +405,41 @@ public class ImageComparisonPipeline {
         private final ValueProvider<String> table;
         private final ValueProvider<String> windowStart;
         private final ValueProvider<String> windowEnd;
+        private final ValueProvider<String> segmentConfigsJson;
+        private final boolean isAi;  // true → aiMethod values; false → humanMethod values
 
         SourceTableQueryProvider(ValueProvider<String> table,
                                   ValueProvider<String> windowStart,
-                                  ValueProvider<String> windowEnd) {
-            this.table       = table;
-            this.windowStart = windowStart;
-            this.windowEnd   = windowEnd;
+                                  ValueProvider<String> windowEnd,
+                                  ValueProvider<String> segmentConfigsJson,
+                                  boolean isAi) {
+            this.table              = table;
+            this.windowStart        = windowStart;
+            this.windowEnd          = windowEnd;
+            this.segmentConfigsJson = segmentConfigsJson;
+            this.isAi               = isAi;
         }
 
         @Override
         public String get() {
+            List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
+            String inList = segments.stream()
+                    .map(s -> "'" + (isAi ? s.aiMethod : s.humanMethod) + "'")
+                    .collect(Collectors.joining(", "));
             return String.format(
-                    "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'",
+                    "SELECT * FROM `%s`"
+                    + " WHERE created_at >= '%s' AND created_at < '%s'"
+                    + " AND method IN (%s)",
                     table.get().replace(':', '.'),
                     windowStart.get(),
-                    windowEnd.get());
+                    windowEnd.get(),
+                    inList);
         }
 
         @Override
         public boolean isAccessible() {
-            return table.isAccessible() && windowStart.isAccessible() && windowEnd.isAccessible();
+            return table.isAccessible() && windowStart.isAccessible()
+                    && windowEnd.isAccessible() && segmentConfigsJson.isAccessible();
         }
     }
 
@@ -468,24 +447,33 @@ public class ImageComparisonPipeline {
             implements ValueProvider<String>, Serializable {
 
         private final ValueProvider<String> table;
+        private final ValueProvider<String> segmentConfigsJson;
 
-        PendingTableQueryProvider(ValueProvider<String> table) {
-            this.table = table;
+        PendingTableQueryProvider(ValueProvider<String> table,
+                                   ValueProvider<String> segmentConfigsJson) {
+            this.table              = table;
+            this.segmentConfigsJson = segmentConfigsJson;
         }
 
         @Override
         public String get() {
+            List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
+            String inList = segments.stream()
+                    .map(s -> "'" + s.name + "'")
+                    .collect(Collectors.joining(", "));
             return String.format(
                     "SELECT * FROM `%s`"
                     + " WHERE first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
-                    + " INTERVAL %d DAY)",
+                    + " INTERVAL %d DAY)"
+                    + " AND segment IN (%s)",
                     table.get().replace(':', '.'),
-                    FilterAndPairFn.MAX_WAIT_DAYS);
+                    FilterAndPairFn.MAX_WAIT_DAYS,
+                    inList);
         }
 
         @Override
         public boolean isAccessible() {
-            return table.isAccessible();
+            return table.isAccessible() && segmentConfigsJson.isAccessible();
         }
     }
 }
