@@ -204,18 +204,18 @@ public class FilterAndPairFn
             }
 
         } else if (!pendingMeta.isEmpty()) {
-            // ── State 4: no source rows, check pending for age-out ────────────
+            // ── State 4: no source rows — keep or age-out each pending row ────
             for (GenericRecord p : pendingMeta.values()) {
                 Instant firstSeen = metaFirstSeen(p, now);
                 long daysWaited   = ChronoUnit.DAYS.between(firstSeen, now);
                 if (daysWaited >= MAX_WAIT_DAYS) {
                     LOG.warn("imageId={} segment={} pending row (type={}) aged out after {} days",
                             imageId, segment, str(p.get("pending_type")), daysWaited);
-                    ctx.output(AGED_OUT, newPendingRow(imageId, segment,
-                            str(p.get("key_id")), str(p.get("pending_type")),
-                            str(p.get("payload")), str(p.get("created_at")),
-                            firstSeen, now, metaRetryCount(p)));
                 }
+                emitPendingOrAgedOut(ctx, imageId, segment,
+                        str(p.get("key_id")), str(p.get("pending_type")),
+                        str(p.get("payload")), str(p.get("created_at")),
+                        firstSeen, now, metaRetryCount(p), daysWaited);
             }
         }
     }

@@ -142,12 +142,18 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
 
         String imageName = JsonFieldExtractor.extractField(decrypted, resolvedImageNameField);
         if (imageName == null || imageName.isBlank()) {
-            LOG.warn("Skipping row: field '{}' is absent or null for key_id={}",
-                    resolvedImageNameField, keyId);
+            LOG.warn("Skipping row: field '{}' is absent or null for key_id={} method={}",
+                    resolvedImageNameField, keyId, method);
             return;
         }
 
+        // Normalise case and whitespace so AI and human rows for the same image
+        // always produce the same key regardless of how each system stores the name.
+        String imageKey = imageName.trim().toLowerCase();
+        LOG.debug("DecryptAndKey: key_id={} method={} imageKey={} segment={}",
+                keyId, method, imageKey, segment);
+
         // Key format: "imageId::segment"
-        ctx.output(KV.of(imageName + "::" + segment, row));
+        ctx.output(KV.of(imageKey + "::" + segment, row));
     }
 }
