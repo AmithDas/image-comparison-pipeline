@@ -164,8 +164,8 @@ public class FilterAndPairFnTest {
             assertEquals("Expected 2 matched pairs (one per AI iteration)", 2, list.size());
 
             Set<String> keys = list.stream().map(KV::getKey).collect(Collectors.toSet());
-            assertTrue("Missing pair key img001::1", keys.contains("img001::1"));
-            assertTrue("Missing pair key img001::2", keys.contains("img001::2"));
+            assertTrue("Missing pair key img001::main::1", keys.contains("img001::main::1"));
+            assertTrue("Missing pair key img001::main::2", keys.contains("img001::main::2"));
 
             // Both pairs reference the same human payload
             for (KV<String, KV<GenericRecord, GenericRecord>> pair : list) {
@@ -180,9 +180,9 @@ public class FilterAndPairFnTest {
                         pair.getValue().getValue().get("created_at").toString());
             }
             assertEquals("Iteration 1 should be the earlier AI (08:00)",
-                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::1"));
+                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::1"));
             assertEquals("Iteration 2 should be the later AI (09:00)",
-                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::2"));
+                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::2"));
 
             return null;
         });
@@ -222,7 +222,7 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img002::1", list.get(0).getKey());
+            assertEquals("img002::main::1", list.get(0).getKey());
             return null;
         });
 
@@ -312,18 +312,19 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img005::1", list.get(0).getKey());
+            assertEquals("img005::main::1", list.get(0).getKey());
             return null;
         });
 
-        // Human should be re-pended; retry_count on the NEW_PENDING record
-        // should be 2 (parsed "1" + 1 increment from metaRetryCount).
+        // Human should be re-pended. retry_count is 0 because the human arrived
+        // from the source table (no prior pending meta for it); the AI pending
+        // row's retry_count does not transfer to the human.
         PAssert.that(newPending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals(1, list.size());
             assertEquals("human", list.get(0).get("pending_type").toString());
-            assertEquals(2L, list.get(0).get("retry_count"));
+            assertEquals(0L, list.get(0).get("retry_count"));
             return null;
         });
 
