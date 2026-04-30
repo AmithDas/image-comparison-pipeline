@@ -54,7 +54,7 @@ public class FilterAndPairFnTest {
                 .set("created_at", createdAt);
     }
 
-    /** Creates a pending TableRow for a single pending record. */
+    /** Creates a pending TableRow for a single pending record (defaults to segment "main"). */
     private static TableRow pendingRow(String imageId, String pendingType,
                                        String keyId, String createdAt, String firstSeenAt) {
         return pendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt, 0L);
@@ -70,6 +70,7 @@ public class FilterAndPairFnTest {
                                        Object retryCount) {
         return new TableRow()
                 .set("image_id",        imageId)
+                .set("segment",         "main")
                 .set("pending_type",    pendingType)
                 .set("payload",         "{\"image_name\":\"" + imageId + "\"}")
                 .set("key_id",          keyId)
