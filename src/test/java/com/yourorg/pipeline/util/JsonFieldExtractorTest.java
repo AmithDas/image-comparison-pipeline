@@ -121,10 +121,10 @@ public class JsonFieldExtractorTest {
         assertEquals(2, codes.size());
         assertEquals(2, msgs.size());
 
-        // array_key is the key field's value (e.g. "A", "B")
-        assertEquals(List.of("A", "B"),       keys(result, "terms.code"));
+        // array_key is the key field's value, lower-cased (e.g. "a", "b")
+        assertEquals(List.of("a", "b"),       keys(result, "terms.code"));
         assertEquals(List.of("A", "B"),       values(result, "terms.code"));
-        assertEquals(List.of("A", "B"),       keys(result, "terms.msg"));
+        assertEquals(List.of("a", "b"),       keys(result, "terms.msg"));
         assertEquals(List.of("hello", "world"), values(result, "terms.msg"));
     }
 
@@ -140,10 +140,10 @@ public class JsonFieldExtractorTest {
                 "{\"terms\":[{\"code\":\"A\",\"msg\":\"hi\"}]}",
                 Map.of("terms", "code"));
 
-        // Human has both A and B
-        assertEquals(List.of("A", "B"), keys(human, "terms.code"));
+        // Human has both A and B (keys are lower-cased)
+        assertEquals(List.of("a", "b"), keys(human, "terms.code"));
         // AI has only A
-        assertEquals(List.of("A"), keys(ai, "terms.code"));
+        assertEquals(List.of("a"), keys(ai, "terms.code"));
 
         // Build key→value maps to simulate FlattenAndCompareFn logic
         Map<String, String> humanByKey = human.get("terms.msg").stream()
@@ -151,10 +151,10 @@ public class JsonFieldExtractorTest {
         Map<String, String> aiByKey = ai.get("terms.msg").stream()
                 .collect(Collectors.toMap(fv -> fv.matchKey, fv -> fv.value));
 
-        assertEquals("hi",  humanByKey.get("A"));
-        assertEquals("bye", humanByKey.get("B"));
-        assertEquals("hi",  aiByKey.get("A"));
-        assertNull(aiByKey.get("B")); // B absent in AI → mismatch
+        assertEquals("hi",  humanByKey.get("a"));
+        assertEquals("bye", humanByKey.get("b"));
+        assertEquals("hi",  aiByKey.get("a"));
+        assertNull(aiByKey.get("b")); // B absent in AI → mismatch
     }
 
     @Test
@@ -241,8 +241,8 @@ public class JsonFieldExtractorTest {
         Map<String, List<FieldValue>> result =
                 JsonFieldExtractor.flatten(json, Map.of("terms", "code"));
 
-        // "terms" is key-based — array_key is the key field's value
-        assertEquals(List.of("X"), keys(result, "terms.code"));
+        // "terms" is key-based — array_key is the key field's value, lower-cased
+        assertEquals(List.of("x"), keys(result, "terms.code"));
         assertEquals(List.of("X"), values(result, "terms.code"));
 
         // "tags" is positional
@@ -264,8 +264,8 @@ public class JsonFieldExtractorTest {
         Map<String, String> aiByKey = ai.get("terms.msg").stream()
                 .collect(Collectors.toMap(fv -> fv.matchKey, fv -> fv.value));
 
-        assertNull(humanByKey.get("C")); // C absent in human → mismatch
-        assertEquals("new", aiByKey.get("C"));
+        assertNull(humanByKey.get("c")); // C absent in human → mismatch
+        assertEquals("new", aiByKey.get("c"));
     }
 
     // ── extractField — plain dot-notation ─────────────────────────────────────
