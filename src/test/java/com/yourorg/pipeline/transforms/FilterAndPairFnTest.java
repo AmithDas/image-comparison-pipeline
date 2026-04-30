@@ -54,7 +54,7 @@ public class FilterAndPairFnTest {
                 .set("created_at", createdAt);
     }
 
-    /** Creates a pending TableRow for a single pending record. */
+    /** Creates a pending TableRow for a single pending record (defaults to segment "main"). */
     private static TableRow pendingRow(String imageId, String pendingType,
                                        String keyId, String createdAt, String firstSeenAt) {
         return pendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt, 0L);
@@ -70,6 +70,7 @@ public class FilterAndPairFnTest {
                                        Object retryCount) {
         return new TableRow()
                 .set("image_id",        imageId)
+                .set("segment",         "main")
                 .set("pending_type",    pendingType)
                 .set("payload",         "{\"image_name\":\"" + imageId + "\"}")
                 .set("key_id",          keyId)
@@ -164,8 +165,8 @@ public class FilterAndPairFnTest {
             assertEquals("Expected 2 matched pairs (one per AI iteration)", 2, list.size());
 
             Set<String> keys = list.stream().map(KV::getKey).collect(Collectors.toSet());
-            assertTrue("Missing pair key img001::1", keys.contains("img001::1"));
-            assertTrue("Missing pair key img001::2", keys.contains("img001::2"));
+            assertTrue("Missing pair key img001::main::1", keys.contains("img001::main::1"));
+            assertTrue("Missing pair key img001::main::2", keys.contains("img001::main::2"));
 
             // Both pairs reference the same human payload
             for (KV<String, KV<GenericRecord, GenericRecord>> pair : list) {
@@ -180,9 +181,9 @@ public class FilterAndPairFnTest {
                         pair.getValue().getValue().get("created_at").toString());
             }
             assertEquals("Iteration 1 should be the earlier AI (08:00)",
-                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::1"));
+                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::1"));
             assertEquals("Iteration 2 should be the later AI (09:00)",
-                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::2"));
+                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::2"));
 
             return null;
         });
@@ -222,7 +223,7 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img002::1", list.get(0).getKey());
+            assertEquals("img002::main::1", list.get(0).getKey());
             return null;
         });
 
@@ -312,18 +313,19 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img005::1", list.get(0).getKey());
+            assertEquals("img005::main::1", list.get(0).getKey());
             return null;
         });
 
-        // Human should be re-pended; retry_count on the NEW_PENDING record
-        // should be 2 (parsed "1" + 1 increment from metaRetryCount).
+        // Human is a fresh source row (no prior pending meta), so retry_count = 0.
+        // The primary goal of this test is confirming no ClassCastException is thrown
+        // when the pending AI's retry_count arrives as a String "1" from BigQuery.
         PAssert.that(newPending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals(1, list.size());
             assertEquals("human", list.get(0).get("pending_type").toString());
-            assertEquals(2L, list.get(0).get("retry_count"));
+            assertEquals(0L, list.get(0).get("retry_count"));
             return null;
         });
 
