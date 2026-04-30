@@ -1,6 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 import com.yourorg.pipeline.util.JsonFieldExtractor.FieldValue;
@@ -15,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -49,6 +51,7 @@ public class FlattenAndCompareFn
     // ── Array match keys ──────────────────────────────────────────────────────
 
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
+            "documentDetails", "docType"
             // "tradeline", "accountnumber-customernumber-dateopened-code",
             // "address",   "addresstype"
     );
@@ -57,11 +60,19 @@ public class FlattenAndCompareFn
 
     private final ValueProvider<String> firestoreCollection;
     private final ValueProvider<String> kmsKeyPath;
+    private final ValueProvider<String> segmentConfigsJson;
+
+    // rootKey → sub-type name (e.g. "verifiedData" → "auth", "documentDetails" → "docreview")
+    // Built in @Setup; used by resolveSegments() to tag each output row with its sub-type.
+    private transient Map<String, String> rootKeyToSegment;
+    private transient List<String>        subTypeNames;
 
     public FlattenAndCompareFn(ValueProvider<String> firestoreCollection,
-                                ValueProvider<String> kmsKeyPath) {
+                                ValueProvider<String> kmsKeyPath,
+                                ValueProvider<String> segmentConfigsJson) {
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
+        this.segmentConfigsJson  = segmentConfigsJson;
     }
 
     @Setup
@@ -69,6 +80,18 @@ public class FlattenAndCompareFn
         BarricadeEncryptionUtil.configure(
                 firestoreCollection.get(),
                 kmsKeyPath.get());
+
+        rootKeyToSegment = new HashMap<>();
+        subTypeNames     = new ArrayList<>();
+        List<SegmentConfig> configs = SegmentConfig.parse(segmentConfigsJson.get());
+        for (SegmentConfig seg : configs) {
+            if (seg.humanSubTypes != null) {
+                for (SegmentConfig.HumanSubType st : seg.humanSubTypes) {
+                    rootKeyToSegment.put(st.discriminatorField, st.name);
+                    subTypeNames.add(st.name);
+                }
+            }
+        }
     }
 
     // ── Processing ────────────────────────────────────────────────────────────
@@ -154,10 +177,12 @@ public class FlattenAndCompareFn
                     for (int i = 0; i < count; i++) {
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
-                        emitRow(ctx, imageId, segment, keyId, iteration,
-                                aiCreatedAt, humanCreatedAt, comparedAt,
-                                field, matchKey, humanVal, aiVal);
-                        rowsEmitted++;
+                        for (String effectiveSegment : resolveSegments(field, segment)) {
+                            emitRow(ctx, imageId, effectiveSegment, keyId, iteration,
+                                    aiCreatedAt, humanCreatedAt, comparedAt,
+                                    field, matchKey, humanVal, aiVal);
+                            rowsEmitted++;
+                        }
                     }
                 }
             } else {
@@ -165,10 +190,12 @@ public class FlattenAndCompareFn
                 for (int i = 0; i < count; i++) {
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
-                    emitRow(ctx, imageId, segment, keyId, iteration,
-                            aiCreatedAt, humanCreatedAt, comparedAt,
-                            field, null, humanVal, aiVal);
-                    rowsEmitted++;
+                    for (String effectiveSegment : resolveSegments(field, segment)) {
+                        emitRow(ctx, imageId, effectiveSegment, keyId, iteration,
+                                aiCreatedAt, humanCreatedAt, comparedAt,
+                                field, null, humanVal, aiVal);
+                        rowsEmitted++;
+                    }
                 }
             }
         }
@@ -178,6 +205,22 @@ public class FlattenAndCompareFn
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the segment(s) to use for a given field path.
+     * - If the field's root key maps to a sub-type, returns that sub-type name only.
+     * - Otherwise returns all sub-type names (shared field written to both),
+     *   or a single-element list of the parent segment if no sub-types are configured.
+     */
+    private List<String> resolveSegments(String fieldPath, String parentSegment) {
+        if (rootKeyToSegment.isEmpty()) return List.of(parentSegment);
+        String rootKey = fieldPath.contains(".")
+                ? fieldPath.substring(0, fieldPath.indexOf('.'))
+                : fieldPath;
+        String matched = rootKeyToSegment.get(rootKey);
+        if (matched != null) return List.of(matched);
+        return subTypeNames.isEmpty() ? List.of(parentSegment) : new ArrayList<>(subTypeNames);
+    }
 
     private void emitRow(ProcessContext ctx,
                          String imageId, String segment, String keyId, int iteration,
