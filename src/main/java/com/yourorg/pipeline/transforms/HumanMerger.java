@@ -1,6 +1,5 @@
 package com.yourorg.pipeline.transforms;
 
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.yourorg.pipeline.config.SegmentConfig;
@@ -13,6 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -50,7 +50,6 @@ public final class HumanMerger {
                                        Map<String, GenericRecord> humanBySubType,
                                        SegmentConfig seg,
                                        Schema payloadSchema) {
-        // Sort sub-types for deterministic key_id and field-collision resolution.
         String[] subTypeNames = humanBySubType.keySet().stream()
                 .sorted()
                 .toArray(String[]::new);
@@ -62,33 +61,54 @@ public final class HumanMerger {
                 .min(Comparator.naturalOrder())
                 .orElse(null);
 
-        JsonObject merged = new JsonObject();
+        // Build subType → discriminatorField lookup.
+        Map<String, String> subTypeToDiscriminator = new LinkedHashMap<>();
+        if (seg.humanSubTypes != null) {
+            for (SegmentConfig.HumanSubType st : seg.humanSubTypes) {
+                subTypeToDiscriminator.put(st.name, st.discriminatorField);
+            }
+        }
 
+        // Decrypt and parse every sub-type payload up front.
+        Map<String, JsonObject> parsedJsons = new LinkedHashMap<>();
         for (String subType : subTypeNames) {
             GenericRecord rec       = humanBySubType.get(subType);
-            String        encrypted = str(rec.get("payload"));
-            String        decrypted = BarricadeEncryptionUtil.decrypt(keyId, encrypted);
+            String        decrypted = BarricadeEncryptionUtil.decrypt(keyId, str(rec.get("payload")));
             String        json      = resolveJson(decrypted, seg, subType);
             if (json == null) continue;
-
-            JsonObject obj;
             try {
-                obj = JsonParser.parseString(json).getAsJsonObject();
+                parsedJsons.put(subType, JsonParser.parseString(json).getAsJsonObject());
             } catch (Exception e) {
                 LOG.warn("HumanMerger: could not parse JSON for subType={} imageId={}", subType, imageId);
-                continue;
             }
+        }
 
-            for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
-                if (merged.has(entry.getKey())) {
-                    if (!merged.get(entry.getKey()).equals(entry.getValue())) {
-                        LOG.warn("HumanMerger: field '{}' collision for imageId={} segment={} "
-                                + "— keeping value from sub-type '{}'",
-                                entry.getKey(), imageId, segment, subTypeNames[0]);
-                    }
-                } else {
-                    merged.add(entry.getKey(), entry.getValue());
-                }
+        // Base sub-type: the one whose discriminatorField is a JSON array (e.g. docreview →
+        // documentDetails).  All other sub-types contribute only their discriminatorField value.
+        String baseSubType = null;
+        for (String subType : subTypeNames) {
+            JsonObject obj  = parsedJsons.get(subType);
+            String     disc = subTypeToDiscriminator.get(subType);
+            if (obj != null && disc != null && obj.has(disc) && obj.get(disc).isJsonArray()) {
+                baseSubType = subType;
+                break;
+            }
+        }
+        if (baseSubType == null) baseSubType = subTypeNames[0];
+
+        JsonObject merged = parsedJsons.getOrDefault(baseSubType, new JsonObject()).deepCopy();
+
+        // Append each non-base sub-type's discriminatorField into the merged JSON.
+        for (String subType : subTypeNames) {
+            if (subType.equals(baseSubType)) continue;
+            JsonObject obj  = parsedJsons.get(subType);
+            String     disc = subTypeToDiscriminator.get(subType);
+            if (obj == null || disc == null) continue;
+            if (obj.has(disc)) {
+                merged.add(disc, obj.get(disc));
+            } else {
+                LOG.warn("HumanMerger: subType='{}' missing discriminatorField='{}' for imageId={}",
+                        subType, disc, imageId);
             }
         }
 
