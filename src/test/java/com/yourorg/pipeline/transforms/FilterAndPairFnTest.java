@@ -317,9 +317,9 @@ public class FilterAndPairFnTest {
             return null;
         });
 
-        // Human is a fresh source row (no prior pending meta), so retry_count = 0.
-        // The primary goal of this test is confirming no ClassCastException is thrown
-        // when the pending AI's retry_count arrives as a String "1" from BigQuery.
+        // Human should be re-pended. retry_count is 0 because the human arrived
+        // from the source table (no prior pending meta for it); the AI pending
+        // row's retry_count does not transfer to the human.
         PAssert.that(newPending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
