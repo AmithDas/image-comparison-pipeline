@@ -3,18 +3,21 @@ Image Comparison Pipeline — Airflow DAG  (Classic Dataflow Template)
 =====================================================================
 Triggers a single Dataflow job every 3 hours.
 
-The Dataflow job owns all window and status management:
-  - Reads the earliest PENDING row from the lookup table
-  - Marks it RUNNING, processes the window, marks DONE or FAILED
-  - If no PENDING row exists, the job exits cleanly (no alert)
+Window management is handled entirely by the Dataflow job itself using the
+Dataflow service account (which already has BigQuery access for source reads):
+  - WindowValueProvider lazily calls claimWindow() + getWindow() on each worker
+  - A conditional UPDATE ensures only the first worker sets current_stop
+  - AdvanceWindowFn calls advance() after all writes complete (via Wait.on)
+  - On failure, advance is never called → next run retries the same window
 
-The DAG is a pure scheduler — no BigQuery status tasks needed here.
+The DAG is a pure scheduler — no BigQuery access is needed from the DAG SA.
 
 All configuration lives in:
   dags/config/image_comparison_config.json
 
-To add a new segment, append an entry to pipeline.segments in that file.
-No Python or Java changes are needed.
+To add a new segment, append an entry to pipeline.segments in that file
+and rebuild the Dataflow template (segment configs are baked into the graph
+at template build time).
 
 Classic Template — how to compile and stage
 ───────────────────────────────────────────
@@ -23,7 +26,11 @@ Classic Template — how to compile and stage
     -Dexec.args="--runner=DataflowRunner \\
       --project=<PROJECT> \\
       --stagingLocation=<STAGING_LOCATION> \\
-      --templateLocation=<TEMPLATE_GCS_PATH>"
+      --templateLocation=<TEMPLATE_GCS_PATH> \\
+      --lookupTable=<LOOKUP_TABLE> \\
+      --pipelineName=<PIPELINE_NAME> \\
+      --segmentConfigs='<JSON_ARRAY>' \\
+      ... (all other required options)"
 """
 
 from __future__ import annotations
@@ -51,8 +58,7 @@ PROJECT_ID        = _CFG["project_id"]
 REGION            = _CFG["region"]
 TEMPLATE_GCS_PATH = _CFG["template_gcs_path"]
 
-# The pipeline expects segmentConfigs as a JSON string — serialise the list from config.
-# Strip comment keys (starting with '_') before passing to Java.
+# Strip comment keys (starting with '_') before passing segmentConfigs to Java.
 _SEGMENT_CONFIGS_JSON = json.dumps([
     {k: v for k, v in seg.items() if not k.startswith("_")}
     for seg in _PIPE["segments"]
@@ -64,8 +70,9 @@ _SEGMENT_CONFIGS_JSON = json.dumps([
 def _dataflow_parameters() -> dict:
     """
     Builds the Dataflow Classic Template parameter dict from config.
-    windowStart / windowEnd are no longer passed here — the Dataflow job
-    reads them directly from the lookup table at startup.
+    Window management (claimWindow, getWindow, advance) is done inside the
+    Dataflow job via WindowValueProvider and AdvanceWindowFn — no window
+    parameters are needed here.
     """
     params = {
         "lookupTable":          _PIPE["lookup_table"],
@@ -112,7 +119,8 @@ with DAG(
     dag_id="image_comparison_pipeline",
     description=(
         "Triggers the Dataflow image comparison job every 3 hours. "
-        "Window selection and status management are handled by the Dataflow job itself. "
+        "Window management (claim / advance) is handled inside the Dataflow job "
+        "using the Dataflow service account — no BigQuery access needed from the DAG SA. "
         "Config lives in dags/config/image_comparison_config.json."
     ),
     default_args=default_args,
