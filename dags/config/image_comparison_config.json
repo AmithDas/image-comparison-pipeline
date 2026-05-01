@@ -26,22 +26,30 @@
     "human_filter_field": "",
     "human_filter_value": "",
 
-    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. Source rows whose method does not match any entry are silently dropped.",
+    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. Source rows whose method does not match any entry are silently dropped. For combined segments (multiple human payloads per image), set payloadFormat='id_request' and list humanSubTypes with a discriminatorField per sub-type.",
     "segments": [
       {
+        "_comment": "Standard single-payload segment.",
         "name":        "main",
-        "aiMethod":    "aimetadata",
-        "humanMethod": "controller.SubmitDispute"
+        "aiMethod":    "aimetadata_v2",
+        "humanMethod": "controller.SubmitMain"
       },
       {
-        "name":        "authentication",
-        "aiMethod":    "auth.ai",
-        "humanMethod": "auth.human"
-      },
-      {
-        "name":        "docproof",
-        "aiMethod":    "docproof.ai",
-        "humanMethod": "docproof.human"
+        "_comment": "Combined segment: AI sends one payload; human sends two separate id_request payloads (auth + docreview) which are merged before comparison. Both sub-types share the same humanMethod.",
+        "name":         "authanddocreview",
+        "aiMethod":     "aimetadata",
+        "humanMethod":  "controller.SubmitDispute",
+        "payloadFormat": "id_request",
+        "humanSubTypes": [
+          {
+            "name":               "auth",
+            "discriminatorField": "verifiedData"
+          },
+          {
+            "name":               "docreview",
+            "discriminatorField": "documentDetails"
+          }
+        ]
       }
     ]
   },
