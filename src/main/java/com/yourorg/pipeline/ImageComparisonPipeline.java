@@ -318,8 +318,7 @@ public class ImageComparisonPipeline {
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
                                 options.getFirestoreCollection(),
-                                options.getKmsKeyPath(),
-                                options.getSegmentConfigs())));
+                                options.getKmsKeyPath())));
 
         // ── 7. Write comparison results to single shared table ────────────────
         comparisonResults
