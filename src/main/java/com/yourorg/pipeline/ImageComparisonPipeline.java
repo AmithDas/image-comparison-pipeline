@@ -3,8 +3,6 @@ package com.yourorg.pipeline;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
-import com.yourorg.pipeline.util.WindowManager;
-import com.yourorg.pipeline.util.WindowManager.WindowInfo;
 import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
@@ -13,6 +11,8 @@ import com.yourorg.pipeline.transforms.OrphanCompareFn;
 import com.yourorg.pipeline.util.SchemaRegistry;
 import com.yourorg.pipeline.util.SchemaUtil;
 import com.yourorg.pipeline.util.TimestampUtil;
+import com.yourorg.pipeline.util.WindowManager;
+import com.yourorg.pipeline.util.WindowManager.WindowInfo;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.Pipeline;
@@ -22,15 +22,19 @@ import org.apache.beam.sdk.extensions.avro.coders.AvroCoder;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.CreateDisposition;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.WriteDisposition;
+import org.apache.beam.sdk.io.gcp.bigquery.WriteResult;
+import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Validation;
 import org.apache.beam.sdk.options.ValueProvider;
+import org.apache.beam.sdk.transforms.Create;
+import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.Wait;
 import org.apache.beam.sdk.transforms.WithKeys;
 import org.apache.beam.sdk.transforms.join.CoGbkResult;
 import org.apache.beam.sdk.transforms.join.CoGroupByKey;
@@ -45,8 +49,10 @@ import org.apache.beam.sdk.values.TypeDescriptors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Serializable;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Entry point for the Image Comparison Dataflow pipeline.
@@ -55,31 +61,38 @@ import java.util.List;
  * Source rows are routed to the correct segment by their {@code method} column value.
  * All comparison results are written to one shared table with a {@code segment} column.
  *
- * <h3>Window management</h3>
- * The pipeline reads its processing window from a BigQuery lookup table
- * ({@code --lookupTable}).  On startup it claims the earliest {@code PENDING} row,
- * marks it {@code RUNNING}, runs, then marks {@code DONE} or {@code FAILED}.
- * The DAG only needs to trigger the Dataflow job — no window/status logic needed there.
+ * <h3>Window management (Classic Template)</h3>
+ * Because this pipeline runs as a Dataflow <em>Classic Template</em>, {@code main()}
+ * executes only at <em>template build time</em>.  Window management must therefore
+ * happen on workers (which run with the Dataflow SA that already has BigQuery access).
  *
- * <h3>Pipeline steps</h3>
- * <ol>
- *   <li>Claim window from lookup table; mark RUNNING.</li>
- *   <li>Read windowed AI and human rows from BigQuery source tables.</li>
- *   <li>Decrypt each row; derive segment from its {@code method} column; key as
- *       {@code "imageId::segment"}.</li>
- *   <li>Read pending state from {@code pending_comparisons}.</li>
- *   <li>Co-group source + pending; run {@link FilterAndPairFn}.</li>
- *   <li>Run {@link FlattenAndCompareFn} on MATCHED pairs.</li>
- *   <li>Write results, pending rows, dead-letter rows, snapshot.</li>
- *   <li>Mark lookup row DONE (or FAILED on exception).</li>
- * </ol>
+ * <p>This is achieved via {@link WindowValueProvider}: a {@link Serializable}
+ * {@link ValueProvider} whose {@link ValueProvider#get()} method lazily calls
+ * {@link WindowManager#claimWindow()} + {@link WindowManager#getWindow()} the
+ * first time it is invoked on each worker JVM.  The result is cached, so
+ * subsequent calls on the same JVM return the same window bounds.
  *
- * <p>Run locally (DirectRunner — requires a PENDING row in the lookup table):
+ * <p>{@link WindowManager#claimWindow()} uses a conditional UPDATE
+ * ({@code WHERE current_stop = last_extracted}) so that only the first worker
+ * wins; all others see a no-op and read the same {@code current_stop} value.
+ *
+ * <p>After all BigQuery writes succeed, {@link AdvanceWindowFn} calls
+ * {@link WindowManager#advance()} via a {@link Wait#on} step connected to the
+ * write results.  If any write fails, the exception propagates and advance is
+ * never called — so the next run retries the same window automatically (because
+ * {@code current_stop} is still {@code > last_extracted}, making the next
+ * conditional UPDATE a no-op that reuses the existing {@code current_stop}).
+ *
+ * <p>The Airflow DAG is a pure scheduler — it only submits the Dataflow job.
+ * No BigQuery access is required from the DAG service account.
+ *
+ * <p>Run locally (DirectRunner):
  * <pre>
  *   mvn compile exec:java \
  *     -Dexec.mainClass=com.yourorg.pipeline.ImageComparisonPipeline \
  *     -Dexec.args="--runner=DirectRunner \
- *       --lookupTable=project:dataset.pipeline_windows \
+ *       --lookupTable=project:dataset.pipeline_config \
+ *       --pipelineName=image_comparison \
  *       --aiSourceTable=project:ai_dataset.ai_payloads \
  *       --humanSourceTable=project:human_dataset.human_payloads \
  *       --outputTable=project:dataset.comparison_results \
@@ -189,38 +202,14 @@ public class ImageComparisonPipeline {
                 .withValidation()
                 .as(Options.class);
 
-        BigQuery bq           = BigQueryOptions.getDefaultInstance().getService();
-        String   lookupTable  = options.getLookupTable().get().replace(':', '.');
-        String   pipelineName = options.getPipelineName().get();
-
-        WindowManager wm = new WindowManager(bq, lookupTable, pipelineName);
-
-        // Step 1: lock the window end to CURRENT_TIMESTAMP().
-        wm.claimWindow();
-
-        // Steps 2 + 3: read window_start = TIMESTAMP_SUB(last_extracted, 1 HOUR)
-        //              and window_end = current_stop.
-        WindowInfo window = wm.getWindow();
-
-        try {
-            Pipeline pipeline = Pipeline.create(options);
-            buildPipeline(pipeline, options, window.windowStart, window.windowEnd);
-            pipeline.run().waitUntilFinish();
-
-            // Step 5 (success): advance last_extracted = current_stop.
-            wm.advance();
-        } catch (Exception e) {
-            LOG.error("Pipeline failed for pipeline='{}' window={}", pipelineName, window, e);
-            // Failure path: revert current_stop = last_extracted so next run retries.
-            wm.revert();
-            throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
-        }
+        Pipeline pipeline = Pipeline.create(options);
+        buildPipeline(pipeline, options);
+        pipeline.run().waitUntilFinish();
     }
 
     // ── Pipeline graph ────────────────────────────────────────────────────────
 
-    public static void buildPipeline(Pipeline pipeline, Options options,
-                                      String windowStart, String windowEnd) {
+    static void buildPipeline(Pipeline pipeline, Options options) {
 
         // ── Schemas ───────────────────────────────────────────────────────────
         SchemaRegistry registry = SchemaRegistry.getInstance();
@@ -228,6 +217,10 @@ public class ImageComparisonPipeline {
         Schema pendingSchema    = registry.get(SchemaRegistry.PENDING_ROW);
 
         // ── Parse segment configs ─────────────────────────────────────────────
+        // segmentConfigs is resolved at template build time so we can loop over
+        // segments and construct the per-segment reads in the graph.
+        // lookupTable / pipelineName are NOT resolved here — they stay as
+        // ValueProviders and are resolved lazily on workers via WindowValueProvider.
         List<SegmentConfig> segments = SegmentConfig.parse(options.getSegmentConfigs().get());
         LOG.info("Pipeline configured with {} segment(s): {}",
                 segments.size(), segments.stream().map(s -> s.name).toList());
@@ -236,22 +229,35 @@ public class ImageComparisonPipeline {
         String humanTable   = options.getHumanSourceTable().get().replace(':', '.');
         String pendingTable = options.getPendingTable().get().replace(':', '.');
 
-        // ── 1 & 2. Per-segment source and pending reads ───────────────────────
+        // Lazy window providers — resolved on workers using the Dataflow SA.
+        // The first call per JVM claims the window in BigQuery; subsequent calls
+        // return the cached value.
+        ValueProvider<String> windowStart =
+                new WindowValueProvider(options.getLookupTable(), options.getPipelineName(), true);
+        ValueProvider<String> windowEnd   =
+                new WindowValueProvider(options.getLookupTable(), options.getPipelineName(), false);
+
+        // ── Per-segment source and pending reads ──────────────────────────────
         PCollectionList<KV<String, TableRow>> sourceParts  = PCollectionList.empty(pipeline);
         PCollectionList<KV<String, TableRow>> pendingParts = PCollectionList.empty(pipeline);
 
         for (SegmentConfig seg : segments) {
 
-            // ── AI source rows for this segment ───────────────────────────────
-            String aiQuery = String.format(
+            // ── AI source rows ────────────────────────────────────────────────
+            // WindowedQueryProvider embeds windowStart/windowEnd into the SQL at
+            // runtime (when .get() is called on workers).
+            String aiQueryTpl = String.format(
                     "SELECT * FROM `%s`"
-                            + " WHERE created_at >= '%s' AND created_at < '%s'"
+                            + " WHERE created_at >= '%%s' AND created_at < '%%s'"
                             + " AND method = '%s'",
-                    aiTable, windowStart, windowEnd, seg.aiMethod);
+                    aiTable, seg.aiMethod);
 
             PCollection<KV<String, TableRow>> keyedAi = pipeline
                     .apply("ReadAi-" + seg.name,
-                            BigQueryIO.readTableRows().fromQuery(aiQuery).usingStandardSql())
+                            BigQueryIO.readTableRows()
+                                    .fromQuery(new WindowedQueryProvider(
+                                            windowStart, windowEnd, aiQueryTpl))
+                                    .usingStandardSql())
                     .apply("KeyAi-" + seg.name,
                             ParDo.of(DecryptAndKeyFn.forAi(
                                     options.getFirestoreCollection(),
@@ -259,16 +265,19 @@ public class ImageComparisonPipeline {
                                     options.getImageNameField(),
                                     options.getSegmentConfigs())));
 
-            // ── Human source rows for this segment ────────────────────────────
-            String humanQuery = String.format(
+            // ── Human source rows ─────────────────────────────────────────────
+            String humanQueryTpl = String.format(
                     "SELECT * FROM `%s`"
-                            + " WHERE created_at >= '%s' AND created_at < '%s'"
+                            + " WHERE created_at >= '%%s' AND created_at < '%%s'"
                             + " AND method = '%s'",
-                    humanTable, windowStart, windowEnd, seg.humanMethod);
+                    humanTable, seg.humanMethod);
 
             PCollection<KV<String, TableRow>> keyedHuman = pipeline
                     .apply("ReadHuman-" + seg.name,
-                            BigQueryIO.readTableRows().fromQuery(humanQuery).usingStandardSql())
+                            BigQueryIO.readTableRows()
+                                    .fromQuery(new WindowedQueryProvider(
+                                            windowStart, windowEnd, humanQueryTpl))
+                                    .usingStandardSql())
                     .apply("KeyHuman-" + seg.name,
                             ParDo.of(DecryptAndKeyFn.forHuman(
                                     options.getFirestoreCollection(),
@@ -279,8 +288,8 @@ public class ImageComparisonPipeline {
                                     options.getHumanFilterValue())));
 
             // ── Pending rows for this segment ─────────────────────────────────
-            // QUALIFY deduplicates across WRITE_APPEND accumulation: pick the
-            // latest re-pended version of each (image_id, segment) pair.
+            // Pending reads do not use the processing window — they look back up
+            // to MAX_WAIT_DAYS.  QUALIFY deduplicates WRITE_APPEND accumulation.
             String pendingQuery = String.format(
                     "SELECT * FROM `%s`"
                             + " WHERE segment = '%s'"
@@ -310,14 +319,14 @@ public class ImageComparisonPipeline {
         PCollection<KV<String, TableRow>> keyedPending =
                 pendingParts.apply("FlattenPendingRows", Flatten.pCollections());
 
-        // ── 4. Co-group source + pending by "imageId::segment" ────────────────
+        // ── Co-group source + pending by "imageId::segment" ───────────────────
         PCollection<KV<String, CoGbkResult>> coGrouped =
                 KeyedPCollectionTuple
                         .of(FilterAndPairFn.SOURCE_TAG, keyedSource)
                         .and(FilterAndPairFn.PENDING_TAG, keyedPending)
                         .apply("CoGroupByImageIdAndSegment", CoGroupByKey.create());
 
-        // ── 5. Filter & pair ──────────────────────────────────────────────────
+        // ── Filter & pair ─────────────────────────────────────────────────────
         PCollectionTuple routed = coGrouped.apply(
                 "FilterAndPair",
                 ParDo.of(new FilterAndPairFn(options.getSegmentConfigs(), payloadSchema, pendingSchema))
@@ -342,15 +351,38 @@ public class ImageComparisonPipeline {
         PCollection<GenericRecord> agedOut =
                 routed.get(FilterAndPairFn.AGED_OUT).setCoder(pendingCoder);
 
-        // ── 6. Flatten & compare matched pairs ────────────────────────────────
+        // ── Flatten & compare matched pairs ───────────────────────────────────
         PCollection<TableRow> comparisonResults = matched
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath())));
 
-        // ── 7. Write comparison results ───────────────────────────────────────
-        comparisonResults
+        // ── Intermediate TableRow PCollections (also used as Write inputs) ────
+        PCollection<TableRow> newPendingRows = newPending
+                .apply("MapPendingToTableRow",
+                        MapElements.into(TypeDescriptor.of(TableRow.class))
+                                   .via(r -> fromPendingRecord(r)));
+
+        PCollection<TableRow> agedOutRows = agedOut
+                .apply("MapAgedOutToTableRow",
+                        MapElements.into(TypeDescriptor.of(TableRow.class))
+                                   .via(r -> fromAgedOutRecord(r)));
+
+        PCollection<TableRow> agedOutResults = agedOut
+                .apply("FlattenAgedOutPayloads",
+                        ParDo.of(new OrphanCompareFn(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath())));
+
+        PCollection<TableRow> pendingSnapshot = newPending
+                .apply("FlattenPendingPayloads",
+                        ParDo.of(new OrphanCompareFn(
+                                options.getFirestoreCollection(),
+                                options.getKmsKeyPath())));
+
+        // ── Write all outputs; capture WriteResults for advance signal ─────────
+        WriteResult compWrite = comparisonResults
                 .apply("WriteResults",
                         BigQueryIO.writeTableRows()
                                 .to(options.getOutputTable())
@@ -358,11 +390,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 8. Append new pending rows ────────────────────────────────────────
-        newPending
-                .apply("MapPendingToTableRow",
-                        MapElements.into(TypeDescriptor.of(TableRow.class))
-                                   .via(r -> fromPendingRecord(r)))
+        WriteResult pendingWrite = newPendingRows
                 .apply("WritePendingTable",
                         BigQueryIO.writeTableRows()
                                 .to(options.getPendingTable())
@@ -370,11 +398,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 9. Append aged-out rows to dead-letter table ──────────────────────
-        agedOut
-                .apply("MapAgedOutToTableRow",
-                        MapElements.into(TypeDescriptor.of(TableRow.class))
-                                   .via(r -> fromAgedOutRecord(r)))
+        WriteResult deadLetterWrite = agedOutRows
                 .apply("WriteDeadLetterTable",
                         BigQueryIO.writeTableRows()
                                 .to(options.getDeadLetterTable())
@@ -382,12 +406,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 10. Flatten aged-out payloads → mismatch rows ─────────────────────
-        agedOut
-                .apply("FlattenAgedOutPayloads",
-                        ParDo.of(new OrphanCompareFn(
-                                options.getFirestoreCollection(),
-                                options.getKmsKeyPath())))
+        WriteResult agedOutWrite = agedOutResults
                 .apply("WriteAgedOutResults",
                         BigQueryIO.writeTableRows()
                                 .to(options.getOutputTable())
@@ -395,12 +414,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 11. Flatten still-pending payloads → snapshot table ───────────────
-        newPending
-                .apply("FlattenPendingPayloads",
-                        ParDo.of(new OrphanCompareFn(
-                                options.getFirestoreCollection(),
-                                options.getKmsKeyPath())))
+        WriteResult snapshotWrite = pendingSnapshot
                 .apply("WritePendingSnapshot",
                         BigQueryIO.writeTableRows()
                                 .to(options.getPendingSnapshotTable())
@@ -408,7 +422,148 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        LOG.info("Pipeline graph constructed. window={} → {}", windowStart, windowEnd);
+        // ── Advance window checkpoint after all writes succeed ─────────────────
+        // Wait.on blocks the trigger element until all WriteResult signals are done.
+        // getSuccessfulTableLoads() fires once per BQ load job (batch FILE_LOADS);
+        // for empty outputs it emits nothing (immediately "done"), which is correct —
+        // empty tables require no waiting.
+        // If any write throws, the exception propagates and AdvanceWindowFn never runs,
+        // so last_extracted stays unchanged and the next run retries the same window.
+        pipeline.apply("AdvanceTrigger", Create.of("done"))
+                .apply("WaitForAllWrites", Wait.on(
+                        compWrite.getSuccessfulTableLoads(),
+                        pendingWrite.getSuccessfulTableLoads(),
+                        deadLetterWrite.getSuccessfulTableLoads(),
+                        agedOutWrite.getSuccessfulTableLoads(),
+                        snapshotWrite.getSuccessfulTableLoads()))
+                .apply("AdvanceWindow",
+                        ParDo.of(new AdvanceWindowFn(
+                                options.getLookupTable(), options.getPipelineName())));
+
+        LOG.info("Pipeline graph constructed.");
+    }
+
+    // ── WindowValueProvider ───────────────────────────────────────────────────
+
+    /**
+     * A {@link Serializable} {@link ValueProvider} that resolves the processing
+     * window start or end from the BigQuery lookup table at runtime (i.e. on
+     * Dataflow workers, using the Dataflow service account).
+     *
+     * <p>On the first call to {@link #get()} within a JVM, this provider:
+     * <ol>
+     *   <li>Calls {@link WindowManager#claimWindow()} — a conditional UPDATE that
+     *       is a no-op if another worker already claimed the window for this run.</li>
+     *   <li>Calls {@link WindowManager#getWindow()} to read the window bounds.</li>
+     *   <li>Caches the result in a static map; subsequent calls return immediately.</li>
+     * </ol>
+     *
+     * <p>Because only the first worker's conditional UPDATE succeeds (the rest are
+     * no-ops), all workers end up reading the same {@code current_stop} value and
+     * therefore use identical window bounds.
+     */
+    private static final class WindowValueProvider
+            implements ValueProvider<String>, Serializable {
+
+        // Shared per JVM — ensures claimWindow() + getWindow() happen once per worker.
+        private static final ConcurrentHashMap<String, WindowInfo> CACHE =
+                new ConcurrentHashMap<>();
+
+        private final ValueProvider<String> lookupTable;
+        private final ValueProvider<String> pipelineName;
+        private final boolean isStart;
+
+        WindowValueProvider(ValueProvider<String> lookupTable,
+                            ValueProvider<String> pipelineName,
+                            boolean isStart) {
+            this.lookupTable  = lookupTable;
+            this.pipelineName = pipelineName;
+            this.isStart      = isStart;
+        }
+
+        @Override
+        public String get() {
+            String name  = pipelineName.get();
+            String table = lookupTable.get().replace(':', '.');
+            WindowInfo info = CACHE.computeIfAbsent(name, k -> {
+                BigQuery bq = BigQueryOptions.getDefaultInstance().getService();
+                WindowManager wm = new WindowManager(bq, table, k);
+                wm.claimWindow();
+                return wm.getWindow();
+            });
+            return isStart ? info.windowStart : info.windowEnd;
+        }
+
+        @Override
+        public boolean isAccessible() {
+            return lookupTable.isAccessible() && pipelineName.isAccessible();
+        }
+    }
+
+    // ── WindowedQueryProvider ─────────────────────────────────────────────────
+
+    /**
+     * A {@link Serializable} {@link ValueProvider} that defers SQL query
+     * construction to runtime by combining two runtime-resolved providers
+     * (windowStart, windowEnd) with a pre-built query template.
+     *
+     * <p>The template must use {@code %s} for windowStart and {@code %s} for
+     * windowEnd (in that order).  All other format arguments (table names, method
+     * values) must be embedded in the template at graph construction time using
+     * {@code String.format} with {@code %%s} to escape the deferred slots.
+     */
+    private static final class WindowedQueryProvider
+            implements ValueProvider<String>, Serializable {
+
+        private final ValueProvider<String> windowStart;
+        private final ValueProvider<String> windowEnd;
+        private final String queryTemplate;
+
+        WindowedQueryProvider(ValueProvider<String> windowStart,
+                              ValueProvider<String> windowEnd,
+                              String queryTemplate) {
+            this.windowStart   = windowStart;
+            this.windowEnd     = windowEnd;
+            this.queryTemplate = queryTemplate;
+        }
+
+        @Override
+        public String get() {
+            return String.format(queryTemplate, windowStart.get(), windowEnd.get());
+        }
+
+        @Override
+        public boolean isAccessible() {
+            return windowStart.isAccessible() && windowEnd.isAccessible();
+        }
+    }
+
+    // ── AdvanceWindowFn ───────────────────────────────────────────────────────
+
+    /**
+     * Advances the processing window checkpoint after all BigQuery writes succeed.
+     * Runs after a {@link Wait#on} that blocks on all write results, so it is
+     * guaranteed not to execute if any write fails.
+     */
+    private static final class AdvanceWindowFn extends DoFn<String, Void> {
+
+        private final ValueProvider<String> lookupTable;
+        private final ValueProvider<String> pipelineName;
+
+        AdvanceWindowFn(ValueProvider<String> lookupTable,
+                        ValueProvider<String> pipelineName) {
+            this.lookupTable  = lookupTable;
+            this.pipelineName = pipelineName;
+        }
+
+        @ProcessElement
+        public void processElement() {
+            String table = lookupTable.get().replace(':', '.');
+            String name  = pipelineName.get();
+            BigQuery bq  = BigQueryOptions.getDefaultInstance().getService();
+            new WindowManager(bq, table, name).advance();
+            LOG.info("WindowManager [{}]: checkpoint advanced (last_extracted = current_stop)", name);
+        }
     }
 
     // ── Row conversion helpers ────────────────────────────────────────────────

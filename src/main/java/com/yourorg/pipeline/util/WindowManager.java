@@ -75,13 +75,30 @@ public final class WindowManager {
      * Must be called before {@link #getWindow()} so the window end is fixed
      * before the source queries run.
      */
+    /**
+     * Conditionally sets {@code current_stop = CURRENT_TIMESTAMP()} for this pipeline's row,
+     * but only when {@code current_stop = last_extracted} (i.e. the previous run has been
+     * marked done, or this is the very first run).
+     *
+     * <p>This condition makes the call idempotent across multiple workers in the same job:
+     * the first worker's UPDATE succeeds; all subsequent workers see
+     * {@code current_stop != last_extracted} and their UPDATE is a no-op.
+     * All workers then call {@link #getWindow()} and read the same {@code current_stop}.
+     *
+     * <p>On a failed run where {@link #advance()} was never called,
+     * {@code current_stop > last_extracted} remains, so the <em>next</em> job's
+     * {@code claimWindow()} is also a no-op and {@link #getWindow()} returns the same
+     * window — ensuring the failed window is retried automatically.
+     */
     public void claimWindow() {
         exec(String.format(
                 "UPDATE `%s`"
                 + " SET current_stop = CURRENT_TIMESTAMP()"
-                + " WHERE table_name = '%s'",
+                + " WHERE table_name = '%s'"
+                + " AND current_stop = last_extracted",
                 lookupTableRef, pipelineName));
-        LOG.info("WindowManager [{}]: current_stop set to CURRENT_TIMESTAMP()", pipelineName);
+        LOG.info("WindowManager [{}]: claimWindow executed (idempotent — "
+                + "only the first caller sets current_stop)", pipelineName);
     }
 
     // ── Steps 2 + 3: read the window ─────────────────────────────────────────
