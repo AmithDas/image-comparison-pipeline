@@ -69,6 +69,7 @@ def _dataflow_parameters() -> dict:
     """
     params = {
         "lookupTable":          _PIPE["lookup_table"],
+        "pipelineName":         _PIPE["pipeline_name"],
         "aiSourceTable":        _PIPE["ai_source_table"],
         "humanSourceTable":     _PIPE["human_source_table"],
         "outputTable":          _PIPE["output_table"],

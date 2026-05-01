@@ -7,7 +7,8 @@
   "template_gcs_path": "gs://your-bucket/templates/image-comparison",
 
   "pipeline": {
-    "lookup_table":           "your-project:your_dataset.pipeline_windows",
+    "lookup_table":           "your-project:your_dataset.pipeline_config",
+    "pipeline_name":          "image_comparison",
 
     "ai_source_table":        "your-project:ai_dataset.ai_payloads",
     "human_source_table":     "your-project:human_dataset.human_payloads",

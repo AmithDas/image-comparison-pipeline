@@ -3,9 +3,8 @@ package com.yourorg.pipeline;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
-import com.google.cloud.bigquery.FieldValueList;
-import com.google.cloud.bigquery.QueryJobConfiguration;
-import com.google.cloud.bigquery.TableResult;
+import com.yourorg.pipeline.util.WindowManager;
+import com.yourorg.pipeline.util.WindowManager.WindowInfo;
 import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
@@ -100,13 +99,18 @@ public class ImageComparisonPipeline {
 
     public interface Options extends PipelineOptions {
 
-        @Description("BigQuery lookup table that controls processing windows. "
-                + "The pipeline claims the earliest PENDING row and manages its status. "
-                + "Schema: run_id STRING, window_start TIMESTAMP, window_end TIMESTAMP, status STRING. "
+        @Description("BigQuery lookup/config table that stores the processing window state. "
+                + "Schema: table_name STRING, last_extracted TIMESTAMP, current_stop TIMESTAMP. "
                 + "Format: project:dataset.table")
         @Validation.Required
         ValueProvider<String> getLookupTable();
         void setLookupTable(ValueProvider<String> value);
+
+        @Description("Value of the table_name column in --lookupTable that identifies "
+                + "this pipeline's config row (e.g. 'image_comparison').")
+        @Validation.Required
+        ValueProvider<String> getPipelineName();
+        void setPipelineName(ValueProvider<String> value);
 
         @Description("BigQuery table containing AI payloads. Format: project:dataset.table")
         @Validation.Required
@@ -177,20 +181,6 @@ public class ImageComparisonPipeline {
         void setKmsKeyPath(ValueProvider<String> value);
     }
 
-    // ── Window info (resolved from lookup table before graph construction) ────
-
-    private static final class WindowInfo {
-        final String runId;
-        final String windowStart;
-        final String windowEnd;
-
-        WindowInfo(String runId, String windowStart, String windowEnd) {
-            this.runId       = runId;
-            this.windowStart = windowStart;
-            this.windowEnd   = windowEnd;
-        }
-    }
-
     // ── Entry point ───────────────────────────────────────────────────────────
 
     public static void main(String[] args) {
@@ -199,69 +189,31 @@ public class ImageComparisonPipeline {
                 .withValidation()
                 .as(Options.class);
 
-        BigQuery bq = BigQueryOptions.getDefaultInstance().getService();
+        BigQuery bq           = BigQueryOptions.getDefaultInstance().getService();
+        String   lookupTable  = options.getLookupTable().get().replace(':', '.');
+        String   pipelineName = options.getPipelineName().get();
 
-        WindowInfo window = fetchPendingWindow(options, bq);
-        if (window == null) {
-            LOG.info("No PENDING window found in lookup table — nothing to do.");
-            return;
-        }
+        WindowManager wm = new WindowManager(bq, lookupTable, pipelineName);
 
-        LOG.info("Claiming window: run_id={} start={} end={}",
-                window.runId, window.windowStart, window.windowEnd);
-        setStatus(options, bq, window.runId, "RUNNING");
+        // Step 1: lock the window end to CURRENT_TIMESTAMP().
+        wm.claimWindow();
+
+        // Steps 2 + 3: read window_start = TIMESTAMP_SUB(last_extracted, 1 HOUR)
+        //              and window_end = current_stop.
+        WindowInfo window = wm.getWindow();
 
         try {
             Pipeline pipeline = Pipeline.create(options);
             buildPipeline(pipeline, options, window.windowStart, window.windowEnd);
             pipeline.run().waitUntilFinish();
-            setStatus(options, bq, window.runId, "DONE");
+
+            // Step 5 (success): advance last_extracted = current_stop.
+            wm.advance();
         } catch (Exception e) {
-            LOG.error("Pipeline failed for run_id={}", window.runId, e);
-            setStatus(options, bq, window.runId, "FAILED");
+            LOG.error("Pipeline failed for pipeline='{}' window={}", pipelineName, window, e);
+            // Failure path: revert current_stop = last_extracted so next run retries.
+            wm.revert();
             throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
-        }
-    }
-
-    // ── Lookup table helpers ──────────────────────────────────────────────────
-
-    private static WindowInfo fetchPendingWindow(Options options, BigQuery bq) {
-        String table = options.getLookupTable().get().replace(':', '.');
-        String sql = String.format(
-                "SELECT run_id,"
-                + " FORMAT_TIMESTAMP('%%Y-%%m-%%dT%%H:%%M:%%SZ', window_start) AS window_start,"
-                + " FORMAT_TIMESTAMP('%%Y-%%m-%%dT%%H:%%M:%%SZ', window_end)   AS window_end"
-                + " FROM `%s`"
-                + " WHERE status = 'PENDING'"
-                + " ORDER BY window_start ASC"
-                + " LIMIT 1",
-                table);
-        try {
-            TableResult result = bq.query(
-                    QueryJobConfiguration.newBuilder(sql).setUseLegacySql(false).build());
-            if (result.getTotalRows() == 0) return null;
-            FieldValueList row = result.iterateAll().iterator().next();
-            return new WindowInfo(
-                    row.get("run_id").getStringValue(),
-                    row.get("window_start").getStringValue(),
-                    row.get("window_end").getStringValue());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted querying lookup table", e);
-        }
-    }
-
-    private static void setStatus(Options options, BigQuery bq, String runId, String status) {
-        String table = options.getLookupTable().get().replace(':', '.');
-        String sql = String.format(
-                "UPDATE `%s` SET status = '%s' WHERE run_id = '%s'",
-                table, status, runId);
-        try {
-            bq.query(QueryJobConfiguration.newBuilder(sql).setUseLegacySql(false).build());
-            LOG.info("Lookup table: run_id={} → {}", runId, status);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted updating status to " + status, e);
         }
     }
 
