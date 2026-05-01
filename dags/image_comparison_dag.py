@@ -1,34 +1,20 @@
 """
 Image Comparison Pipeline — Airflow DAG  (Classic Dataflow Template)
 =====================================================================
-Runs a single Dataflow job every 3 hours that processes all segments
-(main, authentication, docproof, …) in one pass.
+Triggers a single Dataflow job every 3 hours.
 
-Source rows are routed to their segment by the 'method' column value.
-All results land in one shared BigQuery table with a 'segment' column
-for downstream filtering.
+The Dataflow job owns all window and status management:
+  - Reads the earliest PENDING row from the lookup table
+  - Marks it RUNNING, processes the window, marks DONE or FAILED
+  - If no PENDING row exists, the job exits cleanly (no alert)
+
+The DAG is a pure scheduler — no BigQuery status tasks needed here.
 
 All configuration lives in:
   dags/config/image_comparison_config.json
 
 To add a new segment, append an entry to pipeline.segments in that file.
 No Python or Java changes are needed.
-
-Lookup table contract
-─────────────────────
-  run_id        STRING     NOT NULL   e.g. "run-2026-04-23-03"
-  window_start  TIMESTAMP  NOT NULL   inclusive start of the processing window
-  window_end    TIMESTAMP  NOT NULL   exclusive end of the processing window
-  status        STRING     NOT NULL   PENDING | RUNNING | DONE | FAILED
-
-DAG run lifecycle
-─────────────────
-  fetch_window → mark_running → run_dataflow → mark_done
-                                      ↓ (on failure)
-                                   mark_failed
-
-  • No PENDING row → DAG run completes as SKIPPED (no alert).
-  • max_active_runs=1 prevents overlapping windows.
 
 Classic Template — how to compile and stage
 ───────────────────────────────────────────
@@ -47,14 +33,9 @@ import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.exceptions import AirflowSkipException
-from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
 from airflow.providers.google.cloud.operators.dataflow import (
     DataflowTemplatedJobStartOperator,
 )
-from airflow.operators.python import PythonOperator
-from airflow.utils.trigger_rule import TriggerRule
 
 # ── Load config ───────────────────────────────────────────────────────────────
 
@@ -69,9 +50,6 @@ _DATAFLOW = _CFG["dataflow"]
 PROJECT_ID        = _CFG["project_id"]
 REGION            = _CFG["region"]
 TEMPLATE_GCS_PATH = _CFG["template_gcs_path"]
-LOOKUP_TABLE      = _CFG["lookup_table"]
-
-_LOOKUP_TABLE_SQL = LOOKUP_TABLE.replace(":", ".", 1)
 
 # The pipeline expects segmentConfigs as a JSON string — serialise the list from config.
 # Strip comment keys (starting with '_') before passing to Java.
@@ -80,72 +58,23 @@ _SEGMENT_CONFIGS_JSON = json.dumps([
     for seg in _PIPE["segments"]
 ])
 
-# ── Task 1: fetch next pending window ────────────────────────────────────────
-
-def fetch_window(**context) -> None:
-    """
-    Queries the lookup table for the earliest PENDING run and pushes
-    run_id, window_start, and window_end into XCom.
-
-    Raises AirflowSkipException when no PENDING row exists.
-    """
-    hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
-
-    query = f"""
-        SELECT
-            run_id,
-            FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', window_start) AS window_start,
-            FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', window_end)   AS window_end
-        FROM `{_LOOKUP_TABLE_SQL}`
-        WHERE status = 'PENDING'
-        ORDER BY window_start ASC
-        LIMIT 1
-    """
-
-    rows = hook.get_records(query)
-    if not rows:
-        raise AirflowSkipException(
-            f"No PENDING rows found in {LOOKUP_TABLE} — skipping this DAG run."
-        )
-
-    run_id, window_start, window_end = rows[0]
-    ti = context["ti"]
-    ti.xcom_push(key="run_id",       value=run_id)
-    ti.xcom_push(key="window_start", value=window_start)
-    ti.xcom_push(key="window_end",   value=window_end)
-
-
-# ── BQ status update helpers ──────────────────────────────────────────────────
-
-def _update_status_query(new_status: str) -> str:
-    return f"""
-        UPDATE `{_LOOKUP_TABLE_SQL}`
-        SET    status = '{new_status}'
-        WHERE  run_id = '{{{{ ti.xcom_pull(task_ids="fetch_window", key="run_id") }}}}'
-    """
-
-
-def _bq_query_config(sql: str) -> dict:
-    return {"query": {"query": sql, "useLegacySql": False}}
-
 
 # ── Dataflow parameters ───────────────────────────────────────────────────────
 
 def _dataflow_parameters() -> dict:
     """
     Builds the Dataflow Classic Template parameter dict from config.
-    windowStart / windowEnd are resolved at task-run time via Jinja XCom refs.
-    segmentConfigs is a JSON string listing all segments with their method pairs.
+    windowStart / windowEnd are no longer passed here — the Dataflow job
+    reads them directly from the lookup table at startup.
     """
     params = {
+        "lookupTable":          _PIPE["lookup_table"],
         "aiSourceTable":        _PIPE["ai_source_table"],
         "humanSourceTable":     _PIPE["human_source_table"],
         "outputTable":          _PIPE["output_table"],
         "pendingTable":         _PIPE["pending_table"],
         "deadLetterTable":      _PIPE["dead_letter_table"],
         "pendingSnapshotTable": _PIPE["pending_snapshot_table"],
-        "windowStart": "{{ ti.xcom_pull(task_ids='fetch_window', key='window_start') }}",
-        "windowEnd":   "{{ ti.xcom_pull(task_ids='fetch_window', key='window_end') }}",
         "segmentConfigs":       _SEGMENT_CONFIGS_JSON,
         "imageNameField":       _PIPE["image_name_field"],
         "firestoreCollection":  _PIPE["firestore_collection"],
@@ -181,7 +110,8 @@ default_args = {
 with DAG(
     dag_id="image_comparison_pipeline",
     description=(
-        "Single Dataflow job processes all segments every 3 hours. "
+        "Triggers the Dataflow image comparison job every 3 hours. "
+        "Window selection and status management are handled by the Dataflow job itself. "
         "Config lives in dags/config/image_comparison_config.json."
     ),
     default_args=default_args,
@@ -193,26 +123,10 @@ with DAG(
     tags=["dataflow", "image-comparison", "data-platform"],
 ) as dag:
 
-    fetch_window_task = PythonOperator(
-        task_id="fetch_window",
-        python_callable=fetch_window,
-    )
-
-    mark_running = BigQueryInsertJobOperator(
-        task_id="mark_running",
-        configuration=_bq_query_config(_update_status_query("RUNNING")),
-        project_id=PROJECT_ID,
-        gcp_conn_id="google_cloud_default",
-    )
-
     run_dataflow = DataflowTemplatedJobStartOperator(
         task_id="run_dataflow",
         template=TEMPLATE_GCS_PATH,
-        job_name=(
-            "ic-pipeline-"
-            "{{ ti.xcom_pull(task_ids='fetch_window', key='window_start')"
-            "| replace(':', '-') | replace('T', '-') | replace('Z', '') | replace(' ', '-') }}"
-        ),
+        job_name="ic-pipeline-{{ ts_nodash | lower }}",
         project_id=PROJECT_ID,
         location=REGION,
         parameters=_dataflow_parameters(),
@@ -220,21 +134,3 @@ with DAG(
         wait_until_finished=True,
         gcp_conn_id="google_cloud_default",
     )
-
-    mark_done = BigQueryInsertJobOperator(
-        task_id="mark_done",
-        configuration=_bq_query_config(_update_status_query("DONE")),
-        project_id=PROJECT_ID,
-        gcp_conn_id="google_cloud_default",
-        trigger_rule=TriggerRule.ALL_SUCCESS,
-    )
-
-    mark_failed = BigQueryInsertJobOperator(
-        task_id="mark_failed",
-        configuration=_bq_query_config(_update_status_query("FAILED")),
-        project_id=PROJECT_ID,
-        gcp_conn_id="google_cloud_default",
-        trigger_rule=TriggerRule.ONE_FAILED,
-    )
-
-    fetch_window_task >> mark_running >> run_dataflow >> [mark_done, mark_failed]

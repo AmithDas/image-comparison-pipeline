@@ -1,15 +1,13 @@
 {
-  "_comment": "Image Comparison Pipeline — DAG configuration. One Dataflow job handles all segments. Add a new segment by appending to the 'segments' array — no Java code changes needed.",
+  "_comment": "Image Comparison Pipeline — DAG configuration. The Dataflow job owns window/status management: it reads the earliest PENDING row from the lookup table, marks it RUNNING, runs, then marks DONE or FAILED. The DAG is a pure scheduler — no window fetching or status updates needed here.",
 
   "project_id": "your-gcp-project",
   "region":     "us-central1",
 
   "template_gcs_path": "gs://your-bucket/templates/image-comparison",
 
-  "lookup_table": "your-project:your_dataset.lookup",
-
   "pipeline": {
-    "_comment": "All segments write to the same output tables. Use the 'segment' column to filter in BigQuery.",
+    "lookup_table":           "your-project:your_dataset.pipeline_windows",
 
     "ai_source_table":        "your-project:ai_dataset.ai_payloads",
     "human_source_table":     "your-project:human_dataset.human_payloads",
@@ -26,7 +24,7 @@
     "human_filter_field": "",
     "human_filter_value": "",
 
-    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. Source rows whose method does not match any entry are silently dropped. For combined segments (multiple human payloads per image), set payloadFormat='id_request' and list humanSubTypes with a discriminatorField per sub-type.",
+    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. For combined segments (multiple human payloads per image), set payloadFormat='id_request' and list humanSubTypes with a discriminatorField per sub-type.",
     "segments": [
       {
         "_comment": "Standard single-payload segment.",
@@ -35,10 +33,10 @@
         "humanMethod": "controller.SubmitMain"
       },
       {
-        "_comment": "Combined segment: AI sends one payload; human sends two separate id_request payloads (auth + docreview) which are merged before comparison. Both sub-types share the same humanMethod.",
-        "name":         "authanddocreview",
-        "aiMethod":     "aimetadata",
-        "humanMethod":  "controller.SubmitDispute",
+        "_comment": "Combined segment: AI sends one payload; human sends two separate id_request payloads (auth + docreview) which are merged before comparison.",
+        "name":          "authanddocreview",
+        "aiMethod":      "aimetadata",
+        "humanMethod":   "controller.SubmitDispute",
         "payloadFormat": "id_request",
         "humanSubTypes": [
           {
