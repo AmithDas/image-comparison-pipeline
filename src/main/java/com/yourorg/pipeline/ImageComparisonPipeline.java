@@ -254,11 +254,15 @@ public class ImageComparisonPipeline {
                                     options.getHumanFilterValue())));
 
             // ── Pending rows for this segment ─────────────────────────────────
+            // QUALIFY deduplicates across accumulating WRITE_APPEND rows: pick the
+            // latest re-pended version of each (image_id, segment) pair.
             String pendingQuery = String.format(
                     "SELECT * FROM `%s`"
                             + " WHERE segment = '%s'"
                             + " AND first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
-                            + " INTERVAL %d DAY)",
+                            + " INTERVAL %d DAY)"
+                            + " QUALIFY ROW_NUMBER() OVER"
+                            + " (PARTITION BY image_id, segment ORDER BY retry_count DESC) = 1",
                     pendingTable, seg.name, FilterAndPairFn.MAX_WAIT_DAYS);
 
             PCollection<KV<String, TableRow>> keyedPending = pipeline
@@ -329,7 +333,10 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        // ── 8. Overwrite pending table (WRITE_TRUNCATE) ───────────────────────
+        // ── 8. Append new pending rows (WRITE_APPEND) ────────────────────────
+        // WRITE_APPEND avoids wiping rows for segments not processed in this run.
+        // The read query deduplicates by (image_id, segment) so stale duplicates
+        // are ignored on the next read. Rows age out naturally via first_seen_at.
         newPending
                 .apply("MapPendingToTableRow",
                         MapElements.into(TypeDescriptor.of(TableRow.class))
@@ -338,7 +345,7 @@ public class ImageComparisonPipeline {
                         BigQueryIO.writeTableRows()
                                 .to(options.getPendingTable())
                                 .withSchema(SchemaUtil.pendingSchema())
-                                .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
+                                .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
         // ── 9. Append aged-out rows to dead-letter table ──────────────────────
