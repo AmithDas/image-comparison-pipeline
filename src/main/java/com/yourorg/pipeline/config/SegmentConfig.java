@@ -47,15 +47,15 @@ import java.util.Map;
  */
 public class SegmentConfig implements Serializable {
 
-    public final String           name;
-    public final String           aiMethod;
-    public final String           humanMethod;
+    public String           name;
+    public String           aiMethod;
+    public String           humanMethod;
 
     /** {@code "id_request"} or {@code null} (plain JSON). */
-    public final String           payloadFormat;
+    public String           payloadFormat;
 
     /** Non-null when multiple human payloads must be merged before comparison. */
-    public final List<HumanSubType> humanSubTypes;
+    public List<HumanSubType> humanSubTypes;
 
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
@@ -87,11 +87,11 @@ public class SegmentConfig implements Serializable {
 
     public static class HumanSubType implements Serializable {
 
-        public final String name;
+        public String name;
         /** Top-level JSON key whose presence identifies this sub-type in the human payload. */
-        public final String discriminatorField;
+        public String discriminatorField;
 
-        public HumanSubType() { this(null, null); }
+        public HumanSubType() {}
 
         public HumanSubType(String name, String discriminatorField) {
             this.name              = name;
