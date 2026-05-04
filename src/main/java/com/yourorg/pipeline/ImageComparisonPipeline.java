@@ -288,15 +288,11 @@ public class ImageComparisonPipeline {
                                     options.getHumanFilterValue())));
 
             // ── Pending rows for this segment ─────────────────────────────────
-            // Pending reads do not use the processing window — they look back up
-            // to MAX_WAIT_DAYS.  QUALIFY deduplicates WRITE_APPEND accumulation.
             String pendingQuery = String.format(
                     "SELECT * FROM `%s`"
                             + " WHERE segment = '%s'"
                             + " AND first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
-                            + " INTERVAL %d DAY)"
-                            + " QUALIFY ROW_NUMBER() OVER"
-                            + " (PARTITION BY image_id, segment ORDER BY retry_count DESC) = 1",
+                            + " INTERVAL %d DAY)",
                     pendingTable, seg.name, FilterAndPairFn.MAX_WAIT_DAYS);
 
             PCollection<KV<String, TableRow>> keyedPending = pipeline
@@ -395,7 +391,7 @@ public class ImageComparisonPipeline {
                         BigQueryIO.writeTableRows()
                                 .to(options.getPendingTable())
                                 .withSchema(SchemaUtil.pendingSchema())
-                                .withWriteDisposition(WriteDisposition.WRITE_APPEND)
+                                .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
         WriteResult deadLetterWrite = agedOutRows
