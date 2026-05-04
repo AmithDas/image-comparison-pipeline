@@ -57,6 +57,14 @@ public class SegmentConfig implements Serializable {
     /** Non-null when multiple human payloads must be merged before comparison. */
     public List<HumanSubType> humanSubTypes;
 
+    /**
+     * Cross-field name mappings for this segment.
+     * Each entry maps a human payload field name to the corresponding AI payload field name
+     * so they are compared against each other rather than emitted as unmatched orphans.
+     * The human field name is used as {@code field_name} in the output.
+     */
+    public List<FieldMapping> fieldMappings;
+
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
         this(null, null, null, null, null);
@@ -83,7 +91,26 @@ public class SegmentConfig implements Serializable {
         return "id_request".equals(payloadFormat);
     }
 
-    // ── Nested type ───────────────────────────────────────────────────────────
+    // ── Nested types ──────────────────────────────────────────────────────────
+
+    public static class FieldMapping implements Serializable {
+        /** Field name in the human payload. Used as {@code field_name} in comparison output. */
+        public String humanField;
+        /** Corresponding field name in the AI payload. */
+        public String aiField;
+
+        public FieldMapping() {}
+
+        public FieldMapping(String humanField, String aiField) {
+            this.humanField = humanField;
+            this.aiField    = aiField;
+        }
+
+        @Override
+        public String toString() {
+            return humanField + " ↔ " + aiField;
+        }
+    }
 
     public static class HumanSubType implements Serializable {
 

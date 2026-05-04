@@ -312,7 +312,8 @@ public class ImageComparisonPipeline {
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
                                 options.getFirestoreCollection(),
-                                options.getKmsKeyPath())));
+                                options.getKmsKeyPath(),
+                                options.getSegmentConfigs())));
 
         // ── Intermediate TableRow PCollections (also used as Write inputs) ────
         PCollection<TableRow> newPendingRows = newPending

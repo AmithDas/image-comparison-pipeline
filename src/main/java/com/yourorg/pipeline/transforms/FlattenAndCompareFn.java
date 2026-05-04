@@ -1,6 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 import com.yourorg.pipeline.util.JsonFieldExtractor.FieldValue;
@@ -15,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -57,11 +59,17 @@ public class FlattenAndCompareFn
 
     private final ValueProvider<String> firestoreCollection;
     private final ValueProvider<String> kmsKeyPath;
+    private final ValueProvider<String> segmentConfigsJson;
+
+    // segment name → (aiField → humanField); resolved in @Setup
+    private transient Map<String, Map<String, String>> aiToHumanBySegment;
 
     public FlattenAndCompareFn(ValueProvider<String> firestoreCollection,
-                                ValueProvider<String> kmsKeyPath) {
+                                ValueProvider<String> kmsKeyPath,
+                                ValueProvider<String> segmentConfigsJson) {
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
+        this.segmentConfigsJson  = segmentConfigsJson;
     }
 
     @Setup
@@ -69,6 +77,21 @@ public class FlattenAndCompareFn
         BarricadeEncryptionUtil.configure(
                 firestoreCollection.get(),
                 kmsKeyPath.get());
+
+        aiToHumanBySegment = new HashMap<>();
+        List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
+        for (SegmentConfig seg : segments) {
+            if (seg.fieldMappings == null || seg.fieldMappings.isEmpty()) continue;
+            Map<String, String> aiToHuman = new HashMap<>();
+            for (SegmentConfig.FieldMapping fm : seg.fieldMappings) {
+                if (fm.aiField != null && fm.humanField != null) {
+                    aiToHuman.put(fm.aiField, fm.humanField);
+                }
+            }
+            if (!aiToHuman.isEmpty()) {
+                aiToHumanBySegment.put(seg.name, aiToHuman);
+            }
+        }
     }
 
     // ── Processing ────────────────────────────────────────────────────────────
@@ -111,7 +134,7 @@ public class FlattenAndCompareFn
         Map<String, List<FieldValue>> humanFields =
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
         Map<String, List<FieldValue>> aiFields =
-                JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS);
+                applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS), segment);
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",
@@ -178,6 +201,33 @@ public class FlattenAndCompareFn
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Renames AI field keys using the segment's fieldMappings so that
+     * cross-named fields (e.g. AI "consumer" ↔ human "verifiedData") are
+     * compared against each other. The human field name is used as the
+     * canonical key so field_name in the output matches the human side.
+     */
+    private Map<String, List<FieldValue>> applyFieldMappings(
+            Map<String, List<FieldValue>> aiFields, String segment) {
+        Map<String, String> aiToHuman = aiToHumanBySegment.get(segment);
+        if (aiToHuman == null || aiToHuman.isEmpty()) return aiFields;
+
+        Map<String, List<FieldValue>> result = new LinkedHashMap<>(aiFields);
+        for (Map.Entry<String, String> mapping : aiToHuman.entrySet()) {
+            String aiField    = mapping.getKey();
+            String humanField = mapping.getValue();
+            List<FieldValue> values = result.remove(aiField);
+            if (values != null) {
+                result.merge(humanField, values, (existing, incoming) -> {
+                    List<FieldValue> merged = new ArrayList<>(existing);
+                    merged.addAll(incoming);
+                    return merged;
+                });
+            }
+        }
+        return result;
+    }
 
     private void emitRow(ProcessContext ctx,
                          String imageId, String segment, String keyId, int iteration,
