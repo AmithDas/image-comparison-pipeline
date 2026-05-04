@@ -48,6 +48,9 @@
             "name":               "docreview",
             "discriminatorField": "documentDetails"
           }
+        ],
+        "fieldMappings": [
+          { "humanField": "verifiedData", "aiField": "consumer" }
         ]
       }
     ]
