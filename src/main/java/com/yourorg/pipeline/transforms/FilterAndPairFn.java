@@ -86,8 +86,8 @@ public class FilterAndPairFn
             String payload   = (String) row.get("payload");
 
             if ("human".equals(side)) {
-                String subType = row.containsKey("_human_sub_type")
-                        ? (String) row.get("_human_sub_type") : "default";
+                Object rawSubType = row.get("_human_sub_type");
+                String subType = (rawSubType != null) ? rawSubType.toString() : "default";
                 humanBySubType.putIfAbsent(subType,
                         newPayloadRow(imageId, keyId, "human", payload, createdAt));
             } else {
@@ -194,7 +194,7 @@ public class FilterAndPairFn
                 String subType = e.getKey();
                 GenericRecord r = e.getValue();
                 String cAt   = str(r.get("created_at"));
-                String pType = subType.equals("default") ? "human" : "human:" + subType;
+                String pType = "default".equals(subType) ? "human" : "human:" + subType;
                 LOG.info("Partial human sub-type={} imageId={} segment={}", subType, imageId, segment);
                 emitPendingOrAgedOut(ctx, imageId, segment, str(r.get("key_id")),
                         pType, str(r.get("payload")), cAt,
