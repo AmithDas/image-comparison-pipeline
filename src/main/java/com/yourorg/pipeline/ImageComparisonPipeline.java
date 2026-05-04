@@ -190,6 +190,7 @@ public class ImageComparisonPipeline {
         @Validation.Required
         ValueProvider<String> getKmsKeyPath();
         void setKmsKeyPath(ValueProvider<String> value);
+
     }
 
     // ── Entry point ───────────────────────────────────────────────────────────
@@ -226,15 +227,15 @@ public class ImageComparisonPipeline {
                 new WindowValueProvider(options.getLookupTable(), options.getPipelineName(), false);
 
         // ── AI source rows (all segments in one read) ─────────────────────────
-        // DecryptAndKeyFn routes each row to its segment(s) at runtime based on
-        // the method column and segmentConfigs.  Rows with unrecognised methods
-        // are silently dropped.
+        // DIRECT_READ reads from the BQ Storage API with no temp dataset.
+        // WindowFilterFn applies the time-window filter at runtime using the
+        // resolved windowStart/windowEnd values from WindowValueProvider.
         PCollection<KV<String, TableRow>> keyedAi = pipeline
                 .apply("ReadAi",
                         BigQueryIO.readTableRows()
-                                .fromQuery(new SourceQueryProvider(
-                                        options.getAiSourceTable(), windowStart, windowEnd))
-                                .usingStandardSql())
+                                .from(options.getAiSourceTable())
+                                .withMethod(BigQueryIO.TypedRead.Method.DIRECT_READ))
+                .apply("FilterAiWindow", ParDo.of(new WindowFilterFn(windowStart, windowEnd)))
                 .apply("KeyAi",
                         ParDo.of(DecryptAndKeyFn.forAi(
                                 options.getFirestoreCollection(),
@@ -246,9 +247,9 @@ public class ImageComparisonPipeline {
         PCollection<KV<String, TableRow>> keyedHuman = pipeline
                 .apply("ReadHuman",
                         BigQueryIO.readTableRows()
-                                .fromQuery(new SourceQueryProvider(
-                                        options.getHumanSourceTable(), windowStart, windowEnd))
-                                .usingStandardSql())
+                                .from(options.getHumanSourceTable())
+                                .withMethod(BigQueryIO.TypedRead.Method.DIRECT_READ))
+                .apply("FilterHumanWindow", ParDo.of(new WindowFilterFn(windowStart, windowEnd)))
                 .apply("KeyHuman",
                         ParDo.of(DecryptAndKeyFn.forHuman(
                                 options.getFirestoreCollection(),
@@ -268,8 +269,9 @@ public class ImageComparisonPipeline {
         PCollection<KV<String, TableRow>> keyedPending = pipeline
                 .apply("ReadPending",
                         BigQueryIO.readTableRows()
-                                .fromQuery(new PendingQueryProvider(options.getPendingTable()))
-                                .usingStandardSql())
+                                .from(options.getPendingTable())
+                                .withMethod(BigQueryIO.TypedRead.Method.DIRECT_READ))
+                .apply("FilterPendingAge", ParDo.of(new PendingAgeFilterFn()))
                 .apply("KeyPending",
                         WithKeys.of((TableRow row) ->
                                 row.get("image_id") + "::" + row.get("segment"))
@@ -457,71 +459,62 @@ public class ImageComparisonPipeline {
         }
     }
 
-    // ── SourceQueryProvider ───────────────────────────────────────────────────
+    // ── WindowFilterFn ────────────────────────────────────────────────────────
 
     /**
-     * Builds the windowed source query at runtime from three {@link ValueProvider}s.
-     * Reads all rows in the processing window regardless of method — routing to
-     * the correct segment is handled by {@link DecryptAndKeyFn} at runtime.
+     * Filters source rows to the processing window at runtime.
+     * Replaces the SQL WHERE clause that was previously in SourceQueryProvider,
+     * allowing DIRECT_READ (no temp dataset) for the AI and human reads.
      */
-    private static final class SourceQueryProvider
-            implements ValueProvider<String>, Serializable {
+    private static final class WindowFilterFn extends DoFn<TableRow, TableRow> {
 
-        private final ValueProvider<String> table;
         private final ValueProvider<String> windowStart;
         private final ValueProvider<String> windowEnd;
 
-        SourceQueryProvider(ValueProvider<String> table,
-                            ValueProvider<String> windowStart,
-                            ValueProvider<String> windowEnd) {
-            this.table       = table;
+        private transient String resolvedStart;
+        private transient String resolvedEnd;
+
+        WindowFilterFn(ValueProvider<String> windowStart, ValueProvider<String> windowEnd) {
             this.windowStart = windowStart;
             this.windowEnd   = windowEnd;
         }
 
-        @Override
-        public String get() {
-            return String.format(
-                    "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'",
-                    table.get().replace(':', '.'), windowStart.get(), windowEnd.get());
+        @Setup
+        public void setup() {
+            resolvedStart = windowStart.get();
+            resolvedEnd   = windowEnd.get();
         }
 
-        @Override
-        public boolean isAccessible() {
-            return table.isAccessible()
-                    && windowStart.isAccessible()
-                    && windowEnd.isAccessible();
+        @ProcessElement
+        public void processElement(ProcessContext ctx) {
+            String createdAt = (String) ctx.element().get("created_at");
+            if (createdAt == null) return;
+            if (createdAt.compareTo(resolvedStart) >= 0
+                    && createdAt.compareTo(resolvedEnd) < 0) {
+                ctx.output(ctx.element());
+            }
         }
     }
 
-    // ── PendingQueryProvider ──────────────────────────────────────────────────
+    // ── PendingAgeFilterFn ────────────────────────────────────────────────────
 
     /**
-     * Builds the pending-table query at runtime. Reads all pending rows across
-     * all segments — keying by the {@code segment} column avoids needing to know
-     * segment names at graph construction time.
+     * Filters pending rows to those within the max-wait window.
+     * Replaces the SQL WHERE clause that was previously in PendingQueryProvider.
      */
-    private static final class PendingQueryProvider
-            implements ValueProvider<String>, Serializable {
+    private static final class PendingAgeFilterFn extends DoFn<TableRow, TableRow> {
 
-        private final ValueProvider<String> table;
-
-        PendingQueryProvider(ValueProvider<String> table) {
-            this.table = table;
-        }
-
-        @Override
-        public String get() {
-            return String.format(
-                    "SELECT * FROM `%s`"
-                            + " WHERE first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
-                            + " INTERVAL %d DAY)",
-                    table.get().replace(':', '.'), FilterAndPairFn.MAX_WAIT_DAYS);
-        }
-
-        @Override
-        public boolean isAccessible() {
-            return table.isAccessible();
+        @ProcessElement
+        public void processElement(ProcessContext ctx) {
+            String firstSeenAt = (String) ctx.element().get("first_seen_at");
+            if (firstSeenAt == null) return;
+            java.time.Instant cutoff = java.time.Instant.now()
+                    .minus(FilterAndPairFn.MAX_WAIT_DAYS, java.time.temporal.ChronoUnit.DAYS);
+            try {
+                if (java.time.Instant.parse(firstSeenAt).isAfter(cutoff)) {
+                    ctx.output(ctx.element());
+                }
+            } catch (Exception ignored) {}
         }
     }
 
