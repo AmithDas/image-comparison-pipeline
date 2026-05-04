@@ -204,29 +204,44 @@ public class FlattenAndCompareFn
 
     /**
      * Renames AI field keys using the segment's fieldMappings so that
-     * cross-named fields (e.g. AI "consumer" ↔ human "verifiedData") are
-     * compared against each other. The human field name is used as the
-     * canonical key so field_name in the output matches the human side.
+     * cross-named root objects (e.g. AI "consumer" ↔ human "verifiedData")
+     * are compared against each other.
+     *
+     * Handles both exact matches ("consumer") and dot-prefixed children
+     * ("consumer.firstName", "consumer.dob", …). The human field name is
+     * used as the canonical key so field_name in the output matches the
+     * human side.
      */
     private Map<String, List<FieldValue>> applyFieldMappings(
             Map<String, List<FieldValue>> aiFields, String segment) {
         Map<String, String> aiToHuman = aiToHumanBySegment.get(segment);
         if (aiToHuman == null || aiToHuman.isEmpty()) return aiFields;
 
-        Map<String, List<FieldValue>> result = new LinkedHashMap<>(aiFields);
-        for (Map.Entry<String, String> mapping : aiToHuman.entrySet()) {
-            String aiField    = mapping.getKey();
-            String humanField = mapping.getValue();
-            List<FieldValue> values = result.remove(aiField);
-            if (values != null) {
-                result.merge(humanField, values, (existing, incoming) -> {
-                    List<FieldValue> merged = new ArrayList<>(existing);
-                    merged.addAll(incoming);
-                    return merged;
-                });
-            }
+        Map<String, List<FieldValue>> result = new LinkedHashMap<>();
+        for (Map.Entry<String, List<FieldValue>> entry : aiFields.entrySet()) {
+            String key         = entry.getKey();
+            String renamedKey  = rename(key, aiToHuman);
+            result.merge(renamedKey, entry.getValue(), (existing, incoming) -> {
+                List<FieldValue> merged = new ArrayList<>(existing);
+                merged.addAll(incoming);
+                return merged;
+            });
         }
         return result;
+    }
+
+    private static String rename(String key, Map<String, String> aiToHuman) {
+        for (Map.Entry<String, String> mapping : aiToHuman.entrySet()) {
+            String aiPrefix    = mapping.getKey();
+            String humanPrefix = mapping.getValue();
+            if (key.equals(aiPrefix)) {
+                return humanPrefix;
+            }
+            if (key.startsWith(aiPrefix + ".")) {
+                return humanPrefix + key.substring(aiPrefix.length());
+            }
+        }
+        return key;
     }
 
     private void emitRow(ProcessContext ctx,
