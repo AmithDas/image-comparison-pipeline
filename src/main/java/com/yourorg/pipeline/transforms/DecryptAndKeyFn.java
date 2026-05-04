@@ -126,58 +126,47 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
                 ctx.output(KV.of(imageKey + "::" + seg.name, row));
 
             } else if (seg.humanMethod.equals(method)) {
-                // Human row — resolve inner JSON, apply filter, route by discriminator.
-                String json = resolveHumanJson(decrypted, seg, keyId, method);
-                if (json == null) continue;
+                // Resolve inner JSON and image key.
+                // For id_request format (explicit via payloadFormat, or auto-detected when
+                // humanSubTypes is defined), both come from PayloadParser.
+                // For plain JSON, innerJson == decrypted and imageKey comes from imageNameField.
+                boolean tryIdRequest = seg.isIdRequestFormat() || hasSubTypes(seg);
+                PayloadParser.Parsed parsed = tryIdRequest ? PayloadParser.parse(decrypted) : null;
+                boolean isIdRequest = (parsed != null);
 
-                if (!passesFilter(json)) continue;
+                if (seg.isIdRequestFormat() && !isIdRequest) {
+                    LOG.warn("Could not parse id_request payload for segment={} key_id={} method={}",
+                            seg.name, keyId, method);
+                    continue;
+                }
 
-                String subTypeName = resolveSubType(json, seg);
+                String innerJson = isIdRequest ? parsed.json() : decrypted;
+
+                if (!passesFilter(innerJson)) continue;
+
+                String subTypeName = resolveSubType(innerJson, seg);
                 if (subTypeName == null) continue;
 
-                String imageKey = extractImageKey(decrypted, seg, keyId, method);
-                if (imageKey == null) continue;
+                String imageKey = isIdRequest
+                        ? parsed.imageId()
+                        : JsonFieldExtractor.extractField(decrypted, resolvedImageNameField);
+                if (imageKey == null || imageKey.isBlank()) {
+                    LOG.warn("Skipping row: image name absent for key_id={} method={} segment={}",
+                            keyId, method, seg.name);
+                    continue;
+                }
 
                 TableRow emitted = row.clone();
-                if (seg.requiresHumanMerge()) {
-                    emitted.set("_human_sub_type", subTypeName);
-                }
-                ctx.output(KV.of(imageKey + "::" + seg.name, emitted));
+                emitted.set("_human_sub_type", subTypeName);
+                ctx.output(KV.of(imageKey.trim().toLowerCase() + "::" + seg.name, emitted));
             }
         }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private String resolveHumanJson(String decrypted, SegmentConfig seg,
-                                     String keyId, String method) {
-        if (seg.isIdRequestFormat()) {
-            PayloadParser.Parsed p = PayloadParser.parse(decrypted);
-            if (p == null) {
-                LOG.warn("Could not parse id_request payload for segment={} key_id={} method={}",
-                        seg.name, keyId, method);
-                return null;
-            }
-            return p.json();
-        }
-        return decrypted;
-    }
-
-    private String extractImageKey(String decrypted, SegmentConfig seg,
-                                    String keyId, String method) {
-        String name;
-        if (seg.isIdRequestFormat()) {
-            PayloadParser.Parsed p = PayloadParser.parse(decrypted);
-            name = p != null ? p.imageId() : null;
-        } else {
-            name = JsonFieldExtractor.extractField(decrypted, resolvedImageNameField);
-        }
-        if (name == null || name.isBlank()) {
-            LOG.warn("Skipping row: image name absent for key_id={} method={} segment={}",
-                    keyId, method, seg.name);
-            return null;
-        }
-        return name.trim().toLowerCase();
+    private static boolean hasSubTypes(SegmentConfig seg) {
+        return seg.humanSubTypes != null && !seg.humanSubTypes.isEmpty();
     }
 
     private String extractImageKeyPlainJson(String decrypted, String keyId,
@@ -197,18 +186,22 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
      * Returns {@code null} if no sub-type matches (row is dropped).
      */
     private static String resolveSubType(String json, SegmentConfig seg) {
-        if (!seg.requiresHumanMerge()) return "default";
+        if (seg.humanSubTypes == null || seg.humanSubTypes.isEmpty()) return "default";
         JsonObject obj;
         try {
             obj = JsonParser.parseString(json).getAsJsonObject();
         } catch (Exception e) {
+            LOG.warn("Failed to parse human payload JSON for sub-type resolution: {}", e.getMessage());
             return null;
         }
         for (SegmentConfig.HumanSubType st : seg.humanSubTypes) {
             if (obj.has(st.discriminatorField)) {
+                LOG.debug("Resolved sub-type '{}' via discriminator '{}'", st.name, st.discriminatorField);
                 return st.name;
             }
         }
+        LOG.warn("No humanSubType discriminator matched in payload. Segment has sub-types: {}",
+                seg.humanSubTypes);
         return null;
     }
 
