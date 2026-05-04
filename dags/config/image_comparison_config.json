@@ -46,7 +46,8 @@
           },
           {
             "name":               "docreview",
-            "discriminatorField": "documentDetails"
+            "discriminatorField": "docProofs",
+            "isBase":             true
           }
         ],
         "fieldMappings": [

@@ -83,15 +83,25 @@ public final class HumanMerger {
             }
         }
 
-        // Base sub-type: the one whose discriminatorField is a JSON array (e.g. docreview →
-        // documentDetails).  All other sub-types contribute only their discriminatorField value.
+        // Base sub-type: prefer explicit isBase=true in config; fall back to the sub-type
+        // whose discriminatorField is a JSON array; last resort: alphabetically first.
         String baseSubType = null;
-        for (String subType : subTypeNames) {
-            JsonObject obj  = parsedJsons.get(subType);
-            String     disc = subTypeToDiscriminator.get(subType);
-            if (obj != null && disc != null && obj.has(disc) && obj.get(disc).isJsonArray()) {
-                baseSubType = subType;
-                break;
+        if (seg.humanSubTypes != null) {
+            for (SegmentConfig.HumanSubType st : seg.humanSubTypes) {
+                if (st.isBase) {
+                    baseSubType = st.name;
+                    break;
+                }
+            }
+        }
+        if (baseSubType == null) {
+            for (String subType : subTypeNames) {
+                JsonObject obj  = parsedJsons.get(subType);
+                String     disc = subTypeToDiscriminator.get(subType);
+                if (obj != null && disc != null && obj.has(disc) && obj.get(disc).isJsonArray()) {
+                    baseSubType = subType;
+                    break;
+                }
             }
         }
         if (baseSubType == null) baseSubType = subTypeNames[0];

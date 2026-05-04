@@ -117,12 +117,20 @@ public class SegmentConfig implements Serializable {
         public String name;
         /** Top-level JSON key whose presence identifies this sub-type in the human payload. */
         public String discriminatorField;
+        /**
+         * When {@code true}, this sub-type's full payload is used as the merge base.
+         * All other sub-types contribute only their {@code discriminatorField} value on top.
+         * At most one sub-type should set this to {@code true}; if none do, the merger
+         * falls back to heuristic detection (array-valued discriminatorField wins).
+         */
+        public boolean isBase;
 
         public HumanSubType() {}
 
-        public HumanSubType(String name, String discriminatorField) {
+        public HumanSubType(String name, String discriminatorField, boolean isBase) {
             this.name              = name;
             this.discriminatorField = discriminatorField;
+            this.isBase            = isBase;
         }
 
         @Override
