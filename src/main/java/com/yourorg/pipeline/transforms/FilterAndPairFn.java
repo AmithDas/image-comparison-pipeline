@@ -88,8 +88,21 @@ public class FilterAndPairFn
             if ("human".equals(side)) {
                 Object rawSubType = row.get("_human_sub_type");
                 String subType = (rawSubType != null) ? rawSubType.toString() : "default";
-                humanBySubType.putIfAbsent(subType,
-                        newPayloadRow(imageId, keyId, "human", payload, createdAt));
+                GenericRecord incoming = newPayloadRow(imageId, keyId, "human", payload, createdAt);
+                humanBySubType.merge(subType, incoming, (existing, candidate) -> {
+                    String existingCat = str(existing.get("created_at"));
+                    String candidateCat = str(candidate.get("created_at"));
+                    if (existingCat == null) return candidate;
+                    if (candidateCat == null) return existing;
+                    if (candidateCat.compareTo(existingCat) > 0) {
+                        LOG.warn("imageId={} segment={} subType={} — duplicate human payload, "
+                                + "keeping latest ({})", imageId, segment, subType, candidateCat);
+                        return candidate;
+                    }
+                    LOG.warn("imageId={} segment={} subType={} — duplicate human payload, "
+                            + "keeping latest ({})", imageId, segment, subType, existingCat);
+                    return existing;
+                });
             } else {
                 aiRows.add(newPayloadRow(imageId, keyId, "ai", payload, createdAt));
             }

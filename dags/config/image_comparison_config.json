@@ -52,6 +52,9 @@
         ],
         "fieldMappings": [
           { "humanField": "verifiedData", "aiField": "consumer" }
+        ],
+        "segmentTypeMappings": [
+          { "roots": ["verifiedData", "consumerInformation"], "segmentType": "authentication" }
         ]
       }
     ]

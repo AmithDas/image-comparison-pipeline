@@ -65,6 +65,15 @@ public class SegmentConfig implements Serializable {
      */
     public List<FieldMapping> fieldMappings;
 
+    /**
+     * Overrides the {@code segment_type} column value for specific root nodes.
+     * When a flattened field's root node (e.g. {@code verifiedData},
+     * {@code consumerInformation}) matches an entry here, the configured label
+     * is written instead of the raw root name.
+     * Root nodes with no entry keep the raw root name as {@code segment_type}.
+     */
+    public List<SegmentTypeMapping> segmentTypeMappings;
+
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
         this(null, null, null, null, null);
@@ -92,6 +101,20 @@ public class SegmentConfig implements Serializable {
     }
 
     // ── Nested types ──────────────────────────────────────────────────────────
+
+    public static class SegmentTypeMapping implements Serializable {
+        /** Root node names (e.g. {@code "verifiedData"}, {@code "consumerInformation"}) that map to this label. */
+        public List<String> roots;
+        /** Label written to the {@code segment_type} column for these root nodes. */
+        public String segmentType;
+
+        public SegmentTypeMapping() {}
+
+        public SegmentTypeMapping(List<String> roots, String segmentType) {
+            this.roots       = roots;
+            this.segmentType = segmentType;
+        }
+    }
 
     public static class FieldMapping implements Serializable {
         /** Field name in the human payload. Used as {@code field_name} in comparison output. */

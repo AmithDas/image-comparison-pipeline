@@ -63,6 +63,8 @@ public class FlattenAndCompareFn
 
     // segment name → (aiField → humanField); resolved in @Setup
     private transient Map<String, Map<String, String>> aiToHumanBySegment;
+    // segment name → (root node → segment_type label); resolved in @Setup
+    private transient Map<String, Map<String, String>> rootToLabelBySegment;
 
     public FlattenAndCompareFn(ValueProvider<String> firestoreCollection,
                                 ValueProvider<String> kmsKeyPath,
@@ -78,18 +80,29 @@ public class FlattenAndCompareFn
                 firestoreCollection.get(),
                 kmsKeyPath.get());
 
-        aiToHumanBySegment = new HashMap<>();
+        aiToHumanBySegment  = new HashMap<>();
+        rootToLabelBySegment = new HashMap<>();
         List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
         for (SegmentConfig seg : segments) {
-            if (seg.fieldMappings == null || seg.fieldMappings.isEmpty()) continue;
-            Map<String, String> aiToHuman = new HashMap<>();
-            for (SegmentConfig.FieldMapping fm : seg.fieldMappings) {
-                if (fm.aiField != null && fm.humanField != null) {
-                    aiToHuman.put(fm.aiField, fm.humanField);
+            if (seg.fieldMappings != null) {
+                Map<String, String> aiToHuman = new HashMap<>();
+                for (SegmentConfig.FieldMapping fm : seg.fieldMappings) {
+                    if (fm.aiField != null && fm.humanField != null) {
+                        aiToHuman.put(fm.aiField, fm.humanField);
+                    }
                 }
+                if (!aiToHuman.isEmpty()) aiToHumanBySegment.put(seg.name, aiToHuman);
             }
-            if (!aiToHuman.isEmpty()) {
-                aiToHumanBySegment.put(seg.name, aiToHuman);
+            if (seg.segmentTypeMappings != null) {
+                Map<String, String> rootToLabel = new HashMap<>();
+                for (SegmentConfig.SegmentTypeMapping stm : seg.segmentTypeMappings) {
+                    if (stm.roots != null && stm.segmentType != null) {
+                        for (String root : stm.roots) {
+                            rootToLabel.put(root, stm.segmentType);
+                        }
+                    }
+                }
+                if (!rootToLabel.isEmpty()) rootToLabelBySegment.put(seg.name, rootToLabel);
             }
         }
     }
@@ -230,6 +243,32 @@ public class FlattenAndCompareFn
         return result;
     }
 
+    /**
+     * Returns the segment_type for a flattened field, applying any configured
+     * root-node label overrides for the current segment.
+     *
+     * Raw root is:
+     *   "employments.test.test", null  → "employments"
+     *   "documentDetails",       "A"   → "documentDetails"  (keyed array)
+     *   "name",                  null  → null               (root scalar)
+     *
+     * If the raw root matches a segmentTypeMappings entry, the configured label
+     * is returned instead (e.g. "verifiedData" → "authentication").
+     */
+    private static String resolveSegmentType(String field, String arrayKey,
+                                              Map<String, String> rootToLabel) {
+        int dot = field.indexOf('.');
+        String root;
+        if (dot > 0) {
+            root = field.substring(0, dot);
+        } else if (arrayKey != null) {
+            root = field;
+        } else {
+            return null;
+        }
+        return rootToLabel.getOrDefault(root, root);
+    }
+
     private static String rename(String key, Map<String, String> aiToHuman) {
         for (Map.Entry<String, String> mapping : aiToHuman.entrySet()) {
             String aiPrefix    = mapping.getKey();
@@ -255,6 +294,9 @@ public class FlattenAndCompareFn
         String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
         String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);
 
+        Map<String, String> rootToLabel = rootToLabelBySegment.getOrDefault(
+                segment, Collections.emptyMap());
+
         ctx.output(new TableRow()
                 .set("image_id",         imageId)
                 .set("key_id",           keyId)
@@ -264,6 +306,7 @@ public class FlattenAndCompareFn
                 .set("human_created_at", humanCreatedAt)
                 .set("field_name",       field)
                 .set("array_key",        arrayKey)
+                .set("segment_type",     resolveSegmentType(field, arrayKey, rootToLabel))
                 .set("human_value",      encryptedHumanVal)
                 .set("ai_value",         encryptedAiVal)
                 .set("is_match",         isMatch)
