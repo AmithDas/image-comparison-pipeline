@@ -50,7 +50,8 @@ public class FlattenAndCompareFn
     // ── Array match keys ──────────────────────────────────────────────────────
 
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
-            "documentDetails", "docType"
+            "documentDetails", "docType",
+            "docProofs",       "document"
             // "tradeline", "accountnumber-customernumber-dateopened-code",
             // "address",   "addresstype"
     );
@@ -144,10 +145,13 @@ public class FlattenAndCompareFn
         String humanPayload = BarricadeEncryptionUtil.decrypt(keyId, str(human.get("payload")));
         String aiPayload    = BarricadeEncryptionUtil.decrypt(keyId, str(ai.get("payload")));
 
+        Map<String, String> aiToHuman = aiToHumanBySegment.getOrDefault(segment, Collections.emptyMap());
+        Map<String, String> aiMatchKeys = buildAiArrayMatchKeys(ARRAY_MATCH_KEYS, aiToHuman);
+
         Map<String, List<FieldValue>> humanFields =
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
         Map<String, List<FieldValue>> aiFields =
-                applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS), segment);
+                applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, aiMatchKeys), segment);
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",
@@ -281,6 +285,34 @@ public class FlattenAndCompareFn
             }
         }
         return key;
+    }
+
+    /**
+     * Derives an AI-side array match key map from the human-side base map.
+     * Where a field mapping renames an AI key field (e.g. docProofs.DocumentType →
+     * docProofs.document), the AI map substitutes the AI field name so the extractor
+     * finds the correct field when building the match key for AI array elements.
+     */
+    private static Map<String, String> buildAiArrayMatchKeys(Map<String, String> base,
+                                                              Map<String, String> aiToHuman) {
+        if (aiToHuman.isEmpty()) return base;
+        Map<String, String> result = new HashMap<>(base);
+        for (Map.Entry<String, String> entry : base.entrySet()) {
+            String arrayPath     = entry.getKey();
+            String humanKeyField = entry.getValue();
+            String humanFullPath = arrayPath + "." + humanKeyField;
+            for (Map.Entry<String, String> mapping : aiToHuman.entrySet()) {
+                if (humanFullPath.equals(mapping.getValue())) {
+                    String aiFullPath = mapping.getKey();
+                    String prefix     = arrayPath + ".";
+                    if (aiFullPath.startsWith(prefix)) {
+                        result.put(arrayPath, aiFullPath.substring(prefix.length()));
+                    }
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
     private void emitRow(ProcessContext ctx,
