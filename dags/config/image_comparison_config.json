@@ -34,14 +34,16 @@
         "humanMethod": "controller.SubmitDispute"
       },
       {
-        "name":        "authentication",
-        "aiMethod":    "auth.ai",
-        "humanMethod": "auth.human"
+        "name":           "authentication",
+        "aiMethod":       "auth.ai",
+        "humanMethod":    "auth.human",
+        "aiFieldAliases": {"documentType": "document"}
       },
       {
-        "name":        "docproof",
-        "aiMethod":    "docproof.ai",
-        "humanMethod": "docproof.human"
+        "name":           "docproof",
+        "aiMethod":       "docproof.ai",
+        "humanMethod":    "docproof.human",
+        "aiFieldAliases": {"documentType": "document"}
       }
     ]
   },

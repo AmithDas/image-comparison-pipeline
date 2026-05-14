@@ -21,10 +21,17 @@ import java.util.Map;
  * <pre>
  * [
  *   {"name": "main",           "aiMethod": "aimetadata",    "humanMethod": "controller.SubmitDispute"},
- *   {"name": "authentication", "aiMethod": "auth.ai",        "humanMethod": "auth.human"},
- *   {"name": "docproof",       "aiMethod": "docproof.ai",    "humanMethod": "docproof.human"}
+ *   {"name": "authentication", "aiMethod": "auth.ai",        "humanMethod": "auth.human",
+ *    "aiFieldAliases": {"documentType": "document"}},
+ *   {"name": "docproof",       "aiMethod": "docproof.ai",    "humanMethod": "docproof.human",
+ *    "aiFieldAliases": {"documentType": "document"}}
  * ]
  * </pre>
+ *
+ * <p>{@code aiFieldAliases} is optional.  Each entry renames an AI payload field
+ * (dot-notation prefix) to the corresponding human field name before comparison.
+ * Nested paths are handled automatically: {@code "documentType"} also renames
+ * {@code "documentType.subField"} to {@code "document.subField"}.
  *
  * <p>Adding a new segment requires only a DAG configuration change — no Java code changes needed.
  */
@@ -33,6 +40,8 @@ public class SegmentConfig implements Serializable {
     public final String name;
     public final String aiMethod;
     public final String humanMethod;
+    /** Optional map of AI field name (dot-notation prefix) → canonical field name. */
+    public Map<String, String> aiFieldAliases;
 
     public SegmentConfig(String name, String aiMethod, String humanMethod) {
         this.name        = name;
@@ -79,6 +88,22 @@ public class SegmentConfig implements Serializable {
         return map;
     }
 
+    /**
+     * Builds a map of {@code segmentName → aiFieldAliases} for all segments that
+     * declare field aliases.  Used by {@code FlattenAndCompareFn} to rename AI
+     * payload fields before comparison.
+     */
+    public static Map<String, Map<String, String>> buildFieldAliasMap(
+            List<SegmentConfig> segments) {
+        Map<String, Map<String, String>> map = new HashMap<>();
+        for (SegmentConfig s : segments) {
+            if (s.aiFieldAliases != null && !s.aiFieldAliases.isEmpty()) {
+                map.put(s.name, s.aiFieldAliases);
+            }
+        }
+        return map;
+    }
+
     // ── Validation ────────────────────────────────────────────────────────────
 
     private static void validate(List<SegmentConfig> configs) {
@@ -105,6 +130,9 @@ public class SegmentConfig implements Serializable {
     public String toString() {
         return "SegmentConfig{name=" + name
                 + ", aiMethod=" + aiMethod
-                + ", humanMethod=" + humanMethod + "}";
+                + ", humanMethod=" + humanMethod
+                + (aiFieldAliases != null && !aiFieldAliases.isEmpty()
+                        ? ", aiFieldAliases=" + aiFieldAliases : "")
+                + "}";
     }
 }

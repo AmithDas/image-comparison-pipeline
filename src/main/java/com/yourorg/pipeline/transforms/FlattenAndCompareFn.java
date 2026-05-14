@@ -1,6 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 import com.yourorg.pipeline.util.JsonFieldExtractor.FieldValue;
@@ -37,6 +38,13 @@ import java.util.TreeSet;
  *   <li><b>Scalar fields</b>: one row, {@code array_key} is {@code null}.</li>
  * </ul>
  *
+ * <h3>AI field aliases</h3>
+ * Per-segment {@code aiFieldAliases} in {@link SegmentConfig} rename AI payload
+ * fields (dot-notation prefix) to the corresponding human field name before
+ * comparison.  For example, {@code "documentType" → "document"} causes the AI
+ * field {@code documentType} (and any nested path like {@code documentType.code})
+ * to be compared against the human field {@code document}.
+ *
  * <h3>String comparison</h3>
  * {@code is_match} is computed on plaintext (case-insensitive).
  * Values are re-encrypted before writing to BigQuery.
@@ -57,11 +65,17 @@ public class FlattenAndCompareFn
 
     private final ValueProvider<String> firestoreCollection;
     private final ValueProvider<String> kmsKeyPath;
+    private final ValueProvider<String> segmentConfigsJson;
+
+    // Resolved in @Setup; transient so it is re-initialized on each worker.
+    private transient Map<String, Map<String, String>> fieldAliasMap;
 
     public FlattenAndCompareFn(ValueProvider<String> firestoreCollection,
-                                ValueProvider<String> kmsKeyPath) {
+                                ValueProvider<String> kmsKeyPath,
+                                ValueProvider<String> segmentConfigsJson) {
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
+        this.segmentConfigsJson  = segmentConfigsJson;
     }
 
     @Setup
@@ -69,6 +83,8 @@ public class FlattenAndCompareFn
         BarricadeEncryptionUtil.configure(
                 firestoreCollection.get(),
                 kmsKeyPath.get());
+        List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
+        fieldAliasMap = SegmentConfig.buildFieldAliasMap(segments);
     }
 
     // ── Processing ────────────────────────────────────────────────────────────
@@ -112,6 +128,12 @@ public class FlattenAndCompareFn
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
         Map<String, List<FieldValue>> aiFields =
                 JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS);
+
+        // Apply per-segment AI field aliases (e.g. documentType → document).
+        Map<String, String> aliases = fieldAliasMap.getOrDefault(segment, Collections.emptyMap());
+        if (!aliases.isEmpty()) {
+            aiFields = applyAliases(aiFields, aliases);
+        }
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",
@@ -178,6 +200,35 @@ public class FlattenAndCompareFn
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Renames keys in {@code fields} according to {@code aliases}.
+     * An alias {@code "documentType" → "document"} renames both the exact key
+     * {@code "documentType"} and any nested path like {@code "documentType.code"}.
+     */
+    private static Map<String, List<FieldValue>> applyAliases(
+            Map<String, List<FieldValue>> fields, Map<String, String> aliases) {
+        Map<String, List<FieldValue>> result = new LinkedHashMap<>();
+        for (Map.Entry<String, List<FieldValue>> entry : fields.entrySet()) {
+            String renamed = renameField(entry.getKey(), aliases);
+            result.computeIfAbsent(renamed, k -> new ArrayList<>()).addAll(entry.getValue());
+        }
+        return result;
+    }
+
+    private static String renameField(String fieldName, Map<String, String> aliases) {
+        for (Map.Entry<String, String> alias : aliases.entrySet()) {
+            String oldPrefix = alias.getKey();
+            String newPrefix = alias.getValue();
+            if (fieldName.equals(oldPrefix)) {
+                return newPrefix;
+            }
+            if (fieldName.startsWith(oldPrefix + ".")) {
+                return newPrefix + fieldName.substring(oldPrefix.length());
+            }
+        }
+        return fieldName;
+    }
 
     private void emitRow(ProcessContext ctx,
                          String imageId, String segment, String keyId, int iteration,
