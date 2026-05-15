@@ -38,6 +38,13 @@ import java.util.TreeSet;
  *   <li><b>Scalar fields</b>: one row, {@code array_key} is {@code null}.</li>
  * </ul>
  *
+ * <h3>AI field aliases</h3>
+ * Per-segment {@code aiFieldAliases} in {@link SegmentConfig} rename AI payload
+ * fields (dot-notation prefix) to the corresponding human field name before
+ * comparison.  For example, {@code "documentType" → "document"} causes the AI
+ * field {@code documentType} (and any nested path like {@code documentType.code})
+ * to be compared against the human field {@code document}.
+ *
  * <h3>String comparison</h3>
  * {@code is_match} is computed on plaintext (case-insensitive).
  * Values are re-encrypted before writing to BigQuery.
@@ -152,6 +159,12 @@ public class FlattenAndCompareFn
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
         Map<String, List<FieldValue>> aiFields =
                 applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, aiMatchKeys), segment);
+
+        // Apply per-segment AI field aliases (e.g. documentType → document).
+        Map<String, String> aliases = fieldAliasMap.getOrDefault(segment, Collections.emptyMap());
+        if (!aliases.isEmpty()) {
+            aiFields = applyAliases(aiFields, aliases);
+        }
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",

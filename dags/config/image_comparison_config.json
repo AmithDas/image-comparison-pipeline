@@ -30,33 +30,20 @@
       {
         "_comment": "Standard single-payload segment.",
         "name":        "main",
-        "aiMethod":    "aimetadata_v2",
-        "humanMethod": "controller.SubmitMain"
+        "aiMethod":    "aimetadata",
+        "humanMethod": "controller.SubmitDispute"
       },
       {
-        "_comment": "Combined segment: AI sends one payload; human sends two separate id_request payloads (auth + docreview) which are merged before comparison.",
-        "name":          "authanddocreview",
-        "aiMethod":      "aimetadata",
-        "humanMethod":   "controller.SubmitDispute",
-        "payloadFormat": "id_request",
-        "humanSubTypes": [
-          {
-            "name":               "auth",
-            "discriminatorField": "verifiedData"
-          },
-          {
-            "name":               "docreview",
-            "discriminatorField": "docProofs",
-            "isBase":             true
-          }
-        ],
-        "fieldMappings": [
-          { "humanField": "verifiedData", "aiField": "consumer" },
-          { "humanField": "docProofs.document", "aiField": "docProofs.DocumentType" }
-        ],
-        "segmentTypeMappings": [
-          { "roots": ["verifiedData", "consumerInformation"], "segmentType": "authentication" }
-        ]
+        "name":           "authentication",
+        "aiMethod":       "auth.ai",
+        "humanMethod":    "auth.human",
+        "aiFieldAliases": {"documentType": "document"}
+      },
+      {
+        "name":           "docproof",
+        "aiMethod":       "docproof.ai",
+        "humanMethod":    "docproof.human",
+        "aiFieldAliases": {"documentType": "document"}
       }
     ]
   },
