@@ -16,8 +16,10 @@
     "pending_table":          "your-project:dataset.pending_comparisons",
     "dead_letter_table":      "your-project:dataset.dead_letter_comparisons",
     "pending_snapshot_table": "your-project:dataset.pending_snapshot",
+    "query_temp_dataset":     "your-project:pipeline_temp",
 
     "image_name_field":      "queueImages[0].fileName",
+    "human_lookback_days":   180,
     "firestore_collection":  "dek_store",
     "kms_key_path":          "projects/p/locations/l/keyRings/r/cryptoKeys/k",
 

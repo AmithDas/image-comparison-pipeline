@@ -85,6 +85,8 @@ def _dataflow_parameters() -> dict:
         "pendingSnapshotTable": _PIPE["pending_snapshot_table"],
         "segmentConfigs":       _SEGMENT_CONFIGS_JSON,
         "imageNameField":       _PIPE["image_name_field"],
+        "humanLookbackDays":    str(_PIPE["human_lookback_days"]),
+        "queryTempDataset":     _PIPE["query_temp_dataset"],
         "firestoreCollection":  _PIPE["firestore_collection"],
         "kmsKeyPath":           _PIPE["kms_key_path"],
     }

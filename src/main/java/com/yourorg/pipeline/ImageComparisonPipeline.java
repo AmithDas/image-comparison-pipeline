@@ -191,6 +191,20 @@ public class ImageComparisonPipeline {
         ValueProvider<String> getKmsKeyPath();
         void setKmsKeyPath(ValueProvider<String> value);
 
+        @Description("How far back (in days) to read human source rows relative to windowEnd. "
+                + "Allows late-arriving human payloads to match AI rows from earlier windows. "
+                + "Default: 180.")
+        @Default.Integer(180)
+        ValueProvider<Integer> getHumanLookbackDays();
+        void setHumanLookbackDays(ValueProvider<Integer> value);
+
+        @Description("Existing BigQuery dataset for temporary query materialisation tables. "
+                + "Prevents Dataflow from auto-creating a new temp dataset on each run. "
+                + "Format: project:dataset  (e.g. your-project:pipeline_temp)")
+        @Validation.Required
+        ValueProvider<String> getQueryTempDataset();
+        void setQueryTempDataset(ValueProvider<String> value);
+
     }
 
     // ── Entry point ───────────────────────────────────────────────────────────
@@ -226,16 +240,17 @@ public class ImageComparisonPipeline {
         ValueProvider<String> windowEnd   =
                 new WindowValueProvider(options.getLookupTable(), options.getPipelineName(), false);
 
+        // queryTempDataset is static infrastructure — resolved at template build time.
+        String queryTempDataset = options.getQueryTempDataset().get();
+
         // ── AI source rows (all segments in one read) ─────────────────────────
-        // DIRECT_READ reads from the BQ Storage API with no temp dataset.
-        // WindowFilterFn applies the time-window filter at runtime using the
-        // resolved windowStart/windowEnd values from WindowValueProvider.
         PCollection<KV<String, TableRow>> keyedAi = pipeline
                 .apply("ReadAi",
                         BigQueryIO.readTableRows()
-                                .from(options.getAiSourceTable())
-                                .withMethod(BigQueryIO.TypedRead.Method.DIRECT_READ))
-                .apply("FilterAiWindow", ParDo.of(new WindowFilterFn(windowStart, windowEnd)))
+                                .fromQuery(new AiSourceQueryProvider(
+                                        options.getAiSourceTable(), windowStart, windowEnd))
+                                .usingStandardSql()
+                                .withQueryTempDataset(queryTempDataset))
                 .apply("KeyAi",
                         ParDo.of(DecryptAndKeyFn.forAi(
                                 options.getFirestoreCollection(),
@@ -243,13 +258,18 @@ public class ImageComparisonPipeline {
                                 options.getImageNameField(),
                                 options.getSegmentConfigs())));
 
-        // ── Human source rows (all segments in one read) ──────────────────────
+        // ── Human source rows — 180-day lookback ─────────────────────────────
+        // Human payloads may arrive well after the AI payload; reading back
+        // humanLookbackDays from windowEnd ensures late-arriving human rows
+        // can still match pending AI rows from earlier windows.
         PCollection<KV<String, TableRow>> keyedHuman = pipeline
                 .apply("ReadHuman",
                         BigQueryIO.readTableRows()
-                                .from(options.getHumanSourceTable())
-                                .withMethod(BigQueryIO.TypedRead.Method.DIRECT_READ))
-                .apply("FilterHumanWindow", ParDo.of(new WindowFilterFn(windowStart, windowEnd)))
+                                .fromQuery(new HumanSourceQueryProvider(
+                                        options.getHumanSourceTable(), windowEnd,
+                                        options.getHumanLookbackDays()))
+                                .usingStandardSql()
+                                .withQueryTempDataset(queryTempDataset))
                 .apply("KeyHuman",
                         ParDo.of(DecryptAndKeyFn.forHuman(
                                 options.getFirestoreCollection(),
@@ -264,14 +284,12 @@ public class ImageComparisonPipeline {
                                .apply("FlattenSourceRows", Flatten.pCollections());
 
         // ── Pending rows (all segments in one read) ───────────────────────────
-        // Keyed by image_id::segment using the segment column already stored in
-        // the pending table — no need to know segment names at build time.
         PCollection<KV<String, TableRow>> keyedPending = pipeline
                 .apply("ReadPending",
                         BigQueryIO.readTableRows()
-                                .from(options.getPendingTable())
-                                .withMethod(BigQueryIO.TypedRead.Method.DIRECT_READ))
-                .apply("FilterPendingAge", ParDo.of(new PendingAgeFilterFn()))
+                                .fromQuery(new PendingQueryProvider(options.getPendingTable()))
+                                .usingStandardSql()
+                                .withQueryTempDataset(queryTempDataset))
                 .apply("KeyPending",
                         WithKeys.of((TableRow row) ->
                                 row.get("image_id") + "::" + row.get("segment"))
@@ -459,62 +477,100 @@ public class ImageComparisonPipeline {
         }
     }
 
-    // ── WindowFilterFn ────────────────────────────────────────────────────────
+    // ── AiSourceQueryProvider ─────────────────────────────────────────────────
 
-    /**
-     * Filters source rows to the processing window at runtime.
-     * Replaces the SQL WHERE clause that was previously in SourceQueryProvider,
-     * allowing DIRECT_READ (no temp dataset) for the AI and human reads.
-     */
-    private static final class WindowFilterFn extends DoFn<TableRow, TableRow> {
+    /** AI rows in the current processing window: {@code [windowStart, windowEnd)}. */
+    private static final class AiSourceQueryProvider
+            implements ValueProvider<String>, Serializable {
 
+        private final ValueProvider<String> table;
         private final ValueProvider<String> windowStart;
         private final ValueProvider<String> windowEnd;
 
-        private transient String resolvedStart;
-        private transient String resolvedEnd;
-
-        WindowFilterFn(ValueProvider<String> windowStart, ValueProvider<String> windowEnd) {
+        AiSourceQueryProvider(ValueProvider<String> table,
+                               ValueProvider<String> windowStart,
+                               ValueProvider<String> windowEnd) {
+            this.table       = table;
             this.windowStart = windowStart;
             this.windowEnd   = windowEnd;
         }
 
-        @Setup
-        public void setup() {
-            resolvedStart = windowStart.get();
-            resolvedEnd   = windowEnd.get();
+        @Override
+        public String get() {
+            return String.format(
+                    "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'",
+                    table.get().replace(':', '.'), windowStart.get(), windowEnd.get());
         }
 
-        @ProcessElement
-        public void processElement(ProcessContext ctx) {
-            String createdAt = (String) ctx.element().get("created_at");
-            if (createdAt == null) return;
-            if (createdAt.compareTo(resolvedStart) >= 0
-                    && createdAt.compareTo(resolvedEnd) < 0) {
-                ctx.output(ctx.element());
-            }
+        @Override
+        public boolean isAccessible() {
+            return table.isAccessible() && windowStart.isAccessible() && windowEnd.isAccessible();
         }
     }
 
-    // ── PendingAgeFilterFn ────────────────────────────────────────────────────
+    // ── HumanSourceQueryProvider ──────────────────────────────────────────────
 
     /**
-     * Filters pending rows to those within the max-wait window.
-     * Replaces the SQL WHERE clause that was previously in PendingQueryProvider.
+     * Human rows from {@code lookbackDays} before {@code windowEnd} up to
+     * {@code windowEnd}. The wide lookback allows late-arriving human payloads
+     * to match pending AI rows from earlier windows.
      */
-    private static final class PendingAgeFilterFn extends DoFn<TableRow, TableRow> {
+    private static final class HumanSourceQueryProvider
+            implements ValueProvider<String>, Serializable {
 
-        @ProcessElement
-        public void processElement(ProcessContext ctx) {
-            String firstSeenAt = (String) ctx.element().get("first_seen_at");
-            if (firstSeenAt == null) return;
-            java.time.Instant cutoff = java.time.Instant.now()
-                    .minus(FilterAndPairFn.MAX_WAIT_DAYS, java.time.temporal.ChronoUnit.DAYS);
-            try {
-                if (java.time.Instant.parse(firstSeenAt).isAfter(cutoff)) {
-                    ctx.output(ctx.element());
-                }
-            } catch (Exception ignored) {}
+        private final ValueProvider<String>  table;
+        private final ValueProvider<String>  windowEnd;
+        private final ValueProvider<Integer> lookbackDays;
+
+        HumanSourceQueryProvider(ValueProvider<String>  table,
+                                  ValueProvider<String>  windowEnd,
+                                  ValueProvider<Integer> lookbackDays) {
+            this.table        = table;
+            this.windowEnd    = windowEnd;
+            this.lookbackDays = lookbackDays;
+        }
+
+        @Override
+        public String get() {
+            return String.format(
+                    "SELECT * FROM `%s`"
+                    + " WHERE created_at >= TIMESTAMP_SUB('%s', INTERVAL %d DAY)"
+                    + " AND created_at < '%s'",
+                    table.get().replace(':', '.'),
+                    windowEnd.get(), lookbackDays.get(),
+                    windowEnd.get());
+        }
+
+        @Override
+        public boolean isAccessible() {
+            return table.isAccessible() && windowEnd.isAccessible() && lookbackDays.isAccessible();
+        }
+    }
+
+    // ── PendingQueryProvider ──────────────────────────────────────────────────
+
+    /** All pending rows younger than {@link FilterAndPairFn#MAX_WAIT_DAYS}. */
+    private static final class PendingQueryProvider
+            implements ValueProvider<String>, Serializable {
+
+        private final ValueProvider<String> table;
+
+        PendingQueryProvider(ValueProvider<String> table) {
+            this.table = table;
+        }
+
+        @Override
+        public String get() {
+            return String.format(
+                    "SELECT * FROM `%s`"
+                    + " WHERE first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
+                    + " INTERVAL %d DAY)",
+                    table.get().replace(':', '.'), FilterAndPairFn.MAX_WAIT_DAYS);
+        }
+
+        @Override
+        public boolean isAccessible() {
+            return table.isAccessible();
         }
     }
 

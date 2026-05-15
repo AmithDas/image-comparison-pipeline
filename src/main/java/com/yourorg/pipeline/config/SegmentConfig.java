@@ -74,6 +74,15 @@ public class SegmentConfig implements Serializable {
      */
     public List<SegmentTypeMapping> segmentTypeMappings;
 
+    /**
+     * Per-segment AI field aliases. Keys are AI payload field name prefixes (dot-notation);
+     * values are the corresponding human field name prefixes. Applied before comparison so
+     * AI fields are matched against the correct human fields.
+     * Example: {@code {"documentType": "document"}} causes AI field {@code documentType}
+     * (and children like {@code documentType.code}) to be compared against {@code document}.
+     */
+    public Map<String, String> aiFieldAliases;
+
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
         this(null, null, null, null, null);

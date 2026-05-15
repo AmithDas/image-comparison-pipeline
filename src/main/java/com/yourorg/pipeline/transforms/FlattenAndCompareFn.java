@@ -69,10 +69,12 @@ public class FlattenAndCompareFn
     private final ValueProvider<String> kmsKeyPath;
     private final ValueProvider<String> segmentConfigsJson;
 
-    // segment name → (aiField → humanField); resolved in @Setup
+    // segment name → (aiField → humanField) from fieldMappings; resolved in @Setup
     private transient Map<String, Map<String, String>> aiToHumanBySegment;
     // segment name → (root node → segment_type label); resolved in @Setup
     private transient Map<String, Map<String, String>> rootToLabelBySegment;
+    // segment name → (aiFieldPrefix → humanFieldPrefix) from aiFieldAliases; resolved in @Setup
+    private transient Map<String, Map<String, String>> fieldAliasMap;
 
     public FlattenAndCompareFn(ValueProvider<String> firestoreCollection,
                                 ValueProvider<String> kmsKeyPath,
@@ -88,8 +90,9 @@ public class FlattenAndCompareFn
                 firestoreCollection.get(),
                 kmsKeyPath.get());
 
-        aiToHumanBySegment  = new HashMap<>();
+        aiToHumanBySegment   = new HashMap<>();
         rootToLabelBySegment = new HashMap<>();
+        fieldAliasMap        = new HashMap<>();
         List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
         for (SegmentConfig seg : segments) {
             if (seg.fieldMappings != null) {
@@ -111,6 +114,9 @@ public class FlattenAndCompareFn
                     }
                 }
                 if (!rootToLabel.isEmpty()) rootToLabelBySegment.put(seg.name, rootToLabel);
+            }
+            if (seg.aiFieldAliases != null && !seg.aiFieldAliases.isEmpty()) {
+                fieldAliasMap.put(seg.name, seg.aiFieldAliases);
             }
         }
     }
@@ -301,10 +307,17 @@ public class FlattenAndCompareFn
     }
 
     /**
-     * Derives an AI-side array match key map from the human-side base map.
-     * Where a field mapping renames an AI key field (e.g. docProofs.DocumentType →
-     * docProofs.document), the AI map substitutes the AI field name so the extractor
-     * finds the correct field when building the match key for AI array elements.
+     * Derives an AI-side array match key map from the human-side base map,
+     * accounting for both fieldMappings (aiToHuman) and aiFieldAliases.
+     *
+     * <p>For each entry in {@code base} (humanArrayRoot → humanMatchKeyField), if an
+     * alias renames that root on the AI side (e.g. AI uses "documentType" where human
+     * uses "document"), the result also contains the AI root so the extractor finds the
+     * correct match-key field in the AI payload.
+     *
+     * <p>{@code aiToHuman} maps AI field prefix → human field prefix (from fieldMappings).
+     * {@code aliases} maps AI field prefix → human field prefix (from aiFieldAliases).
+     * Both are applied independently.
      */
     private static Map<String, String> buildAiArrayMatchKeys(Map<String, String> base,
                                                               Map<String, String> aiToHuman) {
@@ -326,6 +339,44 @@ public class FlattenAndCompareFn
             }
         }
         return result;
+    }
+
+    /**
+     * Returns a new map with AI field keys renamed according to {@code aliases}.
+     * Each alias entry maps an AI field prefix (dot-notation) to the human field prefix
+     * that should be used as the canonical key in output rows.
+     *
+     * <p>Both exact matches ({@code "documentType"}) and dot-prefixed children
+     * ({@code "documentType.code"}) are handled. Entries with no matching alias pass
+     * through unchanged.
+     */
+    private static Map<String, List<FieldValue>> applyAliases(
+            Map<String, List<FieldValue>> aiFields, Map<String, String> aliases) {
+        if (aliases == null || aliases.isEmpty()) return aiFields;
+        Map<String, List<FieldValue>> result = new LinkedHashMap<>();
+        for (Map.Entry<String, List<FieldValue>> entry : aiFields.entrySet()) {
+            String renamed = renameWithAliases(entry.getKey(), aliases);
+            result.merge(renamed, entry.getValue(), (existing, incoming) -> {
+                List<FieldValue> merged = new ArrayList<>(existing);
+                merged.addAll(incoming);
+                return merged;
+            });
+        }
+        return result;
+    }
+
+    private static String renameWithAliases(String key, Map<String, String> aliases) {
+        for (Map.Entry<String, String> alias : aliases.entrySet()) {
+            String aiPrefix    = alias.getKey();
+            String humanPrefix = alias.getValue();
+            if (key.equals(aiPrefix)) {
+                return humanPrefix;
+            }
+            if (key.startsWith(aiPrefix + ".")) {
+                return humanPrefix + key.substring(aiPrefix.length());
+            }
+        }
+        return key;
     }
 
     private void emitRow(ProcessContext ctx,
