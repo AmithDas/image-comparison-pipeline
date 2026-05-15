@@ -1,44 +1,43 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
+import com.yourorg.pipeline.util.PayloadParser;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.values.KV;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Decrypts the {@code payload} of a source {@link TableRow}, applies an optional
- * payload-field filter, extracts the image identifier via a configurable path, and
- * emits {@code KV<"imageId::segment", row>} for downstream co-grouping.
+ * Decrypts the {@code payload} of a source {@link TableRow}, resolves its segment
+ * and side (AI vs human) from the {@code method} column, and emits
+ * {@code KV<"imageId::segment", row>} for downstream co-grouping.
  *
- * <p>The segment name is resolved at runtime by looking up the row's {@code method}
- * column in the segment config map. Rows whose method does not match any configured
- * segment are silently dropped.
+ * <h3>Routing rules</h3>
+ * <ul>
+ *   <li><b>AI rows</b>: broadcast to every segment whose {@code aiMethod} matches.
+ *       AI payloads are always plain JSON.</li>
+ *   <li><b>Human rows</b>: routed to exactly one segment by checking
+ *       {@code humanSubTypes[].discriminatorField} presence in the decrypted JSON.
+ *       Rows with no matching segment/sub-type are silently dropped.</li>
+ * </ul>
  *
- * <h3>Usage</h3>
- * <pre>
- *   // AI rows — all segments in one pass
- *   ParDo.of(DecryptAndKeyFn.forAi(firestoreCollection, kmsKeyPath,
- *                                   imageNameField, segmentConfigs))
- *
- *   // Human rows with optional payload filter
- *   ParDo.of(DecryptAndKeyFn.forHuman(firestoreCollection, kmsKeyPath,
- *                                      imageNameField, segmentConfigs,
- *                                      filterField, filterValue))
- * </pre>
- *
- * <h3>Payload filter</h3>
- * When {@code filterField} is non-blank, only rows where
- * {@code filterField == filterValue} in the decrypted payload are forwarded.
- * Pass {@code null} for {@code filterField} to disable filtering.
+ * <h3>Payload formats</h3>
+ * <ul>
+ *   <li><b>Plain JSON</b> (default): image name extracted via {@code imageNameField}.</li>
+ *   <li><b>{@code id_request}</b>: payload has the form
+ *       {@code id="<IMAGE_NAME>",request="<JSON>"}; image name comes from the
+ *       {@code id=} field.  The field {@code _human_sub_type} is injected into the
+ *       emitted row so {@link FilterAndPairFn} can route it to the correct sub-type.</li>
+ * </ul>
  */
 public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
 
@@ -48,11 +47,11 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     private final ValueProvider<String> kmsKeyPath;
     private final ValueProvider<String> imageNameField;
     private final ValueProvider<String> segmentConfigsJson;
-    private final ValueProvider<String> filterField;  // null → no filter
+    private final ValueProvider<String> filterField;
     private final ValueProvider<String> filterValue;
 
     // Resolved in @Setup; transient so they are re-initialized on each worker.
-    private transient Map<String, String> methodToSegment;
+    private transient Map<String, List<SegmentConfig>> methodToSegments;
     private transient String resolvedFilterField;
     private transient String resolvedFilterValue;
     private transient String resolvedImageNameField;
@@ -73,7 +72,6 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
 
     // ── Static factories ──────────────────────────────────────────────────────
 
-    /** No payload filter — suitable for AI rows. */
     public static DecryptAndKeyFn forAi(ValueProvider<String> firestoreCollection,
                                          ValueProvider<String> kmsKeyPath,
                                          ValueProvider<String> imageNameField,
@@ -82,10 +80,6 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
                 firestoreCollection, kmsKeyPath, imageNameField, segmentConfigsJson, null, null);
     }
 
-    /**
-     * With an optional payload filter — suitable for human rows.
-     * Pass {@code null} for {@code filterField} to skip filtering.
-     */
     public static DecryptAndKeyFn forHuman(ValueProvider<String> firestoreCollection,
                                             ValueProvider<String> kmsKeyPath,
                                             ValueProvider<String> imageNameField,
@@ -106,11 +100,7 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
                 kmsKeyPath.get());
 
         List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
-        methodToSegment = new HashMap<>();
-        for (SegmentConfig s : segments) {
-            methodToSegment.put(s.aiMethod,    s.name);
-            methodToSegment.put(s.humanMethod, s.name);
-        }
+        methodToSegments = SegmentConfig.buildMethodToSegmentsMap(segments);
 
         resolvedFilterField    = filterField  != null ? filterField.get()  : null;
         resolvedFilterValue    = filterValue  != null ? filterValue.get()  : null;
@@ -121,39 +111,108 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
     public void processElement(ProcessContext ctx) {
         TableRow row    = ctx.element();
         String   method = (String) row.get("method");
-        String   segment = methodToSegment.get(method);
-
-        if (segment == null) {
-            return; // method not in any configured segment — drop
-        }
+        List<SegmentConfig> candidates = methodToSegments.get(method);
+        if (candidates == null) return;
 
         String keyId     = (String) row.get("key_id");
         String decrypted = BarricadeEncryptionUtil.decrypt(keyId, (String) row.get("payload"));
 
-        // Optional payload-field filter (typically applied to human rows).
-        if (resolvedFilterField != null && !resolvedFilterField.isBlank()) {
-            String actual = JsonFieldExtractor.extractField(decrypted, resolvedFilterField);
-            if (!resolvedFilterValue.equals(actual)) {
-                LOG.debug("Skipping row: payload.{} = '{}', expected '{}'",
-                        resolvedFilterField, actual, resolvedFilterValue);
-                return;
+        for (SegmentConfig seg : candidates) {
+            if (seg.aiMethod.equals(method)) {
+                // AI row — broadcast to every segment that lists this aiMethod.
+                // AI payloads are always plain JSON; no sub-type tagging needed.
+                String imageKey = extractImageKeyPlainJson(decrypted, keyId, method, seg.name);
+                if (imageKey == null) continue;
+                ctx.output(KV.of(imageKey + "::" + seg.name, row));
+
+            } else if (seg.humanMethod.equals(method)) {
+                // Resolve inner JSON and image key.
+                // For id_request format (explicit via payloadFormat, or auto-detected when
+                // humanSubTypes is defined), both come from PayloadParser.
+                // For plain JSON, innerJson == decrypted and imageKey comes from imageNameField.
+                boolean tryIdRequest = seg.isIdRequestFormat() || hasSubTypes(seg);
+                PayloadParser.Parsed parsed = tryIdRequest ? PayloadParser.parse(decrypted) : null;
+                boolean isIdRequest = (parsed != null);
+
+                if (seg.isIdRequestFormat() && !isIdRequest) {
+                    LOG.warn("Could not parse id_request payload for segment={} key_id={} method={}",
+                            seg.name, keyId, method);
+                    continue;
+                }
+
+                String innerJson = isIdRequest ? parsed.json() : decrypted;
+
+                if (!passesFilter(innerJson)) continue;
+
+                String subTypeName = resolveSubType(innerJson, seg);
+                if (subTypeName == null) continue;
+
+                String imageKey = isIdRequest
+                        ? parsed.imageId()
+                        : JsonFieldExtractor.extractField(decrypted, resolvedImageNameField);
+                if (imageKey == null || imageKey.isBlank()) {
+                    LOG.warn("Skipping row: image name absent for key_id={} method={} segment={}",
+                            keyId, method, seg.name);
+                    continue;
+                }
+
+                TableRow emitted = row.clone();
+                emitted.set("_human_sub_type", subTypeName);
+                ctx.output(KV.of(imageKey.trim().toLowerCase() + "::" + seg.name, emitted));
             }
         }
+    }
 
-        String imageName = JsonFieldExtractor.extractField(decrypted, resolvedImageNameField);
-        if (imageName == null || imageName.isBlank()) {
-            LOG.warn("Skipping row: field '{}' is absent or null for key_id={} method={}",
-                    resolvedImageNameField, keyId, method);
-            return;
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static boolean hasSubTypes(SegmentConfig seg) {
+        return seg.humanSubTypes != null && !seg.humanSubTypes.isEmpty();
+    }
+
+    private String extractImageKeyPlainJson(String decrypted, String keyId,
+                                             String method, String segName) {
+        String name = JsonFieldExtractor.extractField(decrypted, resolvedImageNameField);
+        if (name == null || name.isBlank()) {
+            LOG.warn("Skipping AI row: field '{}' absent for key_id={} method={} segment={}",
+                    resolvedImageNameField, keyId, method, segName);
+            return null;
         }
+        return name.trim().toLowerCase();
+    }
 
-        // Normalise case and whitespace so AI and human rows for the same image
-        // always produce the same key regardless of how each system stores the name.
-        String imageKey = imageName.trim().toLowerCase();
-        LOG.debug("DecryptAndKey: key_id={} method={} imageKey={} segment={}",
-                keyId, method, imageKey, segment);
+    /**
+     * Returns the sub-type name whose discriminatorField is present in the JSON.
+     * Returns {@code "default"} for segments with no humanSubTypes.
+     * Returns {@code null} if no sub-type matches (row is dropped).
+     */
+    private static String resolveSubType(String json, SegmentConfig seg) {
+        if (seg.humanSubTypes == null || seg.humanSubTypes.isEmpty()) return "default";
+        JsonObject obj;
+        try {
+            obj = JsonParser.parseString(json).getAsJsonObject();
+        } catch (Exception e) {
+            LOG.warn("Failed to parse human payload JSON for sub-type resolution: {}", e.getMessage());
+            return null;
+        }
+        for (SegmentConfig.HumanSubType st : seg.humanSubTypes) {
+            if (obj.has(st.discriminatorField)) {
+                LOG.debug("Resolved sub-type '{}' via discriminator '{}'", st.name, st.discriminatorField);
+                return st.name;
+            }
+        }
+        LOG.warn("No humanSubType discriminator matched in payload. Segment has sub-types: {}",
+                seg.humanSubTypes);
+        return null;
+    }
 
-        // Key format: "imageId::segment"
-        ctx.output(KV.of(imageKey + "::" + segment, row));
+    private boolean passesFilter(String json) {
+        if (resolvedFilterField == null || resolvedFilterField.isBlank()) return true;
+        String actual = JsonFieldExtractor.extractField(json, resolvedFilterField);
+        if (!resolvedFilterValue.equals(actual)) {
+            LOG.debug("Skipping row: payload.{} = '{}', expected '{}'",
+                    resolvedFilterField, actual, resolvedFilterValue);
+            return false;
+        }
+        return true;
     }
 }

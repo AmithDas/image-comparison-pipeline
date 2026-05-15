@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,8 +33,7 @@ import java.util.TreeSet;
  *
  * <h3>Array comparison</h3>
  * <ul>
- *   <li><b>Keyed segments</b> ({@code ARRAY_MATCH_KEYS}): matched by composite key.</li>
- *   <li><b>Child arrays</b>: inherit the parent segment's key.</li>
+ *   <li><b>Keyed arrays</b> ({@code ARRAY_MATCH_KEYS}): matched by composite key.</li>
  *   <li><b>Positional arrays</b>: compared position-by-position.</li>
  *   <li><b>Scalar fields</b>: one row, {@code array_key} is {@code null}.</li>
  * </ul>
@@ -57,6 +57,8 @@ public class FlattenAndCompareFn
     // ── Array match keys ──────────────────────────────────────────────────────
 
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
+            "documentDetails", "docType",
+            "docProofs",       "document"
             // "tradeline", "accountnumber-customernumber-dateopened-code",
             // "address",   "addresstype"
     );
@@ -67,8 +69,10 @@ public class FlattenAndCompareFn
     private final ValueProvider<String> kmsKeyPath;
     private final ValueProvider<String> segmentConfigsJson;
 
-    // Resolved in @Setup; transient so it is re-initialized on each worker.
-    private transient Map<String, Map<String, String>> fieldAliasMap;
+    // segment name → (aiField → humanField); resolved in @Setup
+    private transient Map<String, Map<String, String>> aiToHumanBySegment;
+    // segment name → (root node → segment_type label); resolved in @Setup
+    private transient Map<String, Map<String, String>> rootToLabelBySegment;
 
     public FlattenAndCompareFn(ValueProvider<String> firestoreCollection,
                                 ValueProvider<String> kmsKeyPath,
@@ -83,8 +87,32 @@ public class FlattenAndCompareFn
         BarricadeEncryptionUtil.configure(
                 firestoreCollection.get(),
                 kmsKeyPath.get());
+
+        aiToHumanBySegment  = new HashMap<>();
+        rootToLabelBySegment = new HashMap<>();
         List<SegmentConfig> segments = SegmentConfig.parse(segmentConfigsJson.get());
-        fieldAliasMap = SegmentConfig.buildFieldAliasMap(segments);
+        for (SegmentConfig seg : segments) {
+            if (seg.fieldMappings != null) {
+                Map<String, String> aiToHuman = new HashMap<>();
+                for (SegmentConfig.FieldMapping fm : seg.fieldMappings) {
+                    if (fm.aiField != null && fm.humanField != null) {
+                        aiToHuman.put(fm.aiField, fm.humanField);
+                    }
+                }
+                if (!aiToHuman.isEmpty()) aiToHumanBySegment.put(seg.name, aiToHuman);
+            }
+            if (seg.segmentTypeMappings != null) {
+                Map<String, String> rootToLabel = new HashMap<>();
+                for (SegmentConfig.SegmentTypeMapping stm : seg.segmentTypeMappings) {
+                    if (stm.roots != null && stm.segmentType != null) {
+                        for (String root : stm.roots) {
+                            rootToLabel.put(root, stm.segmentType);
+                        }
+                    }
+                }
+                if (!rootToLabel.isEmpty()) rootToLabelBySegment.put(seg.name, rootToLabel);
+            }
+        }
     }
 
     // ── Processing ────────────────────────────────────────────────────────────
@@ -124,10 +152,13 @@ public class FlattenAndCompareFn
         String humanPayload = BarricadeEncryptionUtil.decrypt(keyId, str(human.get("payload")));
         String aiPayload    = BarricadeEncryptionUtil.decrypt(keyId, str(ai.get("payload")));
 
+        Map<String, String> aiToHuman = aiToHumanBySegment.getOrDefault(segment, Collections.emptyMap());
+        Map<String, String> aiMatchKeys = buildAiArrayMatchKeys(ARRAY_MATCH_KEYS, aiToHuman);
+
         Map<String, List<FieldValue>> humanFields =
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
         Map<String, List<FieldValue>> aiFields =
-                JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS);
+                applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, aiMatchKeys), segment);
 
         // Apply per-segment AI field aliases (e.g. documentType → document).
         Map<String, String> aliases = fieldAliasMap.getOrDefault(segment, Collections.emptyMap());
@@ -202,32 +233,99 @@ public class FlattenAndCompareFn
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /**
-     * Renames keys in {@code fields} according to {@code aliases}.
-     * An alias {@code "documentType" → "document"} renames both the exact key
-     * {@code "documentType"} and any nested path like {@code "documentType.code"}.
+     * Renames AI field keys using the segment's fieldMappings so that
+     * cross-named root objects (e.g. AI "consumer" ↔ human "verifiedData")
+     * are compared against each other.
+     *
+     * Handles both exact matches ("consumer") and dot-prefixed children
+     * ("consumer.firstName", "consumer.dob", …). The human field name is
+     * used as the canonical key so field_name in the output matches the
+     * human side.
      */
-    private static Map<String, List<FieldValue>> applyAliases(
-            Map<String, List<FieldValue>> fields, Map<String, String> aliases) {
+    private Map<String, List<FieldValue>> applyFieldMappings(
+            Map<String, List<FieldValue>> aiFields, String segment) {
+        Map<String, String> aiToHuman = aiToHumanBySegment.get(segment);
+        if (aiToHuman == null || aiToHuman.isEmpty()) return aiFields;
+
         Map<String, List<FieldValue>> result = new LinkedHashMap<>();
-        for (Map.Entry<String, List<FieldValue>> entry : fields.entrySet()) {
-            String renamed = renameField(entry.getKey(), aliases);
-            result.computeIfAbsent(renamed, k -> new ArrayList<>()).addAll(entry.getValue());
+        for (Map.Entry<String, List<FieldValue>> entry : aiFields.entrySet()) {
+            String key         = entry.getKey();
+            String renamedKey  = rename(key, aiToHuman);
+            result.merge(renamedKey, entry.getValue(), (existing, incoming) -> {
+                List<FieldValue> merged = new ArrayList<>(existing);
+                merged.addAll(incoming);
+                return merged;
+            });
         }
         return result;
     }
 
-    private static String renameField(String fieldName, Map<String, String> aliases) {
-        for (Map.Entry<String, String> alias : aliases.entrySet()) {
-            String oldPrefix = alias.getKey();
-            String newPrefix = alias.getValue();
-            if (fieldName.equals(oldPrefix)) {
-                return newPrefix;
+    /**
+     * Returns the segment_type for a flattened field, applying any configured
+     * root-node label overrides for the current segment.
+     *
+     * Raw root is:
+     *   "employments.test.test", null  → "employments"
+     *   "documentDetails",       "A"   → "documentDetails"  (keyed array)
+     *   "name",                  null  → null               (root scalar)
+     *
+     * If the raw root matches a segmentTypeMappings entry, the configured label
+     * is returned instead (e.g. "verifiedData" → "authentication").
+     */
+    private static String resolveSegmentType(String field, String arrayKey,
+                                              Map<String, String> rootToLabel) {
+        int dot = field.indexOf('.');
+        String root;
+        if (dot > 0) {
+            root = field.substring(0, dot);
+        } else if (arrayKey != null) {
+            root = field;
+        } else {
+            return null;
+        }
+        return rootToLabel.getOrDefault(root, root);
+    }
+
+    private static String rename(String key, Map<String, String> aiToHuman) {
+        for (Map.Entry<String, String> mapping : aiToHuman.entrySet()) {
+            String aiPrefix    = mapping.getKey();
+            String humanPrefix = mapping.getValue();
+            if (key.equals(aiPrefix)) {
+                return humanPrefix;
             }
-            if (fieldName.startsWith(oldPrefix + ".")) {
-                return newPrefix + fieldName.substring(oldPrefix.length());
+            if (key.startsWith(aiPrefix + ".")) {
+                return humanPrefix + key.substring(aiPrefix.length());
             }
         }
-        return fieldName;
+        return key;
+    }
+
+    /**
+     * Derives an AI-side array match key map from the human-side base map.
+     * Where a field mapping renames an AI key field (e.g. docProofs.DocumentType →
+     * docProofs.document), the AI map substitutes the AI field name so the extractor
+     * finds the correct field when building the match key for AI array elements.
+     */
+    private static Map<String, String> buildAiArrayMatchKeys(Map<String, String> base,
+                                                              Map<String, String> aiToHuman) {
+        if (aiToHuman.isEmpty()) return base;
+        Map<String, String> result = new HashMap<>(base);
+        for (Map.Entry<String, String> entry : base.entrySet()) {
+            String arrayPath     = entry.getKey();
+            String humanKeyField = entry.getValue();
+            String humanFullPath = arrayPath + "." + humanKeyField;
+            for (Map.Entry<String, String> mapping : aiToHuman.entrySet()) {
+                if (humanFullPath.equals(mapping.getValue())) {
+                    String aiFullPath = mapping.getKey();
+                    String prefix     = arrayPath + ".";
+                    if (aiFullPath.startsWith(prefix)) {
+                        result.put(arrayPath, aiFullPath.substring(prefix.length()));
+                    }
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
     private void emitRow(ProcessContext ctx,
@@ -241,6 +339,9 @@ public class FlattenAndCompareFn
         String encryptedHumanVal = BarricadeEncryptionUtil.encrypt(keyId, humanVal);
         String encryptedAiVal    = BarricadeEncryptionUtil.encrypt(keyId, aiVal);
 
+        Map<String, String> rootToLabel = rootToLabelBySegment.getOrDefault(
+                segment, Collections.emptyMap());
+
         ctx.output(new TableRow()
                 .set("image_id",         imageId)
                 .set("key_id",           keyId)
@@ -250,6 +351,7 @@ public class FlattenAndCompareFn
                 .set("human_created_at", humanCreatedAt)
                 .set("field_name",       field)
                 .set("array_key",        arrayKey)
+                .set("segment_type",     resolveSegmentType(field, arrayKey, rootToLabel))
                 .set("human_value",      encryptedHumanVal)
                 .set("ai_value",         encryptedAiVal)
                 .set("is_match",         isMatch)
