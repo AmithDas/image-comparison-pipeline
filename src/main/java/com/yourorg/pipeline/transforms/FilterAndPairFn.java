@@ -164,6 +164,18 @@ public class FilterAndPairFn
             }
         }
 
+        // Deduplicate AI rows by (created_at, key_id).
+        // The same AI payload can appear in both the current source query and the pending table
+        // (e.g. a prior run stored it as pending before a match was possible). Without dedup,
+        // the same payload enters aiRows twice, shifting every iteration index in that run —
+        // causing an image to show iteration=2 for a timestamp that was iteration=1 in another run.
+        // Source-query rows are inserted first above, so putIfAbsent preserves them over pending.
+        Map<String, GenericRecord> aiDedup = new java.util.LinkedHashMap<>();
+        for (GenericRecord ai : aiRows) {
+            String dedupKey = str(ai.get("created_at")) + "|" + str(ai.get("key_id"));
+            aiDedup.putIfAbsent(dedupKey, ai);
+        }
+        aiRows = new ArrayList<>(aiDedup.values());
         aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
 
         boolean humanComplete = isHumanComplete(seg, humanBySubType);
