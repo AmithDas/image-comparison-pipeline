@@ -137,6 +137,11 @@ public class FilterAndPairFn
             groupDaysWaited = 0;
         }
 
+        // Tracks how many AI payloads have already been matched for this image+segment
+        // across prior runs. Carried forward on the human pending row so that new AI
+        // payloads receive monotonically increasing iteration numbers.
+        long humanMatchedAiCount = 0;
+
         Map<String, GenericRecord> pendingMeta = new HashMap<>();
         for (TableRow pr : pendingRows) {
             GenericRecord p         = toPendingRecord(pr);
@@ -144,6 +149,11 @@ public class FilterAndPairFn
             String        createdAt = str(p.get("created_at"));
 
             pendingMeta.put(pType + ":" + createdAt, p);
+
+            if (pType != null && (pType.equals("human") || pType.equals("human:merged")
+                    || pType.startsWith("human:"))) {
+                humanMatchedAiCount = Math.max(humanMatchedAiCount, metaMatchedAiCount(p));
+            }
 
             if ("human:merged".equals(pType)) {
                 humanBySubType.putIfAbsent("_merged",
@@ -184,34 +194,41 @@ public class FilterAndPairFn
         if (humanComplete && aiPresent) {
             GenericRecord humanRec   = resolveHumanRecord(imageId, segment, humanBySubType, seg);
             String        humanPType = resolvedPendingType(humanBySubType, seg);
+            // Assign iterations starting from humanMatchedAiCount+1 so they are
+            // monotonically increasing across pipeline runs for the same image.
             for (int i = 0; i < aiRows.size(); i++) {
                 ctx.output(MATCHED, KV.of(
-                        imageId + "::" + segment + "::" + (i + 1),
+                        imageId + "::" + segment + "::" + (humanMatchedAiCount + i + 1),
                         KV.of(humanRec, aiRows.get(i))));
             }
-            LOG.info("Matched imageId={} segment={} — {} AI iteration(s)",
-                    imageId, segment, aiRows.size());
+            long newMatchedAiCount = humanMatchedAiCount + aiRows.size();
+            LOG.info("Matched imageId={} segment={} — {} AI iteration(s), iterations {}-{}",
+                    imageId, segment, aiRows.size(),
+                    humanMatchedAiCount + 1, newMatchedAiCount);
             String hCAt = str(humanRec.get("created_at"));
             emitPendingOrAgedOut(ctx, imageId, segment, str(humanRec.get("key_id")),
                     humanPType, str(humanRec.get("payload")), hCAt,
                     groupFirstSeen, now,
-                    metaRetryCount(pendingMeta.get(humanPType + ":" + hCAt)), groupDaysWaited);
+                    metaRetryCount(pendingMeta.get(humanPType + ":" + hCAt)), groupDaysWaited,
+                    newMatchedAiCount);
 
         } else if (humanComplete) {
             GenericRecord humanRec   = resolveHumanRecord(imageId, segment, humanBySubType, seg);
             String        humanPType = resolvedPendingType(humanBySubType, seg);
             String        hCAt       = str(humanRec.get("created_at"));
             LOG.info("Human complete, no AI — imageId={} segment={}", imageId, segment);
+            // No new AI matched — preserve humanMatchedAiCount unchanged.
             emitPendingOrAgedOut(ctx, imageId, segment, str(humanRec.get("key_id")),
                     humanPType, str(humanRec.get("payload")), hCAt,
                     groupFirstSeen, now,
-                    metaRetryCount(pendingMeta.get(humanPType + ":" + hCAt)), groupDaysWaited);
+                    metaRetryCount(pendingMeta.get(humanPType + ":" + hCAt)), groupDaysWaited,
+                    humanMatchedAiCount);
             for (GenericRecord ai : aiRows) {
                 String cAt = str(ai.get("created_at"));
                 emitPendingOrAgedOut(ctx, imageId, segment, str(ai.get("key_id")),
                         "ai", str(ai.get("payload")), cAt,
                         groupFirstSeen, now, metaRetryCount(pendingMeta.get("ai:" + cAt)),
-                        groupDaysWaited);
+                        groupDaysWaited, 0L);
             }
 
         } else if (!humanBySubType.isEmpty() || aiPresent) {
@@ -224,14 +241,14 @@ public class FilterAndPairFn
                 emitPendingOrAgedOut(ctx, imageId, segment, str(r.get("key_id")),
                         pType, str(r.get("payload")), cAt,
                         groupFirstSeen, now, metaRetryCount(pendingMeta.get(pType + ":" + cAt)),
-                        groupDaysWaited);
+                        groupDaysWaited, humanMatchedAiCount);
             }
             for (GenericRecord ai : aiRows) {
                 String cAt = str(ai.get("created_at"));
                 emitPendingOrAgedOut(ctx, imageId, segment, str(ai.get("key_id")),
                         "ai", str(ai.get("payload")), cAt,
                         groupFirstSeen, now, metaRetryCount(pendingMeta.get("ai:" + cAt)),
-                        groupDaysWaited);
+                        groupDaysWaited, 0L);
             }
 
         } else if (!pendingMeta.isEmpty()) {
@@ -245,7 +262,8 @@ public class FilterAndPairFn
                 emitPendingOrAgedOut(ctx, imageId, segment,
                         str(p.get("key_id")), str(p.get("pending_type")),
                         str(p.get("payload")), str(p.get("created_at")),
-                        firstSeen, now, metaRetryCount(p), daysWaited);
+                        firstSeen, now, metaRetryCount(p), daysWaited,
+                        metaMatchedAiCount(p));
             }
         }
     }
@@ -277,9 +295,10 @@ public class FilterAndPairFn
                                        String keyId, String pendingType,
                                        String payload, String createdAt,
                                        Instant groupFirstSeen, Instant now,
-                                       long retryCount, long daysWaited) {
+                                       long retryCount, long daysWaited,
+                                       long matchedAiCount) {
         GenericRecord row = newPendingRow(imageId, segment, keyId, pendingType,
-                payload, createdAt, groupFirstSeen, now, retryCount);
+                payload, createdAt, groupFirstSeen, now, retryCount, matchedAiCount);
         if (daysWaited >= MAX_WAIT_DAYS) {
             ctx.output(AGED_OUT, row);
         } else {
@@ -299,6 +318,12 @@ public class FilterAndPairFn
         return count != null ? ((Number) count).longValue() + 1 : 0L;
     }
 
+    private static long metaMatchedAiCount(GenericRecord meta) {
+        if (meta == null) return 0L;
+        Object count = meta.get("matched_ai_count");
+        return count != null ? ((Number) count).longValue() : 0L;
+    }
+
     private GenericRecord newPayloadRow(String imageId, String keyId,
                                          String payloadType, String payload,
                                          String createdAt) {
@@ -315,17 +340,18 @@ public class FilterAndPairFn
                                          String keyId, String pendingType,
                                          String payload, String createdAt,
                                          Instant firstSeen, Instant now,
-                                         long retryCount) {
+                                         long retryCount, long matchedAiCount) {
         GenericRecord r = new GenericData.Record(pendingSchema);
-        r.put("image_id",        imageId);
-        r.put("key_id",          keyId);
-        r.put("segment",         segment);
-        r.put("pending_type",    pendingType);
-        r.put("payload",         payload);
-        r.put("created_at",      createdAt);
-        r.put("first_seen_at",   TimestampUtil.formatInstant(firstSeen));
-        r.put("last_retried_at", TimestampUtil.formatInstant(now));
-        r.put("retry_count",     retryCount);
+        r.put("image_id",          imageId);
+        r.put("key_id",            keyId);
+        r.put("segment",           segment);
+        r.put("pending_type",      pendingType);
+        r.put("payload",           payload);
+        r.put("created_at",        createdAt);
+        r.put("first_seen_at",     TimestampUtil.formatInstant(firstSeen));
+        r.put("last_retried_at",   TimestampUtil.formatInstant(now));
+        r.put("retry_count",       retryCount);
+        r.put("matched_ai_count",  matchedAiCount);
         return r;
     }
 
@@ -337,9 +363,10 @@ public class FilterAndPairFn
         r.put("pending_type",    row.get("pending_type"));
         r.put("payload",         row.get("payload"));
         r.put("created_at",      TimestampUtil.normalizeTimestamp(str(row.get("created_at"))));
-        r.put("first_seen_at",   TimestampUtil.normalizeTimestamp(str(row.get("first_seen_at"))));
-        r.put("last_retried_at", TimestampUtil.normalizeTimestamp(str(row.get("last_retried_at"))));
-        r.put("retry_count",     parseLong(row.get("retry_count")));
+        r.put("first_seen_at",    TimestampUtil.normalizeTimestamp(str(row.get("first_seen_at"))));
+        r.put("last_retried_at",  TimestampUtil.normalizeTimestamp(str(row.get("last_retried_at"))));
+        r.put("retry_count",      parseLong(row.get("retry_count")));
+        r.put("matched_ai_count", parseLong(row.get("matched_ai_count")));
         return r;
     }
 
