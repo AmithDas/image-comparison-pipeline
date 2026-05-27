@@ -27,7 +27,7 @@
     "human_filter_field": "",
     "human_filter_value": "",
 
-    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. For combined segments (multiple human payloads per image), set payloadFormat='id_request' and list humanSubTypes with a discriminatorField per sub-type.",
+    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. For combined segments (multiple human payloads per image), list humanSubTypes with discriminatorField per sub-type. Use mergeArrayFields to concatenate shared arrays (e.g. documentProofs) across sub-types instead of replacing.",
     "segments": [
       {
         "_comment": "Standard single-payload segment.",
@@ -36,16 +36,30 @@
         "humanMethod": "controller.SubmitDispute"
       },
       {
-        "name":           "authentication",
+        "_comment": "Combined authentication + docreview segment. Authentication and docreview human payloads arrive under different method values and are merged before AI comparison. The documentProofs array is tagged per sub-type, filtered, then concatenated into the merged record.",
+        "name":           "authanddocreview",
         "aiMethod":       "auth.ai",
         "humanMethod":    "auth.human",
-        "aiFieldAliases": {"documentType": "document"}
-      },
-      {
-        "name":           "docproof",
-        "aiMethod":       "docproof.ai",
-        "humanMethod":    "docproof.human",
-        "aiFieldAliases": {"documentType": "document"}
+        "aiFieldAliases": {"documentType": "document"},
+        "mergeArrayFields":       ["documentProofs"],
+        "humanSubTypes": [
+          {
+            "_comment": "Authentication sub-type: payload contains both verifiedData and documentProofs. Stamps every documentProofs item with authenticationType=Authentication.",
+            "name":               "authentication",
+            "discriminatorField": "verifiedData",
+            "docProofsField":     "documentProofs",
+            "docProofsLabel":     "Authentication"
+          },
+          {
+            "_comment": "DocReview sub-type (merge base): payload contains documentProofs but NOT verifiedData. negativeDiscriminatorField ensures auth payloads (which also have documentProofs) are not misclassified here, regardless of sub-type ordering.",
+            "name":                      "docreview",
+            "discriminatorField":        "documentProofs",
+            "negativeDiscriminatorField": "verifiedData",
+            "docProofsField":            "documentProofs",
+            "docProofsLabel":            "Document_Review",
+            "isBase":                    true
+          }
+        ]
       }
     ]
   },

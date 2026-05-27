@@ -83,6 +83,15 @@ public class SegmentConfig implements Serializable {
      */
     public Map<String, String> aiFieldAliases;
 
+    /**
+     * Array fields that are concatenated across all human sub-types during the merge,
+     * rather than the default behaviour of only copying each sub-type's
+     * {@code discriminatorField}.  Useful when the same array (e.g. {@code documentProofs})
+     * appears in more than one sub-type payload and all items must be preserved.
+     * Example: {@code ["documentProofs"]}.
+     */
+    public List<String> mergeArrayFields;
+
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
         this(null, null, null, null, null);
@@ -156,6 +165,39 @@ public class SegmentConfig implements Serializable {
          * falls back to heuristic detection (array-valued discriminatorField wins).
          */
         public boolean isBase;
+
+        /**
+         * Optional field that must be <em>absent</em> from the payload for this sub-type
+         * to match.  Use when two sub-types share the same {@code discriminatorField} but
+         * one of them also contains an additional top-level key that the other does not.
+         * Example: both authentication and docreview payloads contain {@code documentProofs},
+         * but only authentication also contains {@code verifiedData}.  Setting
+         * {@code negativeDiscriminatorField: "verifiedData"} on docreview ensures it only
+         * matches payloads that do <em>not</em> have {@code verifiedData}, making the
+         * ordering of {@code humanSubTypes} in config irrelevant.
+         */
+        public String negativeDiscriminatorField;
+
+        /**
+         * Name of the JSON array field in this sub-type's payload that requires
+         * {@code authenticationType} tagging before the merge (e.g. {@code "documentProofs"}).
+         * Leave {@code null} to skip the transformation for this sub-type.
+         */
+        public String docProofsField;
+
+        /**
+         * The {@code authenticationType} value to stamp on each item in {@link #docProofsField}.
+         * Supported values:
+         * <ul>
+         *   <li>{@code "Authentication"} — adds {@code authenticationType:"Authentication"} to
+         *       every item in the array.</li>
+         *   <li>{@code "Document_Review"} — removes items already tagged
+         *       {@code "Authentication"}, then adds {@code authenticationType:"Document_Review"}
+         *       to remaining items that lack it.</li>
+         * </ul>
+         * Ignored when {@link #docProofsField} is {@code null}.
+         */
+        public String docProofsLabel;
 
         public HumanSubType() {}
 

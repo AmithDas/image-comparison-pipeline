@@ -195,10 +195,14 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
             return null;
         }
         for (SegmentConfig.HumanSubType st : seg.humanSubTypes) {
-            if (obj.has(st.discriminatorField)) {
-                LOG.debug("Resolved sub-type '{}' via discriminator '{}'", st.name, st.discriminatorField);
-                return st.name;
+            if (!obj.has(st.discriminatorField)) continue;
+            if (st.negativeDiscriminatorField != null && obj.has(st.negativeDiscriminatorField)) {
+                LOG.debug("Sub-type '{}' skipped — negativeDiscriminatorField '{}' is present",
+                        st.name, st.negativeDiscriminatorField);
+                continue;
             }
+            LOG.debug("Resolved sub-type '{}' via discriminator '{}'", st.name, st.discriminatorField);
+            return st.name;
         }
         LOG.warn("No humanSubType discriminator matched in payload. Segment has sub-types: {}",
                 seg.humanSubTypes);

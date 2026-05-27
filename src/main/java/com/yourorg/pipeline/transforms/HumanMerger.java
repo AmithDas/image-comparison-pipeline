@@ -1,5 +1,7 @@
 package com.yourorg.pipeline.transforms;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.yourorg.pipeline.config.SegmentConfig;
@@ -83,6 +85,28 @@ public final class HumanMerger {
             }
         }
 
+        // Build subType → HumanSubType config lookup for transformation metadata.
+        Map<String, SegmentConfig.HumanSubType> subTypeConfigMap = new LinkedHashMap<>();
+        if (seg.humanSubTypes != null) {
+            for (SegmentConfig.HumanSubType st : seg.humanSubTypes) {
+                subTypeConfigMap.put(st.name, st);
+            }
+        }
+
+        // Apply documentProofs transformation to each sub-type before merging.
+        // Rules (driven by HumanSubType.docProofsField + docProofsLabel in config):
+        //   "Authentication"   → stamp every item with authenticationType="Authentication"
+        //   "Document_Review"  → remove items already tagged "Authentication";
+        //                        add authenticationType="Document_Review" to the rest if absent
+        for (String subType : subTypeNames) {
+            JsonObject            obj   = parsedJsons.get(subType);
+            SegmentConfig.HumanSubType stCfg = subTypeConfigMap.get(subType);
+            if (obj == null || stCfg == null
+                    || stCfg.docProofsField == null || stCfg.docProofsLabel == null) continue;
+            applyDocProofsTransform(obj, stCfg.docProofsField, stCfg.docProofsLabel,
+                    imageId, subType);
+        }
+
         // Base sub-type: prefer explicit isBase=true in config; fall back to the sub-type
         // whose discriminatorField is a JSON array; last resort: alphabetically first.
         String baseSubType = null;
@@ -122,6 +146,34 @@ public final class HumanMerger {
             }
         }
 
+        // Concatenate any fields listed in mergeArrayFields across all sub-types.
+        // This handles shared arrays (e.g. documentProofs) that appear in more than one
+        // sub-type payload and must be combined rather than replaced.
+        if (seg.mergeArrayFields != null && !seg.mergeArrayFields.isEmpty()) {
+            for (String arrayField : seg.mergeArrayFields) {
+                JsonArray combined = new JsonArray();
+                // Base sub-type's items are already in `merged`; collect them first.
+                if (merged.has(arrayField) && merged.get(arrayField).isJsonArray()) {
+                    for (JsonElement el : merged.getAsJsonArray(arrayField)) {
+                        combined.add(el);
+                    }
+                }
+                // Append items from each non-base sub-type.
+                for (String subType : subTypeNames) {
+                    if (subType.equals(baseSubType)) continue;
+                    JsonObject obj = parsedJsons.get(subType);
+                    if (obj != null && obj.has(arrayField) && obj.get(arrayField).isJsonArray()) {
+                        for (JsonElement el : obj.getAsJsonArray(arrayField)) {
+                            combined.add(el);
+                        }
+                    }
+                }
+                merged.add(arrayField, combined);
+                LOG.debug("HumanMerger: merged '{}' array — {} total items for imageId={}",
+                        arrayField, combined.size(), imageId);
+            }
+        }
+
         // Re-encrypt the merged payload so FlattenAndCompareFn can decrypt normally.
         String reEncrypted = BarricadeEncryptionUtil.encrypt(keyId, merged.toString());
 
@@ -135,6 +187,77 @@ public final class HumanMerger {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Transforms the named array inside {@code payload} according to {@code label}:
+     *
+     * <ul>
+     *   <li><b>"Authentication"</b>: adds {@code authenticationType:"Authentication"} to
+     *       every item (overwriting any existing value).</li>
+     *   <li><b>"Document_Review"</b>: removes items whose existing {@code authenticationType}
+     *       equals {@code "Authentication"}, then adds {@code authenticationType:"Document_Review"}
+     *       to remaining items that do not already have it.</li>
+     * </ul>
+     *
+     * Operates in-place on {@code payload}. Non-object array elements are passed through
+     * unchanged.
+     */
+    private static void applyDocProofsTransform(JsonObject payload,
+                                                  String arrayField,
+                                                  String label,
+                                                  String imageId,
+                                                  String subType) {
+        if (!payload.has(arrayField) || !payload.get(arrayField).isJsonArray()) {
+            LOG.debug("HumanMerger: '{}' array absent for subType={} imageId={} — skipping transform",
+                    arrayField, subType, imageId);
+            return;
+        }
+
+        JsonArray original    = payload.getAsJsonArray(arrayField);
+        JsonArray transformed = new JsonArray();
+
+        if ("Authentication".equals(label)) {
+            for (JsonElement el : original) {
+                if (el.isJsonObject()) {
+                    JsonObject item = el.getAsJsonObject().deepCopy();
+                    item.addProperty("authenticationType", "Authentication");
+                    transformed.add(item);
+                } else {
+                    transformed.add(el);
+                }
+            }
+
+        } else if ("Document_Review".equals(label)) {
+            for (JsonElement el : original) {
+                if (!el.isJsonObject()) {
+                    transformed.add(el);
+                    continue;
+                }
+                JsonObject item     = el.getAsJsonObject();
+                String     existing = item.has("authenticationType")
+                        ? item.get("authenticationType").getAsString() : null;
+
+                // Drop items already tagged as Authentication — they belong to the auth sub-type.
+                if ("Authentication".equals(existing)) continue;
+
+                JsonObject copy = item.deepCopy();
+                // Stamp Document_Review if not already present.
+                if (!"Document_Review".equals(existing)) {
+                    copy.addProperty("authenticationType", "Document_Review");
+                }
+                transformed.add(copy);
+            }
+
+        } else {
+            LOG.warn("HumanMerger: unknown docProofsLabel '{}' for subType={} — no transform applied",
+                    label, subType);
+            return;
+        }
+
+        payload.add(arrayField, transformed);
+        LOG.debug("HumanMerger: applied docProofsTransform label='{}' to '{}' for subType={} imageId={} — {}/{} items kept",
+                label, arrayField, subType, imageId, transformed.size(), original.size());
+    }
 
     private static String resolveJson(String decrypted, SegmentConfig seg, String subType) {
         if (seg.isIdRequestFormat()) {
