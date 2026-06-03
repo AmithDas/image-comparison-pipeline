@@ -89,6 +89,7 @@ def _dataflow_parameters() -> dict:
         "queryTempDataset":     _PIPE["query_temp_dataset"],
         "firestoreCollection":  _PIPE["firestore_collection"],
         "kmsKeyPath":           _PIPE["kms_key_path"],
+        "codeGroupingsTable":   _PIPE["code_groupings_table"],
     }
     if _PIPE.get("human_filter_field") and _PIPE.get("human_filter_value"):
         params["humanFilterField"] = _PIPE["human_filter_field"]

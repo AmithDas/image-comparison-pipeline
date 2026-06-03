@@ -33,6 +33,7 @@ import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.Wait;
 import org.apache.beam.sdk.transforms.WithKeys;
 import org.apache.beam.sdk.transforms.join.CoGbkResult;
@@ -42,9 +43,11 @@ import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptor;
 import org.apache.beam.sdk.values.TypeDescriptors;
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -191,6 +194,13 @@ public class ImageComparisonPipeline {
         ValueProvider<String> getKmsKeyPath();
         void setKmsKeyPath(ValueProvider<String> value);
 
+        @Description("BigQuery table containing dispute code groupings loaded at worker startup. "
+                + "Schema: variant_code STRING, base_code STRING. "
+                + "Format: project:dataset.table")
+        @Validation.Required
+        ValueProvider<String> getCodeGroupingsTable();
+        void setCodeGroupingsTable(ValueProvider<String> value);
+
         @Description("How far back (in days) to read human source rows relative to windowEnd. "
                 + "Allows late-arriving human payloads to match AI rows from earlier windows. "
                 + "Default: 180.")
@@ -242,6 +252,22 @@ public class ImageComparisonPipeline {
 
         // queryTempDataset is static infrastructure — resolved at template build time.
         String queryTempDataset = options.getQueryTempDataset().get();
+
+        // ── Dispute code groupings side input ─────────────────────────────────
+        // Read once for the entire job; Beam broadcasts to all workers automatically.
+        // Schema: variant_code STRING, base_code STRING.
+        PCollectionView<Map<String, String>> codeGroupingsView = pipeline
+                .apply("ReadCodeGroupings",
+                        BigQueryIO.readTableRows()
+                                .from(options.getCodeGroupingsTable())
+                                .withMethod(BigQueryIO.TypedRead.Method.DIRECT_READ))
+                .apply("CodeGroupingsToKV",
+                        MapElements.into(TypeDescriptors.kvs(
+                                        TypeDescriptors.strings(), TypeDescriptors.strings()))
+                                .via(row -> KV.of(
+                                        (String) row.get("variant_code"),
+                                        (String) row.get("base_code"))))
+                .apply("CodeGroupingsView", View.asMap());
 
         // ── AI source rows (all segments in one read) ─────────────────────────
         PCollection<KV<String, TableRow>> keyedAi = pipeline
@@ -333,7 +359,9 @@ public class ImageComparisonPipeline {
                         ParDo.of(new FlattenAndCompareFn(
                                 options.getFirestoreCollection(),
                                 options.getKmsKeyPath(),
-                                options.getSegmentConfigs())));
+                                options.getSegmentConfigs(),
+                                codeGroupingsView))
+                                .withSideInputs(codeGroupingsView));
 
         // ── Intermediate TableRow PCollections (also used as Write inputs) ────
         PCollection<TableRow> newPendingRows = newPending

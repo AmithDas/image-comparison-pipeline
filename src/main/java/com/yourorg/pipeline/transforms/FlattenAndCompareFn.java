@@ -10,6 +10,7 @@ import org.apache.avro.generic.GenericRecord;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.PCollectionView;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -81,27 +82,15 @@ public class FlattenAndCompareFn
         CODE_FIELD_PATHS = java.util.Collections.unmodifiableSet(s);
     }
 
-    // Maps each variant dispute code to its canonical base code.
-    // Both AI and human match keys are normalised to the base code so they
-    // collapse into one comparison row instead of two.
-    // The code field value is stored as "originalCode/baseCode" for traceability.
-    // Add new mappings here as they are introduced.
-
-    static final Map<String, String> CODE_GROUPINGS;
-    static {
-        Map<String, String> m = new HashMap<>();
-        m.put("001", "005");
-        m.put("002", "005");
-        // m.put("003", "007");
-        // m.put("004", "007");
-        CODE_GROUPINGS = java.util.Collections.unmodifiableMap(m);
-    }
+    // CODE_GROUPINGS is loaded from BQ at worker startup — see @Setup.
+    // Schema: variant_code STRING, base_code STRING.
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
-    private final ValueProvider<String> firestoreCollection;
-    private final ValueProvider<String> kmsKeyPath;
-    private final ValueProvider<String> segmentConfigsJson;
+    private final ValueProvider<String>              firestoreCollection;
+    private final ValueProvider<String>              kmsKeyPath;
+    private final ValueProvider<String>              segmentConfigsJson;
+    private final PCollectionView<Map<String, String>> codeGroupingsView;
 
     // segment name → (aiField → humanField) from fieldMappings; resolved in @Setup
     private transient Map<String, Map<String, String>> aiToHumanBySegment;
@@ -112,10 +101,12 @@ public class FlattenAndCompareFn
 
     public FlattenAndCompareFn(ValueProvider<String> firestoreCollection,
                                 ValueProvider<String> kmsKeyPath,
-                                ValueProvider<String> segmentConfigsJson) {
+                                ValueProvider<String> segmentConfigsJson,
+                                PCollectionView<Map<String, String>> codeGroupingsView) {
         this.firestoreCollection = firestoreCollection;
         this.kmsKeyPath          = kmsKeyPath;
         this.segmentConfigsJson  = segmentConfigsJson;
+        this.codeGroupingsView   = codeGroupingsView;
     }
 
     @Setup
@@ -213,12 +204,13 @@ public class FlattenAndCompareFn
             aiFields = applyAliases(aiFields, aliases);
         }
 
-        // Normalise dispute-code match keys and values using the static CODE_NORM_ENTRIES.
-        // Variant codes (e.g. 001, 002) are replaced with their base code (e.g. 005) so
-        // both sides fall into the same comparison group — one row instead of two.
+        // Normalise dispute-code match keys and values.
+        // The side input is broadcast once per job by Beam and cached in worker memory —
+        // ctx.sideInput() does not trigger a remote read per element.
+        Map<String, String> codeGroupings = ctx.sideInput(codeGroupingsView);
         for (String[] entry : CODE_NORM_ENTRIES) {
-            humanFields = applyCodeNormalization(humanFields, entry[0], entry[1], CODE_GROUPINGS);
-            aiFields    = applyCodeNormalization(aiFields,    entry[0], entry[1], CODE_GROUPINGS);
+            humanFields = applyCodeNormalization(humanFields, entry[0], entry[1], codeGroupings);
+            aiFields    = applyCodeNormalization(aiFields,    entry[0], entry[1], codeGroupings);
         }
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
