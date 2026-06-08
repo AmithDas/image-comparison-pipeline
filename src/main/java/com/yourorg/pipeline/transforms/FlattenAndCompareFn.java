@@ -17,7 +17,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -57,10 +59,27 @@ public class FlattenAndCompareFn
     // ── Array match keys ──────────────────────────────────────────────────────
 
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
-            "documentDetails", "docType",
-            "docProofs",       "document",
-            "tradelines",      "accountnumber-customernumber-dateopened"
-            // "address",       "addresstype"
+            "documentDetails",                               "docType",
+            "docProofs",                                     "document",
+            "tradelines",                                    "accountnumber-customernumber-dateopened",
+            "tradelines.tradelineRequest.disputeCodes",      "code"
+            // "address",                                    "addresstype"
+    );
+
+    // ── Soft-match arrays ─────────────────────────────────────────────────────
+    // Maps array path → parent array path.
+    //
+    // Arrays listed here use exact-first, positional-fallback matching WITHIN
+    // each parent group:
+    //   1. Items whose keys exist on both sides are paired as exact matches.
+    //   2. Remaining unmatched items (per parent group, sorted by key) are paired
+    //      positionally — so a human code 007 will pair with AI code 005 when
+    //      no exact match exists, rather than producing two orphan rows.
+    //   3. Any surplus items become orphan rows (null on the other side) as usual.
+    //
+    // Each key must also appear in ARRAY_MATCH_KEYS.
+    static final Map<String, String> SOFT_MATCH_ARRAYS = Map.of(
+            "tradelines.tradelineRequest.disputeCodes", "tradelines"
     );
 
     // ── Constructor ───────────────────────────────────────────────────────────
@@ -156,6 +175,13 @@ public class FlattenAndCompareFn
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
         Map<String, List<FieldValue>> aiFields =
                 applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS), segment);
+
+        // Soft-match: remap unmatched items on both sides to a combined key
+        // "{parent}-{aiCode}/{humanCode}" so they compare as a pair instead of
+        // two orphans, and array_key in the output shows both code values.
+        Map<String, String>[] softRemaps = computeSoftMatchRemaps(humanFields, aiFields);
+        if (!softRemaps[0].isEmpty()) humanFields = applyKeyRemap(humanFields, softRemaps[0]);
+        if (!softRemaps[1].isEmpty()) aiFields    = applyKeyRemap(aiFields,    softRemaps[1]);
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",
@@ -289,6 +315,128 @@ public class FlattenAndCompareFn
             }
         }
         return key;
+    }
+
+    /**
+     * Computes soft-match key remappings for both human and AI sides.
+     *
+     * <p>For each array in {@link #SOFT_MATCH_ARRAYS}, unmatched items on each side
+     * are paired positionally within their parent group. Both sides are remapped to a
+     * combined key {@code "{parent}-{aiCode}/{humanCode}"} so the {@code array_key}
+     * in the output shows both code values, making it clear the row is a fallback-paired
+     * comparison rather than an exact key match.
+     *
+     * <p>Returns a two-element array: {@code [humanRemap, aiRemap]}.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, String>[] computeSoftMatchRemaps(
+            Map<String, List<FieldValue>> humanFields,
+            Map<String, List<FieldValue>> aiFields) {
+
+        Map<String, String> humanRemap = new HashMap<>();
+        Map<String, String> aiRemap    = new HashMap<>();
+
+        for (Map.Entry<String, String> e : SOFT_MATCH_ARRAYS.entrySet()) {
+            String arrayPath  = e.getKey();
+            String parentPath = e.getValue();
+
+            // All parent-level keys (e.g. tradeline composite keys) from both sides.
+            Set<String> parentKeys = new LinkedHashSet<>();
+            parentKeys.addAll(collectMatchKeys(humanFields, parentPath));
+            parentKeys.addAll(collectMatchKeys(aiFields,    parentPath));
+
+            Set<String> humanArrayKeys = collectMatchKeys(humanFields, arrayPath);
+            Set<String> aiArrayKeys    = collectMatchKeys(aiFields,    arrayPath);
+
+            for (String parentKey : parentKeys) {
+                String childPrefix = parentKey + "-";
+
+                // Child keys belonging to this parent group.
+                List<String> humanChildKeys = new ArrayList<>();
+                List<String> aiChildKeys    = new ArrayList<>();
+                for (String k : humanArrayKeys) { if (k.startsWith(childPrefix)) humanChildKeys.add(k); }
+                for (String k : aiArrayKeys)    { if (k.startsWith(childPrefix)) aiChildKeys.add(k); }
+                Collections.sort(humanChildKeys);
+                Collections.sort(aiChildKeys);
+
+                // Keys present on both sides → exact match, leave alone.
+                Set<String> exact = new HashSet<>(humanChildKeys);
+                exact.retainAll(new HashSet<>(aiChildKeys));
+
+                // Unmatched keys on each side (order preserved from sorted list).
+                List<String> unmatchedHuman = new ArrayList<>();
+                List<String> unmatchedAi   = new ArrayList<>();
+                for (String k : humanChildKeys) { if (!exact.contains(k)) unmatchedHuman.add(k); }
+                for (String k : aiChildKeys)    { if (!exact.contains(k)) unmatchedAi.add(k); }
+
+                // Pair positionally. Both sides remap to "{parent}-{aiCode}/{humanCode}"
+                // so array_key in the output shows both values (e.g. "acc-cust-date-005/007").
+                // Surplus items on either side keep their original key → orphan rows.
+                int pairs = Math.min(unmatchedHuman.size(), unmatchedAi.size());
+                for (int i = 0; i < pairs; i++) {
+                    String aiKey    = unmatchedAi.get(i);
+                    String humanKey = unmatchedHuman.get(i);
+                    String combined = combinedKey(parentKey, aiKey, humanKey);
+                    aiRemap.put(aiKey,    combined);
+                    humanRemap.put(humanKey, combined);
+                }
+            }
+        }
+
+        return new Map[]{humanRemap, aiRemap};
+    }
+
+    /**
+     * Builds a combined array key for a fallback-paired item:
+     * {@code "{parent}-{aiCode}/{humanCode}"} — e.g. {@code "acc-cust-date-005/007"}.
+     *
+     * <p>The code portion is extracted as everything after the last {@code -} in
+     * each full match key.
+     */
+    private static String combinedKey(String parentKey, String aiKey, String humanKey) {
+        String aiCode    = aiKey.substring(aiKey.lastIndexOf('-') + 1);
+        String humanCode = humanKey.substring(humanKey.lastIndexOf('-') + 1);
+        return parentKey + "-" + aiCode + "/" + humanCode;
+    }
+
+    /**
+     * Returns the set of distinct non-null match keys used by all {@link FieldValue}
+     * entries under {@code arrayPath} (exact path or any dot-prefixed child).
+     */
+    private static Set<String> collectMatchKeys(Map<String, List<FieldValue>> fields,
+                                                 String arrayPath) {
+        Set<String> keys   = new LinkedHashSet<>();
+        String      prefix = arrayPath + ".";
+        for (Map.Entry<String, List<FieldValue>> entry : fields.entrySet()) {
+            String field = entry.getKey();
+            if (field.equals(arrayPath) || field.startsWith(prefix)) {
+                for (FieldValue fv : entry.getValue()) {
+                    if (fv.matchKey != null) keys.add(fv.matchKey);
+                }
+            }
+        }
+        return keys;
+    }
+
+    /**
+     * Returns a new field map with match keys remapped according to {@code keyRemap}.
+     * Fields whose match keys are not in the map are left unchanged.
+     */
+    private static Map<String, List<FieldValue>> applyKeyRemap(
+            Map<String, List<FieldValue>> fields,
+            Map<String, String> keyRemap) {
+        Map<String, List<FieldValue>> result = new LinkedHashMap<>();
+        for (Map.Entry<String, List<FieldValue>> entry : fields.entrySet()) {
+            List<FieldValue> remapped = new ArrayList<>(entry.getValue().size());
+            for (FieldValue fv : entry.getValue()) {
+                String newKey = fv.matchKey != null
+                        ? keyRemap.getOrDefault(fv.matchKey, fv.matchKey)
+                        : null;
+                remapped.add(new FieldValue(newKey, fv.value));
+            }
+            result.put(entry.getKey(), remapped);
+        }
+        return result;
     }
 
     private void emitRow(ProcessContext ctx,
