@@ -22,7 +22,6 @@
     "human_lookback_days":   180,
     "firestore_collection":  "dek_store",
     "kms_key_path":          "projects/p/locations/l/keyRings/r/cryptoKeys/k",
-    "code_groupings_table":  "your-project:dataset.dispute_code_mappings",
 
     "_comment_filter": "Leave human_filter_field blank to disable payload filtering.",
     "human_filter_field": "",
@@ -38,11 +37,10 @@
       },
       {
         "_comment": "Combined authentication + docreview segment. Authentication and docreview human payloads arrive under different method values and are merged before AI comparison. The documentProofs array is tagged per sub-type, filtered, then concatenated into the merged record.",
-        "name":           "authanddocreview",
-        "aiMethod":       "auth.ai",
-        "humanMethod":    "auth.human",
-        "aiFieldAliases": {"documentType": "document"},
-        "mergeArrayFields":       ["documentProofs"],
+        "name":             "authanddocreview",
+        "aiMethod":         "auth.ai",
+        "humanMethod":      "auth.human",
+        "mergeArrayFields": ["documentProofs"],
         "humanSubTypes": [
           {
             "_comment": "Authentication sub-type: payload contains both verifiedData and documentProofs. Stamps every documentProofs item with authenticationType=Authentication.",
