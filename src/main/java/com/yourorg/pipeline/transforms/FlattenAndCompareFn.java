@@ -184,12 +184,19 @@ public class FlattenAndCompareFn
         Map<String, List<FieldValue>> aiFields =
                 applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS), segment);
 
-        // Soft-match: remap unmatched items on both sides to a combined key
-        // "{parent}-{aiCode}/{humanCode}" so they compare as a pair instead of
-        // two orphans, and array_key in the output shows both code values.
-        Map<String, String>[] softRemaps = computeSoftMatchRemaps(humanFields, aiFields);
-        if (!softRemaps[0].isEmpty()) humanFields = applyKeyRemap(humanFields, softRemaps[0]);
-        if (!softRemaps[1].isEmpty()) aiFields    = applyKeyRemap(aiFields,    softRemaps[1]);
+        // Soft-match: for each configured array, compute exact-first / positional-fallback
+        // remaps and apply them scoped to that array path only.  Processing each array
+        // independently prevents two arrays that share the same parent key prefix (e.g.
+        // credit.dob.disputCodes and credit.ssn.disputCodes both under "asdasd") from
+        // clobbering each other's remaps or leaking remaps across sibling arrays.
+        for (Map.Entry<String, String> softEntry : SOFT_MATCH_ARRAYS.entrySet()) {
+            String arrayPath  = softEntry.getKey();
+            String parentPath = softEntry.getValue();
+            Map<String, String>[] remaps =
+                    computeSoftMatchRemapsForArray(humanFields, aiFields, arrayPath, parentPath);
+            if (!remaps[0].isEmpty()) humanFields = applyKeyRemap(humanFields, arrayPath, remaps[0]);
+            if (!remaps[1].isEmpty()) aiFields    = applyKeyRemap(aiFields,    arrayPath, remaps[1]);
+        }
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",
@@ -326,52 +333,56 @@ public class FlattenAndCompareFn
     }
 
     /**
-     * Computes soft-match key remappings for both human and AI sides.
+     * Computes soft-match key remappings for a single array.
      *
-     * <p>For each array in {@link #SOFT_MATCH_ARRAYS}, unmatched items on each side
-     * are paired positionally within their parent group. Both sides are remapped to a
-     * combined key {@code "{parent}-{aiCode}/{humanCode}"} so the {@code array_key}
-     * in the output shows both code values, making it clear the row is a fallback-paired
-     * comparison rather than an exact key match.
+     * <p>Unmatched items on each side are paired positionally within their parent group.
+     * Both sides are remapped to a combined key {@code "{parent}-{aiCode}-{humanCode}"}
+     * so the {@code array_key} in the output shows both code values, making it clear the
+     * row is a fallback-paired comparison rather than an exact key match.
+     *
+     * <p>Callers must process each array independently and apply the resulting remaps
+     * <em>scoped to that array path only</em> (via {@link #applyKeyRemap(Map, String, Map)})
+     * to prevent sibling arrays that share the same parent prefix from overwriting each
+     * other's remaps.
      *
      * <p>Returns a two-element array: {@code [humanRemap, aiRemap]}.
      */
     @SuppressWarnings("unchecked")
-    private static Map<String, String>[] computeSoftMatchRemaps(
+    private static Map<String, String>[] computeSoftMatchRemapsForArray(
             Map<String, List<FieldValue>> humanFields,
-            Map<String, List<FieldValue>> aiFields) {
+            Map<String, List<FieldValue>> aiFields,
+            String arrayPath,
+            String parentPath) {
 
         Map<String, String> humanRemap = new HashMap<>();
         Map<String, String> aiRemap    = new HashMap<>();
 
-        for (Map.Entry<String, String> e : SOFT_MATCH_ARRAYS.entrySet()) {
-            String arrayPath  = e.getKey();
-            String parentPath = e.getValue();
+        Set<String> humanArrayKeys = collectMatchKeys(humanFields, arrayPath);
+        Set<String> aiArrayKeys    = collectMatchKeys(aiFields,    arrayPath);
 
-            Set<String> humanArrayKeys = collectMatchKeys(humanFields, arrayPath);
-            Set<String> aiArrayKeys    = collectMatchKeys(aiFields,    arrayPath);
-
-            if (parentPath.isEmpty()) {
-                // No keyed parent — treat all items as one group.
-                processGroup("", new ArrayList<>(humanArrayKeys), new ArrayList<>(aiArrayKeys),
-                             humanRemap, aiRemap);
-            } else {
-                // Group by parent key to prevent cross-group pairing.
-                Stream.concat(
-                        collectMatchKeys(humanFields, parentPath).stream(),
-                        collectMatchKeys(aiFields,    parentPath).stream())
-                    .collect(Collectors.toCollection(LinkedHashSet::new))
-                    .forEach(parentKey -> {
-                        String childPrefix = parentKey + "-";
-                        List<String> humanChildKeys = humanArrayKeys.stream()
-                                .filter(k -> k.startsWith(childPrefix))
-                                .collect(Collectors.toList());
-                        List<String> aiChildKeys = aiArrayKeys.stream()
-                                .filter(k -> k.startsWith(childPrefix))
-                                .collect(Collectors.toList());
-                        processGroup(parentKey, humanChildKeys, aiChildKeys, humanRemap, aiRemap);
-                    });
-            }
+        if (parentPath.isEmpty()) {
+            // No keyed parent — treat all items as one group.
+            processGroup("", new ArrayList<>(humanArrayKeys), new ArrayList<>(aiArrayKeys),
+                         humanRemap, aiRemap);
+        } else {
+            // Group by parent key to prevent cross-group pairing.
+            // Only use top-level parent keys (the direct key of the parent object/array,
+            // e.g. "asdasd" for credit keyed by customerNumber) to avoid spurious groups
+            // from deeper match keys that also appear under the parent path.
+            Set<String> humanParentKeys = collectMatchKeys(humanFields, parentPath);
+            Set<String> aiParentKeys    = collectMatchKeys(aiFields,    parentPath);
+            Stream.concat(humanParentKeys.stream(), aiParentKeys.stream())
+                .collect(Collectors.toCollection(LinkedHashSet::new))
+                .forEach(parentKey -> {
+                    String childPrefix = parentKey + "-";
+                    List<String> humanChildKeys = humanArrayKeys.stream()
+                            .filter(k -> k.startsWith(childPrefix))
+                            .collect(Collectors.toList());
+                    List<String> aiChildKeys = aiArrayKeys.stream()
+                            .filter(k -> k.startsWith(childPrefix))
+                            .collect(Collectors.toList());
+                    processGroup(parentKey, humanChildKeys, aiChildKeys, humanRemap, aiRemap);
+                });
         }
 
         return new Map[]{humanRemap, aiRemap};
@@ -467,22 +478,35 @@ public class FlattenAndCompareFn
     }
 
     /**
-     * Returns a new field map with match keys remapped according to {@code keyRemap}.
-     * Fields whose match keys are not in the map are left unchanged.
+     * Returns a new field map with match keys remapped according to {@code keyRemap},
+     * but <em>only</em> for fields that belong to {@code arrayPath} (i.e. the field
+     * path equals {@code arrayPath} or starts with {@code arrayPath + "."}).
+     *
+     * <p>Scoping the remap to a specific array path prevents sibling arrays that happen
+     * to share the same match key values (e.g. {@code credit.dob.disputCodes} and
+     * {@code credit.ssn.disputCodes} both using code {@code "604"}) from having their
+     * keys inadvertently rewritten by another array's soft-match pass.
      */
     private static Map<String, List<FieldValue>> applyKeyRemap(
             Map<String, List<FieldValue>> fields,
+            String arrayPath,
             Map<String, String> keyRemap) {
+        String prefix = arrayPath + ".";
         return fields.entrySet().stream()
                 .collect(Collectors.toMap(
                         Map.Entry::getKey,
-                        e -> e.getValue().stream()
-                                .map(fv -> new FieldValue(
-                                        fv.matchKey != null
-                                                ? keyRemap.getOrDefault(fv.matchKey, fv.matchKey)
-                                                : null,
-                                        fv.value))
-                                .collect(Collectors.toList()),
+                        e -> {
+                            String field = e.getKey();
+                            boolean inArray = field.equals(arrayPath) || field.startsWith(prefix);
+                            if (!inArray) return e.getValue();
+                            return e.getValue().stream()
+                                    .map(fv -> new FieldValue(
+                                            fv.matchKey != null
+                                                    ? keyRemap.getOrDefault(fv.matchKey, fv.matchKey)
+                                                    : null,
+                                            fv.value))
+                                    .collect(Collectors.toList());
+                        },
                         (a, b) -> a,
                         LinkedHashMap::new));
     }

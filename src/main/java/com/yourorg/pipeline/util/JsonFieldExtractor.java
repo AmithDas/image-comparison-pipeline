@@ -184,7 +184,7 @@ public final class JsonFieldExtractor {
         try {
             JsonElement root = JsonParser.parseString(json);
             if (root.isJsonObject()) {
-                flattenObject(root.getAsJsonObject(), "", null, result, arrayMatchKeys);
+                flattenObject(root.getAsJsonObject(), "", null, false, result, arrayMatchKeys);
             } else {
                 List<FieldValue> list = new ArrayList<>();
                 list.add(new FieldValue(null, root.isJsonNull() ? null : root.toString()));
@@ -201,20 +201,30 @@ public final class JsonFieldExtractor {
     /**
      * Recursively flattens a JSON object.
      *
-     * @param inheritedMatchKey the match key propagated from the nearest enclosing
-     *                          keyed-array element ({@code null} at the root or inside
-     *                          a positional array)
+     * @param inheritedMatchKey  the match key propagated from the nearest enclosing
+     *                           keyed-array element ({@code null} at the root or inside
+     *                           a positional array)
+     * @param ownKeyAlreadySet   {@code true} when this call was made by
+     *                           {@link #flattenArray} in key-based mode — the array
+     *                           already extracted the element key into
+     *                           {@code inheritedMatchKey}, so the object-level key
+     *                           extraction block must be skipped to prevent doubling.
+     *                           {@code false} in all other cases.
      */
     private static void flattenObject(JsonObject obj, String prefix,
                                       String inheritedMatchKey,
+                                      boolean ownKeyAlreadySet,
                                       Map<String, List<FieldValue>> result,
                                       Map<String, String> arrayMatchKeys) {
-        // If this object path is configured with a key field, extract the key value
-        // and incorporate it into inheritedMatchKey for all children.
-        // This lets a plain JSON object (not an array) act as a keying context —
-        // e.g. a "credit" object keyed by "customerNumber" so its nested
-        // disputeCodes items carry "asdasd-001" instead of just "001".
-        if (!prefix.isEmpty()) {
+        // If this object path is configured with a key field AND the key was not
+        // already extracted by a parent flattenArray call for the same path, extract
+        // it now and incorporate it into inheritedMatchKey for all children.
+        // This lets a plain JSON object act as a keying context — e.g. a "credit"
+        // object keyed by "customerNumber" so its nested disputeCodes items carry
+        // "asdasd-001" instead of just "001".
+        // When credit is a JSON array, flattenArray already sets inheritedMatchKey to
+        // the element's customerNumber; ownKeyAlreadySet prevents re-extraction here.
+        if (!prefix.isEmpty() && !ownKeyAlreadySet) {
             String objKeyField = arrayMatchKeys.get(prefix);
             if (objKeyField != null) {
                 String objKey = extractKeyValue(obj, objKeyField, prefix);
@@ -231,7 +241,8 @@ public final class JsonFieldExtractor {
             JsonElement val = entry.getValue();
 
             if (val.isJsonObject()) {
-                flattenObject(val.getAsJsonObject(), key, inheritedMatchKey, result, arrayMatchKeys);
+                flattenObject(val.getAsJsonObject(), key, inheritedMatchKey, false,
+                              result, arrayMatchKeys);
             } else if (val.isJsonArray()) {
                 flattenArray(val.getAsJsonArray(), key, inheritedMatchKey, result, arrayMatchKeys);
             } else if (val.isJsonNull()) {
@@ -273,7 +284,9 @@ public final class JsonFieldExtractor {
                     keyValue = inheritedMatchKey + "-" + keyValue;
                 }
                 if (el.isJsonObject()) {
-                    flattenObject(el.getAsJsonObject(), prefix, keyValue, result, arrayMatchKeys);
+                    // ownKeyAlreadySet=true: the element's key is already in keyValue;
+                    // flattenObject must not extract it a second time for the same path.
+                    flattenObject(el.getAsJsonObject(), prefix, keyValue, true, result, arrayMatchKeys);
                 } else {
                     result.computeIfAbsent(prefix, k -> new ArrayList<>())
                           .add(new FieldValue(keyValue, el.isJsonNull() ? null : el.getAsString()));
@@ -289,7 +302,7 @@ public final class JsonFieldExtractor {
             for (JsonElement el : elements) {
                 if (el.isJsonObject()) {
                     Map<String, List<FieldValue>> temp = new LinkedHashMap<>();
-                    flattenObject(el.getAsJsonObject(), prefix, inheritedMatchKey,
+                    flattenObject(el.getAsJsonObject(), prefix, inheritedMatchKey, false,
                                   temp, arrayMatchKeys);
                     temp.forEach((k, vals) ->
                             result.computeIfAbsent(k, x -> new ArrayList<>()).addAll(vals));
