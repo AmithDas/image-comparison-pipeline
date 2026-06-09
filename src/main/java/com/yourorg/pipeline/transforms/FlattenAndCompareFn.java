@@ -17,16 +17,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
-import java.util.stream.Stream;
 
 /**
  * Flattens both JSON payloads in a matched pair and emits one {@link TableRow}
@@ -62,32 +57,32 @@ public class FlattenAndCompareFn
     // ── Array match keys ──────────────────────────────────────────────────────
 
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.of(
-            "documentDetails",                               "docType",
-            "docProofs",                                     "document",
-            "tradelines",                                    "accountnumber-customernumber-dateopened",
-            "tradelines.tradelineRequest.disputeCodes",      "code",
-            "credit",                                        "customerNumber",
-            "credit.dob.disputeCodes",                       "code"
-            // "address",                                    "addresstype"
+            "documentDetails", "docType",
+            "docProofs",       "document",
+            "tradelines",      "accountnumber-customernumber-dateopened",
+            "credit",          "customerNumber"
+            // "address",       "addresstype"
     );
 
-    // ── Soft-match arrays ─────────────────────────────────────────────────────
-    // Maps array path → parent array path.
+    // ── Collapse arrays ───────────────────────────────────────────────────────
+    // Maps array path → field to sort elements by before concatenating.
     //
-    // Arrays listed here use exact-first, positional-fallback matching WITHIN
-    // each parent group:
-    //   1. Items whose keys exist on both sides are paired as exact matches.
-    //   2. Remaining unmatched items (per parent group, sorted by key) are paired
-    //      positionally — so a human code 007 will pair with AI code 005 when
-    //      no exact match exists, rather than producing two orphan rows.
-    //   3. Any surplus items become orphan rows (null on the other side) as usual.
+    // Arrays listed here are NOT matched element-by-element.  Instead, all
+    // elements are sorted by the given field and every scalar sub-field is
+    // collapsed into a single comma-joined value per parent match key:
     //
-    // Each key must also appear in ARRAY_MATCH_KEYS.
-    // Value is the parent keyed array path, or "" when the dispute-code array has
-    // no keyed parent (items are positional at the root level).
-    static final Map<String, String> SOFT_MATCH_ARRAYS = Map.of(
-            "tradelines.tradelineRequest.disputeCodes", "tradelines",
-            "credit.dob.disputeCodes",                 "credit"
+    //   AI   disputeCodes: [{code:"007",message:"ajk"},{code:"005",message:"abc"}]
+    //   Human disputeCodes: [{code:"007",message:"ajk"}]
+    //
+    //   → disputeCodes.code    comparison: "005,007"  vs  "007"  → mismatch
+    //   → disputeCodes.message comparison: "abc,ajk"  vs  "ajk"  → mismatch
+    //
+    // The array_key in the output is just the parent match key (tradeline
+    // composite key or credit customerNumber) — no per-code suffix.
+    static final Map<String, String> COLLAPSE_ARRAYS = Map.of(
+            "tradelines.tradelineRequest.disputeCodes", "code",
+            "credit.dob.disputeCodes",                  "code",
+            "credit.ssn.disputeCodes",                  "code"
     );
 
     // ── Constructor ───────────────────────────────────────────────────────────
@@ -180,23 +175,11 @@ public class FlattenAndCompareFn
         String aiPayload    = BarricadeEncryptionUtil.decrypt(keyId, str(ai.get("payload")));
 
         Map<String, List<FieldValue>> humanFields =
-                JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
+                JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS, COLLAPSE_ARRAYS);
         Map<String, List<FieldValue>> aiFields =
-                applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS), segment);
-
-        // Soft-match: for each configured array, compute exact-first / positional-fallback
-        // remaps and apply them scoped to that array path only.  Processing each array
-        // independently prevents two arrays that share the same parent key prefix (e.g.
-        // credit.dob.disputCodes and credit.ssn.disputCodes both under "asdasd") from
-        // clobbering each other's remaps or leaking remaps across sibling arrays.
-        for (Map.Entry<String, String> softEntry : SOFT_MATCH_ARRAYS.entrySet()) {
-            String arrayPath  = softEntry.getKey();
-            String parentPath = softEntry.getValue();
-            Map<String, String>[] remaps =
-                    computeSoftMatchRemapsForArray(humanFields, aiFields, arrayPath, parentPath);
-            if (!remaps[0].isEmpty()) humanFields = applyKeyRemap(humanFields, arrayPath, remaps[0]);
-            if (!remaps[1].isEmpty()) aiFields    = applyKeyRemap(aiFields,    arrayPath, remaps[1]);
-        }
+                applyFieldMappings(
+                        JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS, COLLAPSE_ARRAYS),
+                        segment);
 
         if (humanFields.isEmpty() && aiFields.isEmpty()) {
             LOG.warn("Both payloads empty for imageId='{}' segment='{}' — skipping",
@@ -330,185 +313,6 @@ public class FlattenAndCompareFn
             }
         }
         return key;
-    }
-
-    /**
-     * Computes soft-match key remappings for a single array.
-     *
-     * <p>Unmatched items on each side are paired positionally within their parent group.
-     * Both sides are remapped to a combined key {@code "{parent}-{aiCode}-{humanCode}"}
-     * so the {@code array_key} in the output shows both code values, making it clear the
-     * row is a fallback-paired comparison rather than an exact key match.
-     *
-     * <p>Callers must process each array independently and apply the resulting remaps
-     * <em>scoped to that array path only</em> (via {@link #applyKeyRemap(Map, String, Map)})
-     * to prevent sibling arrays that share the same parent prefix from overwriting each
-     * other's remaps.
-     *
-     * <p>Returns a two-element array: {@code [humanRemap, aiRemap]}.
-     */
-    @SuppressWarnings("unchecked")
-    private static Map<String, String>[] computeSoftMatchRemapsForArray(
-            Map<String, List<FieldValue>> humanFields,
-            Map<String, List<FieldValue>> aiFields,
-            String arrayPath,
-            String parentPath) {
-
-        Map<String, String> humanRemap = new HashMap<>();
-        Map<String, String> aiRemap    = new HashMap<>();
-
-        Set<String> humanArrayKeys = collectMatchKeys(humanFields, arrayPath);
-        Set<String> aiArrayKeys    = collectMatchKeys(aiFields,    arrayPath);
-
-        if (parentPath.isEmpty()) {
-            // No keyed parent — treat all items as one group.
-            processGroup("", new ArrayList<>(humanArrayKeys), new ArrayList<>(aiArrayKeys),
-                         humanRemap, aiRemap);
-        } else {
-            // Group by parent key to prevent cross-group pairing.
-            // Only use top-level parent keys (the direct key of the parent object/array,
-            // e.g. "asdasd" for credit keyed by customerNumber) to avoid spurious groups
-            // from deeper match keys that also appear under the parent path.
-            Set<String> humanParentKeys = collectMatchKeys(humanFields, parentPath);
-            Set<String> aiParentKeys    = collectMatchKeys(aiFields,    parentPath);
-            Stream.concat(humanParentKeys.stream(), aiParentKeys.stream())
-                .collect(Collectors.toCollection(LinkedHashSet::new))
-                .forEach(parentKey -> {
-                    String childPrefix = parentKey + "-";
-                    List<String> humanChildKeys = humanArrayKeys.stream()
-                            .filter(k -> k.startsWith(childPrefix))
-                            .collect(Collectors.toList());
-                    List<String> aiChildKeys = aiArrayKeys.stream()
-                            .filter(k -> k.startsWith(childPrefix))
-                            .collect(Collectors.toList());
-                    processGroup(parentKey, humanChildKeys, aiChildKeys, humanRemap, aiRemap);
-                });
-        }
-
-        return new Map[]{humanRemap, aiRemap};
-    }
-
-    /**
-     * Applies exact-first, positional-fallback matching for one group of child keys.
-     * Sorting is done here so callers can pass keys in any order.
-     *
-     * <ul>
-     *   <li>Exact matches  → remapped to {@code "{parent}-{code}-{code}"}</li>
-     *   <li>Fallback pairs → remapped to {@code "{parent}-{aiCode}-{humanCode}"}</li>
-     *   <li>Surplus AI     → remapped to {@code "{parent}-{aiCode}-null"}</li>
-     *   <li>Surplus human  → remapped to {@code "{parent}-null-{humanCode}"}</li>
-     * </ul>
-     */
-    private static void processGroup(String parentKey,
-                                      List<String> humanKeys,
-                                      List<String> aiKeys,
-                                      Map<String, String> humanRemap,
-                                      Map<String, String> aiRemap) {
-        List<String> sortedHuman = humanKeys.stream().sorted().collect(Collectors.toList());
-        List<String> sortedAi    = aiKeys.stream().sorted().collect(Collectors.toList());
-
-        Set<String> exact = sortedHuman.stream()
-                .filter(new HashSet<>(sortedAi)::contains)
-                .collect(Collectors.toSet());
-        exact.forEach(k -> {
-            String combined = combinedKey(parentKey, k, k);
-            aiRemap.put(k,    combined);
-            humanRemap.put(k, combined);
-        });
-
-        List<String> unmatchedHuman = sortedHuman.stream()
-                .filter(k -> !exact.contains(k)).collect(Collectors.toList());
-        List<String> unmatchedAi   = sortedAi.stream()
-                .filter(k -> !exact.contains(k)).collect(Collectors.toList());
-
-        int pairs = Math.min(unmatchedHuman.size(), unmatchedAi.size());
-        IntStream.range(0, pairs).forEach(i -> {
-            String aiKey    = unmatchedAi.get(i);
-            String humanKey = unmatchedHuman.get(i);
-            String combined = combinedKey(parentKey, aiKey, humanKey);
-            aiRemap.put(aiKey,    combined);
-            humanRemap.put(humanKey, combined);
-        });
-
-        unmatchedAi.stream().skip(pairs)
-                .forEach(aiKey -> aiRemap.put(aiKey, combinedKey(parentKey, aiKey, null)));
-        unmatchedHuman.stream().skip(pairs)
-                .forEach(humanKey -> humanRemap.put(humanKey, combinedKey(parentKey, null, humanKey)));
-    }
-
-    /**
-     * Builds a combined array key: {@code "{parent}-{aiCode}-{humanCode}"}.
-     * When {@code parentKey} is empty (no keyed parent), only the code pair is returned.
-     * Passing {@code null} for either key substitutes {@code "null"}.
-     *
-     * <p>Examples:
-     * <ul>
-     *   <li>{@code ("acc-cust-date", "acc-cust-date-005", "acc-cust-date-007")} → {@code "acc-cust-date-005-007"}</li>
-     *   <li>{@code ("", "001", "002")}                                          → {@code "001-002"}</li>
-     *   <li>{@code ("acc-cust-date", "acc-cust-date-005", null)}                → {@code "acc-cust-date-005-null"}</li>
-     *   <li>{@code ("", null, "006")}                                           → {@code "null-006"}</li>
-     * </ul>
-     */
-    private static String combinedKey(String parentKey, String aiKey, String humanKey) {
-        String aiCode    = aiKey    != null ? lastSegment(aiKey)    : "null";
-        String humanCode = humanKey != null ? lastSegment(humanKey) : "null";
-        String codePart  = aiCode + "-" + humanCode;
-        return parentKey.isEmpty() ? codePart : parentKey + "-" + codePart;
-    }
-
-    /** Extracts the portion after the last {@code -}, or the whole string if no {@code -} present. */
-    private static String lastSegment(String key) {
-        int dash = key.lastIndexOf('-');
-        return dash >= 0 ? key.substring(dash + 1) : key;
-    }
-
-    /**
-     * Returns the set of distinct non-null match keys used by all {@link FieldValue}
-     * entries under {@code arrayPath} (exact path or any dot-prefixed child).
-     */
-    private static Set<String> collectMatchKeys(Map<String, List<FieldValue>> fields,
-                                                 String arrayPath) {
-        String prefix = arrayPath + ".";
-        return fields.entrySet().stream()
-                .filter(e -> e.getKey().equals(arrayPath) || e.getKey().startsWith(prefix))
-                .flatMap(e -> e.getValue().stream())
-                .filter(fv -> fv.matchKey != null)
-                .map(fv -> fv.matchKey)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-    }
-
-    /**
-     * Returns a new field map with match keys remapped according to {@code keyRemap},
-     * but <em>only</em> for fields that belong to {@code arrayPath} (i.e. the field
-     * path equals {@code arrayPath} or starts with {@code arrayPath + "."}).
-     *
-     * <p>Scoping the remap to a specific array path prevents sibling arrays that happen
-     * to share the same match key values (e.g. {@code credit.dob.disputCodes} and
-     * {@code credit.ssn.disputCodes} both using code {@code "604"}) from having their
-     * keys inadvertently rewritten by another array's soft-match pass.
-     */
-    private static Map<String, List<FieldValue>> applyKeyRemap(
-            Map<String, List<FieldValue>> fields,
-            String arrayPath,
-            Map<String, String> keyRemap) {
-        String prefix = arrayPath + ".";
-        return fields.entrySet().stream()
-                .collect(Collectors.toMap(
-                        Map.Entry::getKey,
-                        e -> {
-                            String field = e.getKey();
-                            boolean inArray = field.equals(arrayPath) || field.startsWith(prefix);
-                            if (!inArray) return e.getValue();
-                            return e.getValue().stream()
-                                    .map(fv -> new FieldValue(
-                                            fv.matchKey != null
-                                                    ? keyRemap.getOrDefault(fv.matchKey, fv.matchKey)
-                                                    : null,
-                                            fv.value))
-                                    .collect(Collectors.toList());
-                        },
-                        (a, b) -> a,
-                        LinkedHashMap::new));
     }
 
     private void emitRow(ProcessContext ctx,
