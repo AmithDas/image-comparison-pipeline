@@ -24,6 +24,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 /**
  * Flattens both JSON payloads in a matched pair and emits one {@link TableRow}
@@ -341,62 +344,81 @@ public class FlattenAndCompareFn
             String parentPath = e.getValue();
 
             // All parent-level keys (e.g. tradeline composite keys) from both sides.
-            Set<String> parentKeys = new LinkedHashSet<>();
-            parentKeys.addAll(collectMatchKeys(humanFields, parentPath));
-            parentKeys.addAll(collectMatchKeys(aiFields,    parentPath));
+            Set<String> parentKeys = Stream.concat(
+                    collectMatchKeys(humanFields, parentPath).stream(),
+                    collectMatchKeys(aiFields,    parentPath).stream())
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
 
             Set<String> humanArrayKeys = collectMatchKeys(humanFields, arrayPath);
             Set<String> aiArrayKeys    = collectMatchKeys(aiFields,    arrayPath);
 
-            for (String parentKey : parentKeys) {
+            parentKeys.forEach(parentKey -> {
                 String childPrefix = parentKey + "-";
 
-                // Child keys belonging to this parent group.
-                List<String> humanChildKeys = new ArrayList<>();
-                List<String> aiChildKeys    = new ArrayList<>();
-                for (String k : humanArrayKeys) { if (k.startsWith(childPrefix)) humanChildKeys.add(k); }
-                for (String k : aiArrayKeys)    { if (k.startsWith(childPrefix)) aiChildKeys.add(k); }
-                Collections.sort(humanChildKeys);
-                Collections.sort(aiChildKeys);
+                // Child keys belonging to this parent group, sorted.
+                List<String> humanChildKeys = humanArrayKeys.stream()
+                        .filter(k -> k.startsWith(childPrefix))
+                        .sorted().collect(Collectors.toList());
+                List<String> aiChildKeys = aiArrayKeys.stream()
+                        .filter(k -> k.startsWith(childPrefix))
+                        .sorted().collect(Collectors.toList());
 
-                // Keys present on both sides → exact match, leave alone.
-                Set<String> exact = new HashSet<>(humanChildKeys);
-                exact.retainAll(new HashSet<>(aiChildKeys));
+                // Keys present on both sides → exact match.
+                // Still remap to "{code}-{code}" format for consistency with fallback rows.
+                Set<String> exact = humanChildKeys.stream()
+                        .filter(new HashSet<>(aiChildKeys)::contains)
+                        .collect(Collectors.toSet());
+                exact.forEach(k -> {
+                    String combined = combinedKey(parentKey, k, k);
+                    aiRemap.put(k,    combined);
+                    humanRemap.put(k, combined);
+                });
 
-                // Unmatched keys on each side (order preserved from sorted list).
-                List<String> unmatchedHuman = new ArrayList<>();
-                List<String> unmatchedAi   = new ArrayList<>();
-                for (String k : humanChildKeys) { if (!exact.contains(k)) unmatchedHuman.add(k); }
-                for (String k : aiChildKeys)    { if (!exact.contains(k)) unmatchedAi.add(k); }
+                // Unmatched keys on each side (sorted order preserved).
+                List<String> unmatchedHuman = humanChildKeys.stream()
+                        .filter(k -> !exact.contains(k)).collect(Collectors.toList());
+                List<String> unmatchedAi = aiChildKeys.stream()
+                        .filter(k -> !exact.contains(k)).collect(Collectors.toList());
 
-                // Pair positionally. Both sides remap to "{parent}-{aiCode}/{humanCode}"
-                // so array_key in the output shows both values (e.g. "acc-cust-date-005/007").
-                // Surplus items on either side keep their original key → orphan rows.
+                // Pair positionally: both sides remap to "{parent}-{aiCode}-{humanCode}".
                 int pairs = Math.min(unmatchedHuman.size(), unmatchedAi.size());
-                for (int i = 0; i < pairs; i++) {
+                IntStream.range(0, pairs).forEach(i -> {
                     String aiKey    = unmatchedAi.get(i);
                     String humanKey = unmatchedHuman.get(i);
                     String combined = combinedKey(parentKey, aiKey, humanKey);
                     aiRemap.put(aiKey,    combined);
                     humanRemap.put(humanKey, combined);
-                }
-            }
+                });
+
+                // Surplus AI items (no human counterpart) → "{aiCode}-null".
+                unmatchedAi.stream().skip(pairs)
+                        .forEach(aiKey -> aiRemap.put(aiKey, combinedKey(parentKey, aiKey, null)));
+
+                // Surplus human items (no AI counterpart) → "{humanCode}-null".
+                unmatchedHuman.stream().skip(pairs)
+                        .forEach(humanKey -> humanRemap.put(humanKey, combinedKey(parentKey, null, humanKey)));
+            });
         }
 
         return new Map[]{humanRemap, aiRemap};
     }
 
     /**
-     * Builds a combined array key for a fallback-paired item:
-     * {@code "{parent}-{aiCode}/{humanCode}"} — e.g. {@code "acc-cust-date-005/007"}.
+     * Builds a combined array key: {@code "{parent}-{aiCode}-{humanCode}"}.
      *
-     * <p>The code portion is extracted as everything after the last {@code -} in
-     * each full match key.
+     * <p>For orphan items where one side has no counterpart, pass {@code null} for
+     * that side's key. The real code is always placed first, followed by {@code "null"}:
+     * <ul>
+     *   <li>AI orphan  ({@code humanKey} is {@code null}): {@code "acc-cust-date-005-null"}</li>
+     *   <li>Human orphan ({@code aiKey} is {@code null}):  {@code "acc-cust-date-006-null"}</li>
+     * </ul>
      */
     private static String combinedKey(String parentKey, String aiKey, String humanKey) {
-        String aiCode    = aiKey.substring(aiKey.lastIndexOf('-') + 1);
-        String humanCode = humanKey.substring(humanKey.lastIndexOf('-') + 1);
-        return parentKey + "-" + aiCode + "/" + humanCode;
+        String aiCode    = aiKey    != null ? aiKey.substring(aiKey.lastIndexOf('-') + 1)       : null;
+        String humanCode = humanKey != null ? humanKey.substring(humanKey.lastIndexOf('-') + 1) : null;
+        if (aiCode == null)    return parentKey + "-" + humanCode + "-null";
+        if (humanCode == null) return parentKey + "-" + aiCode    + "-null";
+        return parentKey + "-" + aiCode + "-" + humanCode;
     }
 
     /**
@@ -405,17 +427,13 @@ public class FlattenAndCompareFn
      */
     private static Set<String> collectMatchKeys(Map<String, List<FieldValue>> fields,
                                                  String arrayPath) {
-        Set<String> keys   = new LinkedHashSet<>();
-        String      prefix = arrayPath + ".";
-        for (Map.Entry<String, List<FieldValue>> entry : fields.entrySet()) {
-            String field = entry.getKey();
-            if (field.equals(arrayPath) || field.startsWith(prefix)) {
-                for (FieldValue fv : entry.getValue()) {
-                    if (fv.matchKey != null) keys.add(fv.matchKey);
-                }
-            }
-        }
-        return keys;
+        String prefix = arrayPath + ".";
+        return fields.entrySet().stream()
+                .filter(e -> e.getKey().equals(arrayPath) || e.getKey().startsWith(prefix))
+                .flatMap(e -> e.getValue().stream())
+                .filter(fv -> fv.matchKey != null)
+                .map(fv -> fv.matchKey)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
     /**
@@ -425,18 +443,18 @@ public class FlattenAndCompareFn
     private static Map<String, List<FieldValue>> applyKeyRemap(
             Map<String, List<FieldValue>> fields,
             Map<String, String> keyRemap) {
-        Map<String, List<FieldValue>> result = new LinkedHashMap<>();
-        for (Map.Entry<String, List<FieldValue>> entry : fields.entrySet()) {
-            List<FieldValue> remapped = new ArrayList<>(entry.getValue().size());
-            for (FieldValue fv : entry.getValue()) {
-                String newKey = fv.matchKey != null
-                        ? keyRemap.getOrDefault(fv.matchKey, fv.matchKey)
-                        : null;
-                remapped.add(new FieldValue(newKey, fv.value));
-            }
-            result.put(entry.getKey(), remapped);
-        }
-        return result;
+        return fields.entrySet().stream()
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        e -> e.getValue().stream()
+                                .map(fv -> new FieldValue(
+                                        fv.matchKey != null
+                                                ? keyRemap.getOrDefault(fv.matchKey, fv.matchKey)
+                                                : null,
+                                        fv.value))
+                                .collect(Collectors.toList()),
+                        (a, b) -> a,
+                        LinkedHashMap::new));
     }
 
     private void emitRow(ProcessContext ctx,
