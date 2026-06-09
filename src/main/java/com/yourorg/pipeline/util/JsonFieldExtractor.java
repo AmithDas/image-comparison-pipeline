@@ -209,6 +209,23 @@ public final class JsonFieldExtractor {
                                       String inheritedMatchKey,
                                       Map<String, List<FieldValue>> result,
                                       Map<String, String> arrayMatchKeys) {
+        // If this object path is configured with a key field, extract the key value
+        // and incorporate it into inheritedMatchKey for all children.
+        // This lets a plain JSON object (not an array) act as a keying context —
+        // e.g. a "credit" object keyed by "customerNumber" so its nested
+        // disputeCodes items carry "asdasd-001" instead of just "001".
+        if (!prefix.isEmpty()) {
+            String objKeyField = arrayMatchKeys.get(prefix);
+            if (objKeyField != null) {
+                String objKey = extractKeyValue(obj, objKeyField, prefix);
+                if (objKey != null) {
+                    inheritedMatchKey = inheritedMatchKey != null
+                            ? inheritedMatchKey + "-" + objKey
+                            : objKey;
+                }
+            }
+        }
+
         for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
             String      key = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
             JsonElement val = entry.getValue();

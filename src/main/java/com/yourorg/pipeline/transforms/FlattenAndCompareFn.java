@@ -65,7 +65,9 @@ public class FlattenAndCompareFn
             "documentDetails",                               "docType",
             "docProofs",                                     "document",
             "tradelines",                                    "accountnumber-customernumber-dateopened",
-            "tradelines.tradelineRequest.disputeCodes",      "code"
+            "tradelines.tradelineRequest.disputeCodes",      "code",
+            "credit",                                        "customerNumber",
+            "credit.dob.disputeCodes",                       "code"
             // "address",                                    "addresstype"
     );
 
@@ -81,8 +83,11 @@ public class FlattenAndCompareFn
     //   3. Any surplus items become orphan rows (null on the other side) as usual.
     //
     // Each key must also appear in ARRAY_MATCH_KEYS.
+    // Value is the parent keyed array path, or "" when the dispute-code array has
+    // no keyed parent (items are positional at the root level).
     static final Map<String, String> SOFT_MATCH_ARRAYS = Map.of(
-            "tradelines.tradelineRequest.disputeCodes", "tradelines"
+            "tradelines.tradelineRequest.disputeCodes", "tradelines",
+            "credit.dob.disputeCodes",                 "credit"
     );
 
     // ── Constructor ───────────────────────────────────────────────────────────
@@ -343,82 +348,107 @@ public class FlattenAndCompareFn
             String arrayPath  = e.getKey();
             String parentPath = e.getValue();
 
-            // All parent-level keys (e.g. tradeline composite keys) from both sides.
-            Set<String> parentKeys = Stream.concat(
-                    collectMatchKeys(humanFields, parentPath).stream(),
-                    collectMatchKeys(aiFields,    parentPath).stream())
-                    .collect(Collectors.toCollection(LinkedHashSet::new));
-
             Set<String> humanArrayKeys = collectMatchKeys(humanFields, arrayPath);
             Set<String> aiArrayKeys    = collectMatchKeys(aiFields,    arrayPath);
 
-            parentKeys.forEach(parentKey -> {
-                String childPrefix = parentKey + "-";
-
-                // Child keys belonging to this parent group, sorted.
-                List<String> humanChildKeys = humanArrayKeys.stream()
-                        .filter(k -> k.startsWith(childPrefix))
-                        .sorted().collect(Collectors.toList());
-                List<String> aiChildKeys = aiArrayKeys.stream()
-                        .filter(k -> k.startsWith(childPrefix))
-                        .sorted().collect(Collectors.toList());
-
-                // Keys present on both sides → exact match.
-                // Still remap to "{code}-{code}" format for consistency with fallback rows.
-                Set<String> exact = humanChildKeys.stream()
-                        .filter(new HashSet<>(aiChildKeys)::contains)
-                        .collect(Collectors.toSet());
-                exact.forEach(k -> {
-                    String combined = combinedKey(parentKey, k, k);
-                    aiRemap.put(k,    combined);
-                    humanRemap.put(k, combined);
-                });
-
-                // Unmatched keys on each side (sorted order preserved).
-                List<String> unmatchedHuman = humanChildKeys.stream()
-                        .filter(k -> !exact.contains(k)).collect(Collectors.toList());
-                List<String> unmatchedAi = aiChildKeys.stream()
-                        .filter(k -> !exact.contains(k)).collect(Collectors.toList());
-
-                // Pair positionally: both sides remap to "{parent}-{aiCode}-{humanCode}".
-                int pairs = Math.min(unmatchedHuman.size(), unmatchedAi.size());
-                IntStream.range(0, pairs).forEach(i -> {
-                    String aiKey    = unmatchedAi.get(i);
-                    String humanKey = unmatchedHuman.get(i);
-                    String combined = combinedKey(parentKey, aiKey, humanKey);
-                    aiRemap.put(aiKey,    combined);
-                    humanRemap.put(humanKey, combined);
-                });
-
-                // Surplus AI items (no human counterpart) → "{aiCode}-null".
-                unmatchedAi.stream().skip(pairs)
-                        .forEach(aiKey -> aiRemap.put(aiKey, combinedKey(parentKey, aiKey, null)));
-
-                // Surplus human items (no AI counterpart) → "{humanCode}-null".
-                unmatchedHuman.stream().skip(pairs)
-                        .forEach(humanKey -> humanRemap.put(humanKey, combinedKey(parentKey, null, humanKey)));
-            });
+            if (parentPath.isEmpty()) {
+                // No keyed parent — treat all items as one group.
+                processGroup("", new ArrayList<>(humanArrayKeys), new ArrayList<>(aiArrayKeys),
+                             humanRemap, aiRemap);
+            } else {
+                // Group by parent key to prevent cross-group pairing.
+                Stream.concat(
+                        collectMatchKeys(humanFields, parentPath).stream(),
+                        collectMatchKeys(aiFields,    parentPath).stream())
+                    .collect(Collectors.toCollection(LinkedHashSet::new))
+                    .forEach(parentKey -> {
+                        String childPrefix = parentKey + "-";
+                        List<String> humanChildKeys = humanArrayKeys.stream()
+                                .filter(k -> k.startsWith(childPrefix))
+                                .collect(Collectors.toList());
+                        List<String> aiChildKeys = aiArrayKeys.stream()
+                                .filter(k -> k.startsWith(childPrefix))
+                                .collect(Collectors.toList());
+                        processGroup(parentKey, humanChildKeys, aiChildKeys, humanRemap, aiRemap);
+                    });
+            }
         }
 
         return new Map[]{humanRemap, aiRemap};
     }
 
     /**
-     * Builds a combined array key: {@code "{parent}-{aiCode}-{humanCode}"}.
+     * Applies exact-first, positional-fallback matching for one group of child keys.
+     * Sorting is done here so callers can pass keys in any order.
      *
-     * <p>For orphan items where one side has no counterpart, pass {@code null} for
-     * that side's key. The real code is always placed first, followed by {@code "null"}:
      * <ul>
-     *   <li>AI orphan  ({@code humanKey} is {@code null}): {@code "acc-cust-date-005-null"}</li>
-     *   <li>Human orphan ({@code aiKey} is {@code null}):  {@code "acc-cust-date-006-null"}</li>
+     *   <li>Exact matches  → remapped to {@code "{parent}-{code}-{code}"}</li>
+     *   <li>Fallback pairs → remapped to {@code "{parent}-{aiCode}-{humanCode}"}</li>
+     *   <li>Surplus AI     → remapped to {@code "{parent}-{aiCode}-null"}</li>
+     *   <li>Surplus human  → remapped to {@code "{parent}-null-{humanCode}"}</li>
+     * </ul>
+     */
+    private static void processGroup(String parentKey,
+                                      List<String> humanKeys,
+                                      List<String> aiKeys,
+                                      Map<String, String> humanRemap,
+                                      Map<String, String> aiRemap) {
+        List<String> sortedHuman = humanKeys.stream().sorted().collect(Collectors.toList());
+        List<String> sortedAi    = aiKeys.stream().sorted().collect(Collectors.toList());
+
+        Set<String> exact = sortedHuman.stream()
+                .filter(new HashSet<>(sortedAi)::contains)
+                .collect(Collectors.toSet());
+        exact.forEach(k -> {
+            String combined = combinedKey(parentKey, k, k);
+            aiRemap.put(k,    combined);
+            humanRemap.put(k, combined);
+        });
+
+        List<String> unmatchedHuman = sortedHuman.stream()
+                .filter(k -> !exact.contains(k)).collect(Collectors.toList());
+        List<String> unmatchedAi   = sortedAi.stream()
+                .filter(k -> !exact.contains(k)).collect(Collectors.toList());
+
+        int pairs = Math.min(unmatchedHuman.size(), unmatchedAi.size());
+        IntStream.range(0, pairs).forEach(i -> {
+            String aiKey    = unmatchedAi.get(i);
+            String humanKey = unmatchedHuman.get(i);
+            String combined = combinedKey(parentKey, aiKey, humanKey);
+            aiRemap.put(aiKey,    combined);
+            humanRemap.put(humanKey, combined);
+        });
+
+        unmatchedAi.stream().skip(pairs)
+                .forEach(aiKey -> aiRemap.put(aiKey, combinedKey(parentKey, aiKey, null)));
+        unmatchedHuman.stream().skip(pairs)
+                .forEach(humanKey -> humanRemap.put(humanKey, combinedKey(parentKey, null, humanKey)));
+    }
+
+    /**
+     * Builds a combined array key: {@code "{parent}-{aiCode}-{humanCode}"}.
+     * When {@code parentKey} is empty (no keyed parent), only the code pair is returned.
+     * Passing {@code null} for either key substitutes {@code "null"}.
+     *
+     * <p>Examples:
+     * <ul>
+     *   <li>{@code ("acc-cust-date", "acc-cust-date-005", "acc-cust-date-007")} → {@code "acc-cust-date-005-007"}</li>
+     *   <li>{@code ("", "001", "002")}                                          → {@code "001-002"}</li>
+     *   <li>{@code ("acc-cust-date", "acc-cust-date-005", null)}                → {@code "acc-cust-date-005-null"}</li>
+     *   <li>{@code ("", null, "006")}                                           → {@code "null-006"}</li>
      * </ul>
      */
     private static String combinedKey(String parentKey, String aiKey, String humanKey) {
-        String aiCode    = aiKey    != null ? aiKey.substring(aiKey.lastIndexOf('-') + 1)       : null;
-        String humanCode = humanKey != null ? humanKey.substring(humanKey.lastIndexOf('-') + 1) : null;
-        if (aiCode == null)    return parentKey + "-" + humanCode + "-null";
-        if (humanCode == null) return parentKey + "-" + aiCode    + "-null";
-        return parentKey + "-" + aiCode + "-" + humanCode;
+        String aiCode    = aiKey    != null ? lastSegment(aiKey)    : "null";
+        String humanCode = humanKey != null ? lastSegment(humanKey) : "null";
+        String codePart  = aiCode + "-" + humanCode;
+        return parentKey.isEmpty() ? codePart : parentKey + "-" + codePart;
+    }
+
+    /** Extracts the portion after the last {@code -}, or the whole string if no {@code -} present. */
+    private static String lastSegment(String key) {
+        int dash = key.lastIndexOf('-');
+        return dash >= 0 ? key.substring(dash + 1) : key;
     }
 
     /**
