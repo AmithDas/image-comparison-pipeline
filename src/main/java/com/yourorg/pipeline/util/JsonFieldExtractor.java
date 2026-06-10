@@ -161,47 +161,30 @@ public final class JsonFieldExtractor {
 
     /**
      * Flattens a JSON string using positional comparison for all arrays
-     * (no match keys or collapse configured).
+     * (no match keys configured).
      */
     public static Map<String, List<FieldValue>> flatten(String json) {
-        return flatten(json, Collections.emptyMap(), Collections.emptyMap());
-    }
-
-    /**
-     * Flattens a JSON string using key-based or positional comparison.
-     * Equivalent to {@link #flatten(String, Map, Map)} with an empty collapse map.
-     */
-    public static Map<String, List<FieldValue>> flatten(String json,
-                                                        Map<String, String> arrayMatchKeys) {
-        return flatten(json, arrayMatchKeys, Collections.emptyMap());
+        return flatten(json, Collections.emptyMap());
     }
 
     /**
      * Flattens a JSON string into a map of dot-notation paths → lists of
      * {@link FieldValue} entries.
      *
-     * @param json            raw JSON string
-     * @param arrayMatchKeys  map of dot-notation array path → field name to use as the
-     *                        match key for that array section.  Arrays not listed here
-     *                        fall back to positional comparison.
-     * @param collapseArrays  map of dot-notation array path → field name to sort by.
-     *                        Arrays listed here are collapsed into a single
-     *                        {@link FieldValue} per parent match key: elements are sorted
-     *                        by the given field, then each scalar sub-field's values are
-     *                        joined with {@code ","}.  This lets dispute-code arrays be
-     *                        compared as one concatenated string rather than row-by-row.
+     * @param json           raw JSON string
+     * @param arrayMatchKeys map of dot-notation array path → field name to use as the
+     *                       match key for that array section.  Arrays not listed here
+     *                       fall back to positional comparison.
      * @return ordered map of flattened paths to {@link FieldValue} lists
      */
     public static Map<String, List<FieldValue>> flatten(String json,
-                                                        Map<String, String> arrayMatchKeys,
-                                                        Map<String, String> collapseArrays) {
+                                                        Map<String, String> arrayMatchKeys) {
         Map<String, List<FieldValue>> result = new LinkedHashMap<>();
         if (json == null || json.isBlank()) return result;
         try {
             JsonElement root = JsonParser.parseString(json);
             if (root.isJsonObject()) {
-                flattenObject(root.getAsJsonObject(), "", null, false,
-                              result, arrayMatchKeys, collapseArrays);
+                flattenObject(root.getAsJsonObject(), "", null, false, result, arrayMatchKeys);
             } else {
                 List<FieldValue> list = new ArrayList<>();
                 list.add(new FieldValue(null, root.isJsonNull() ? null : root.toString()));
@@ -232,8 +215,7 @@ public final class JsonFieldExtractor {
                                       String inheritedMatchKey,
                                       boolean ownKeyAlreadySet,
                                       Map<String, List<FieldValue>> result,
-                                      Map<String, String> arrayMatchKeys,
-                                      Map<String, String> collapseArrays) {
+                                      Map<String, String> arrayMatchKeys) {
         // If this object path is configured with a key field AND the key was not
         // already extracted by a parent flattenArray call for the same path, extract
         // it now and incorporate it into inheritedMatchKey for all children.
@@ -260,10 +242,9 @@ public final class JsonFieldExtractor {
 
             if (val.isJsonObject()) {
                 flattenObject(val.getAsJsonObject(), key, inheritedMatchKey, false,
-                              result, arrayMatchKeys, collapseArrays);
+                              result, arrayMatchKeys);
             } else if (val.isJsonArray()) {
-                flattenArray(val.getAsJsonArray(), key, inheritedMatchKey,
-                             result, arrayMatchKeys, collapseArrays);
+                flattenArray(val.getAsJsonArray(), key, inheritedMatchKey, result, arrayMatchKeys);
             } else if (val.isJsonNull()) {
                 result.computeIfAbsent(key, k -> new ArrayList<>())
                       .add(new FieldValue(inheritedMatchKey, null));
@@ -285,54 +266,9 @@ public final class JsonFieldExtractor {
     private static void flattenArray(JsonArray arr, String prefix,
                                      String inheritedMatchKey,
                                      Map<String, List<FieldValue>> result,
-                                     Map<String, String> arrayMatchKeys,
-                                     Map<String, String> collapseArrays) {
+                                     Map<String, String> arrayMatchKeys) {
         List<JsonElement> elements = new ArrayList<>();
         arr.forEach(elements::add);
-
-        String collapseByField = collapseArrays.get(prefix);
-        if (collapseByField != null) {
-            // ── Collapse mode ────────────────────────────────────────────────
-            // Sort all elements by the nominated field (e.g. "code"), then
-            // concatenate each scalar sub-field's values with "," into a single
-            // FieldValue per parent match key.
-            //
-            // Example — AI tradeline has codes [007, 005], human has [007]:
-            //   disputeCodes.code    → FieldValue(key="acc-cust-date", value="005,007")
-            //   disputeCodes.message → FieldValue(key="acc-cust-date", value="abc,ajk")
-            // vs human:
-            //   disputeCodes.code    → FieldValue(key="acc-cust-date", value="007")
-            //   disputeCodes.message → FieldValue(key="acc-cust-date", value="ajk")
-            // Comparison: "005,007" vs "007" → mismatch (one row, not two).
-            final String sortField = collapseByField;
-            elements.sort(Comparator.comparing(el -> {
-                if (!el.isJsonObject()) return "";
-                JsonElement v = el.getAsJsonObject().get(sortField);
-                return (v != null && !v.isJsonNull() && v.isJsonPrimitive())
-                        ? v.getAsString().toLowerCase() : "";
-            }));
-
-            // Collect scalar values per sub-field, in sort order.
-            Map<String, List<String>> bySubField = new LinkedHashMap<>();
-            for (JsonElement el : elements) {
-                if (!el.isJsonObject()) continue;
-                for (Map.Entry<String, JsonElement> entry : el.getAsJsonObject().entrySet()) {
-                    String      subPath = prefix + "." + entry.getKey();
-                    JsonElement subVal  = entry.getValue();
-                    String      strVal  = subVal.isJsonNull()      ? null
-                                        : subVal.isJsonPrimitive() ? subVal.getAsString()
-                                        : subVal.toString();
-                    bySubField.computeIfAbsent(subPath, k -> new ArrayList<>())
-                              .add(strVal != null ? strVal : "");
-                }
-            }
-
-            // Write one FieldValue per sub-field with all values joined.
-            bySubField.forEach((subPath, vals) ->
-                    result.computeIfAbsent(subPath, k -> new ArrayList<>())
-                          .add(new FieldValue(inheritedMatchKey, String.join(",", vals))));
-            return;
-        }
 
         String matchKeyField = arrayMatchKeys.get(prefix);
 
@@ -351,7 +287,7 @@ public final class JsonFieldExtractor {
                     // ownKeyAlreadySet=true: the element's key is already in keyValue;
                     // flattenObject must not extract it a second time for the same path.
                     flattenObject(el.getAsJsonObject(), prefix, keyValue, true,
-                                  result, arrayMatchKeys, collapseArrays);
+                                  result, arrayMatchKeys);
                 } else {
                     result.computeIfAbsent(prefix, k -> new ArrayList<>())
                           .add(new FieldValue(keyValue, el.isJsonNull() ? null : el.getAsString()));
@@ -368,12 +304,12 @@ public final class JsonFieldExtractor {
                 if (el.isJsonObject()) {
                     Map<String, List<FieldValue>> temp = new LinkedHashMap<>();
                     flattenObject(el.getAsJsonObject(), prefix, inheritedMatchKey, false,
-                                  temp, arrayMatchKeys, collapseArrays);
+                                  temp, arrayMatchKeys);
                     temp.forEach((k, vals) ->
                             result.computeIfAbsent(k, x -> new ArrayList<>()).addAll(vals));
                 } else if (el.isJsonArray()) {
                     flattenArray(el.getAsJsonArray(), prefix, inheritedMatchKey,
-                                 result, arrayMatchKeys, collapseArrays);
+                                 result, arrayMatchKeys);
                 } else if (el.isJsonNull()) {
                     result.computeIfAbsent(prefix, k -> new ArrayList<>())
                           .add(new FieldValue(inheritedMatchKey, null));
