@@ -102,38 +102,7 @@ OPTIONS (
 
 
 -- ------------------------------------------------------------
--- 4. Pending snapshot table
---    Field-level mismatch rows for payloads still awaiting their counterpart.
---    Truncated and rewritten on every pipeline run — records disappear
---    automatically once their counterpart is matched.
---    Same schema as comparison_results; ai_iteration = 0 for all rows.
--- ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_snapshot` (
-  image_id          STRING    NOT NULL,
-  key_id            STRING    NOT NULL,
-  segment           STRING    NOT NULL,
-  ai_iteration      INT64     NOT NULL,   -- always 0 for pending snapshots
-  ai_created_at     TIMESTAMP,
-  human_created_at  TIMESTAMP,
-  field_name        STRING    NOT NULL,
-  array_key         STRING,
-  segment_type      STRING,
-  human_value       STRING,               -- populated if pending_type = 'human'
-  ai_value          STRING,               -- populated if pending_type = 'ai'
-  is_match          BOOL      NOT NULL,   -- always false
-  load_time         TIMESTAMP NOT NULL
-)
-PARTITION BY DATE(load_time)
-CLUSTER BY image_id, field_name
-OPTIONS (
-  description = "Field-level mismatch snapshot for still-pending payloads. "
-                "Full refresh (WRITE_TRUNCATE) on every pipeline run. "
-                "Records disappear once their counterpart is matched."
-);
-
-
--- ------------------------------------------------------------
--- 5. Dead-letter table
+-- 4. Dead-letter table
 --    Payloads that exceeded MAX_WAIT_DAYS (FilterAndPairFn.MAX_WAIT_DAYS)
 --    without a counterpart.
 --    Mirrors src/main/resources/avro/dead_letter_row.json.
@@ -156,7 +125,7 @@ OPTIONS (
 
 
 -- ------------------------------------------------------------
--- 6. Pipeline window lookup table
+-- 5. Pipeline window lookup table
 --    Drives the pipeline's own window management (see WindowManager /
 --    ImageComparisonPipeline.WindowValueProvider). The Dataflow job — not
 --    the Airflow DAG — claims and advances this row on each run:
