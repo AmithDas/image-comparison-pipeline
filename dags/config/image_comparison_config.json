@@ -15,7 +15,6 @@
     "output_table":           "your-project:dataset.comparison_results",
     "pending_table":          "your-project:dataset.pending_comparisons",
     "dead_letter_table":      "your-project:dataset.dead_letter_comparisons",
-    "pending_snapshot_table": "your-project:dataset.pending_snapshot",
     "query_temp_dataset":     "your-project:pipeline_temp",
 
     "image_name_field":      "queueImages[0].fileName",
