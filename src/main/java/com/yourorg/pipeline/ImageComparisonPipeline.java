@@ -6,7 +6,6 @@ import com.google.cloud.bigquery.BigQueryOptions;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
-import com.yourorg.pipeline.transforms.OrphanCompareFn;
 import com.yourorg.pipeline.util.SchemaRegistry;
 import com.yourorg.pipeline.util.SchemaUtil;
 import com.yourorg.pipeline.util.TimestampUtil;
@@ -96,7 +95,6 @@ import java.util.concurrent.ConcurrentHashMap;
  *       --outputTable=project:dataset.comparison_results \
  *       --pendingTable=project:dataset.pending_comparisons \
  *       --deadLetterTable=project:dataset.dead_letter_comparisons \
- *       --pendingSnapshotTable=project:dataset.pending_snapshot \
  *       --segmentConfigs='[...]' \
  *       --firestoreCollection=dek_store \
  *       --kmsKeyPath=projects/p/locations/l/keyRings/r/cryptoKeys/k"
@@ -151,12 +149,6 @@ public class ImageComparisonPipeline {
         @Validation.Required
         ValueProvider<String> getDeadLetterTable();
         void setDeadLetterTable(ValueProvider<String> value);
-
-        @Description("BigQuery table for the still-pending payload snapshot (WRITE_TRUNCATE). "
-                + "Format: project:dataset.table")
-        @Validation.Required
-        ValueProvider<String> getPendingSnapshotTable();
-        void setPendingSnapshotTable(ValueProvider<String> value);
 
         @Description(
                 "JSON array of segment configurations. Each entry must have: "
@@ -346,18 +338,6 @@ public class ImageComparisonPipeline {
                         MapElements.into(TypeDescriptor.of(TableRow.class))
                                    .via(r -> fromAgedOutRecord(r)));
 
-        PCollection<TableRow> agedOutResults = agedOut
-                .apply("FlattenAgedOutPayloads",
-                        ParDo.of(new OrphanCompareFn(
-                                options.getFirestoreCollection(),
-                                options.getKmsKeyPath())));
-
-        PCollection<TableRow> pendingSnapshot = newPending
-                .apply("FlattenPendingPayloads",
-                        ParDo.of(new OrphanCompareFn(
-                                options.getFirestoreCollection(),
-                                options.getKmsKeyPath())));
-
         // ── Write all outputs; capture WriteResults for advance signal ─────────
         WriteResult compWrite = comparisonResults
                 .apply("WriteResults",
@@ -383,22 +363,6 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        WriteResult agedOutWrite = agedOutResults
-                .apply("WriteAgedOutResults",
-                        BigQueryIO.writeTableRows()
-                                .to(options.getOutputTable())
-                                .withSchema(SchemaUtil.comparisonResultsSchema())
-                                .withWriteDisposition(WriteDisposition.WRITE_APPEND)
-                                .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
-
-        WriteResult snapshotWrite = pendingSnapshot
-                .apply("WritePendingSnapshot",
-                        BigQueryIO.writeTableRows()
-                                .to(options.getPendingSnapshotTable())
-                                .withSchema(SchemaUtil.comparisonResultsSchema())
-                                .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
-                                .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
-
         // ── Advance window checkpoint after all writes succeed ─────────────────
         // Wait.on blocks the trigger element until all WriteResult signals are done.
         // getSuccessfulTableLoads() fires once per BQ load job (batch FILE_LOADS);
@@ -410,9 +374,7 @@ public class ImageComparisonPipeline {
                 .apply("WaitForAllWrites", Wait.on(
                         compWrite.getSuccessfulTableLoads(),
                         pendingWrite.getSuccessfulTableLoads(),
-                        deadLetterWrite.getSuccessfulTableLoads(),
-                        agedOutWrite.getSuccessfulTableLoads(),
-                        snapshotWrite.getSuccessfulTableLoads()))
+                        deadLetterWrite.getSuccessfulTableLoads()))
                 .apply("AdvanceWindow",
                         ParDo.of(new AdvanceWindowFn(
                                 options.getLookupTable(), options.getPipelineName())));

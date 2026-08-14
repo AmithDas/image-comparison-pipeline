@@ -27,8 +27,7 @@ import java.util.Map;
  *   <li>{@code key_id}: taken from the first sub-type (alphabetical by sub-type name).</li>
  *   <li>Field collision: first sub-type wins; a WARN is logged if values differ.</li>
  *   <li>The merged payload is re-encrypted before being stored so downstream
- *       transforms ({@link FlattenAndCompareFn}, {@link OrphanCompareFn}) can
- *       decrypt it uniformly.</li>
+ *       transforms ({@link FlattenAndCompareFn}) can decrypt it uniformly.</li>
  * </ul>
  */
 public final class HumanMerger {
