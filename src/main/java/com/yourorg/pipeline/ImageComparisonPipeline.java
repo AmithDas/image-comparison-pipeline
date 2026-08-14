@@ -549,7 +549,17 @@ public class ImageComparisonPipeline {
 
     // ── PendingQueryProvider ──────────────────────────────────────────────────
 
-    /** All pending rows younger than {@link FilterAndPairFn#MAX_WAIT_DAYS}. */
+    /**
+     * All pending rows, unfiltered by age.
+     *
+     * <p>Age filtering must not happen here: {@link FilterAndPairFn} is what decides
+     * whether a pending row has aged out (>= {@link FilterAndPairFn#MAX_WAIT_DAYS})
+     * and routes it to {@code dead_letter_comparisons}. Since {@code pending_comparisons}
+     * is {@code WRITE_TRUNCATE}d from only the rows this run reads, filtering rows out
+     * of this query before they reach the DoFn would make them vanish silently instead
+     * of being dead-lettered — the row is simply absent from both the pending rewrite
+     * and the dead-letter output.
+     */
     private static final class PendingQueryProvider
             implements ValueProvider<String>, Serializable {
 
@@ -561,11 +571,7 @@ public class ImageComparisonPipeline {
 
         @Override
         public String get() {
-            return String.format(
-                    "SELECT * FROM `%s`"
-                    + " WHERE first_seen_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),"
-                    + " INTERVAL %d DAY)",
-                    table.get().replace(':', '.'), FilterAndPairFn.MAX_WAIT_DAYS);
+            return String.format("SELECT * FROM `%s`", table.get().replace(':', '.'));
         }
 
         @Override
