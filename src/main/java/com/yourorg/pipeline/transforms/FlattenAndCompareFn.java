@@ -218,7 +218,7 @@ public class FlattenAndCompareFn
 
         String aiCreatedAt    = TimestampUtil.normalizeTimestamp(str(ai.get("created_at")));
         String humanCreatedAt = TimestampUtil.normalizeTimestamp(str(human.get("created_at")));
-        String comparedAt     = TimestampUtil.formatInstant(Instant.now());
+        String loadTime       = TimestampUtil.formatInstant(Instant.now());
 
         int rowsEmitted = 0;
 
@@ -248,7 +248,7 @@ public class FlattenAndCompareFn
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
                         emitRow(ctx, imageId, segment, keyId, iteration,
-                                aiCreatedAt, humanCreatedAt, comparedAt,
+                                aiCreatedAt, humanCreatedAt, loadTime,
                                 field, matchKey, humanVal, aiVal);
                         rowsEmitted++;
                     }
@@ -259,7 +259,7 @@ public class FlattenAndCompareFn
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
                     emitRow(ctx, imageId, segment, keyId, iteration,
-                            aiCreatedAt, humanCreatedAt, comparedAt,
+                            aiCreatedAt, humanCreatedAt, loadTime,
                             field, null, humanVal, aiVal);
                     rowsEmitted++;
                 }
@@ -496,7 +496,7 @@ public class FlattenAndCompareFn
 
     private void emitRow(ProcessContext ctx,
                          String imageId, String segment, String keyId, int iteration,
-                         String aiCreatedAt, String humanCreatedAt, String comparedAt,
+                         String aiCreatedAt, String humanCreatedAt, String loadTime,
                          String field, String arrayKey,
                          String humanVal, String aiVal) {
 
@@ -520,7 +520,7 @@ public class FlattenAndCompareFn
                 .set("human_value",      encryptedHumanVal)
                 .set("ai_value",         encryptedAiVal)
                 .set("is_match",         isMatch)
-                .set("compared_at",      comparedAt));
+                .set("load_time",        loadTime));
     }
 
     private static Map<String, List<String>> groupByKey(List<FieldValue> entries) {

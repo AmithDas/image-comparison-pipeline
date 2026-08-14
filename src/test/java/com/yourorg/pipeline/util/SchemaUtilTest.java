@@ -23,7 +23,7 @@ public class SchemaUtilTest {
 
         assertEquals("TIMESTAMP", fields.get("ai_created_at").getType());
         assertEquals("TIMESTAMP", fields.get("human_created_at").getType());
-        assertEquals("TIMESTAMP", fields.get("compared_at").getType());
+        assertEquals("TIMESTAMP", fields.get("load_time").getType());
     }
 
     @Test
@@ -43,7 +43,7 @@ public class SchemaUtilTest {
         Map<String, TableFieldSchema> fields = fieldMap(SchemaUtil.comparisonResultsSchema());
 
         assertEquals("REQUIRED", fields.get("image_id").getMode());
-        assertEquals("REQUIRED", fields.get("compared_at").getMode());
+        assertEquals("REQUIRED", fields.get("load_time").getMode());
         assertEquals("NULLABLE", fields.get("ai_created_at").getMode());
         assertEquals("NULLABLE", fields.get("human_created_at").getMode());
         assertEquals("NULLABLE", fields.get("human_value").getMode());

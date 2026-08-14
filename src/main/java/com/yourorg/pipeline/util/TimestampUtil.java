@@ -29,7 +29,7 @@ import java.time.temporal.ChronoUnit;
  * <h3>The fix</h3>
  * <ul>
  *   <li>Use {@link #formatInstant(Instant)} wherever the code creates a new
- *       timestamp (e.g. {@code compared_at}, {@code aged_out_at},
+ *       timestamp (e.g. {@code load_time}, {@code aged_out_at},
  *       {@code last_retried_at}).</li>
  *   <li>Use {@link #normalizeTimestamp(String)} wherever a timestamp string
  *       is passed through from a BigQuery source row (e.g. {@code created_at},

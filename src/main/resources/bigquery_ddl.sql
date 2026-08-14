@@ -62,9 +62,9 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.comparison_results` (
   human_value       STRING,               -- Barricade-encrypted; null if field absent in human payload
   ai_value          STRING,               -- Barricade-encrypted; null if field absent in AI payload
   is_match          BOOL      NOT NULL,   -- compared on plaintext before encryption
-  compared_at       TIMESTAMP NOT NULL
+  load_time         TIMESTAMP NOT NULL
 )
-PARTITION BY DATE(compared_at)
+PARTITION BY DATE(load_time)
 CLUSTER BY image_id, field_name
 OPTIONS (
   description = "Field-level comparison results between human and AI payloads, across all segments."
@@ -121,9 +121,9 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_snapshot` (
   human_value       STRING,               -- populated if pending_type = 'human'
   ai_value          STRING,               -- populated if pending_type = 'ai'
   is_match          BOOL      NOT NULL,   -- always false
-  compared_at       TIMESTAMP NOT NULL
+  load_time         TIMESTAMP NOT NULL
 )
-PARTITION BY DATE(compared_at)
+PARTITION BY DATE(load_time)
 CLUSTER BY image_id, field_name
 OPTIONS (
   description = "Field-level mismatch snapshot for still-pending payloads. "

@@ -64,7 +64,7 @@ public class OrphanCompareFn extends DoFn<GenericRecord, TableRow> {
         String pendingType = str(record.get("pending_type")); // "human" or "ai"
         String payload     = str(record.get("payload"));
         String createdAt   = TimestampUtil.normalizeTimestamp(str(record.get("created_at")));
-        String comparedAt  = TimestampUtil.formatInstant(Instant.now());
+        String loadTime    = TimestampUtil.formatInstant(Instant.now());
 
         if (imageId == null || keyId == null || pendingType == null || payload == null) {
             LOG.warn("Skipping orphan record — missing required fields: imageId={}", imageId);
@@ -112,7 +112,7 @@ public class OrphanCompareFn extends DoFn<GenericRecord, TableRow> {
                         .set("human_value",      humanValue)
                         .set("ai_value",         aiValue)
                         .set("is_match",         false)
-                        .set("compared_at",      comparedAt));
+                        .set("load_time",        loadTime));
                 rowsEmitted++;
             }
         }
