@@ -39,6 +39,7 @@
         "name":             "authanddocreview",
         "aiMethod":         "auth.ai",
         "humanMethod":      "auth.human",
+        "payloadFormat":    "id_request",
         "mergeArrayFields": ["documentProofs"],
         "humanSubTypes": [
           {
