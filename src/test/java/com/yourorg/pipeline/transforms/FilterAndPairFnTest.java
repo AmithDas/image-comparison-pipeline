@@ -44,35 +44,68 @@ public class FilterAndPairFnTest {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    private static String payloadFor(String imageId) {
+        return "{\"image_name\":\"" + imageId + "\"}";
+    }
+
+    /** The same AI identity key FilterAndPairFn derives internally: payload + "|" + created_at. */
+    private static String aiDedupKey(String imageId, String createdAt) {
+        return payloadFor(imageId) + "|" + createdAt;
+    }
+
     /** Creates a source TableRow (payload is plain JSON — FilterAndPairFn never parses it). */
     private static TableRow sourceRow(String imageId, String method,
                                       String keyId, String createdAt) {
-        return new TableRow()
-                .set("payload",    "{\"image_name\":\"" + imageId + "\"}")
+        return sourceRow(imageId, method, keyId, createdAt, null);
+    }
+
+    private static TableRow sourceRow(String imageId, String method,
+                                      String keyId, String createdAt, String caseId) {
+        TableRow row = new TableRow()
+                .set("payload",    payloadFor(imageId))
                 .set("key_id",     keyId)
                 .set("method",     method)
                 .set("created_at", createdAt);
+        if (caseId != null) row.set("case_id", caseId);
+        return row;
     }
 
-    /** Creates a pending TableRow for a single pending record (defaults to segment "main"). */
-    private static TableRow pendingRow(String imageId, String pendingType,
-                                       String keyId, String createdAt, String firstSeenAt) {
-        return pendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt, 0L);
+    /** Creates a case (human-side) pending TableRow (defaults to segment "main"). */
+    private static TableRow casePendingRow(String imageId, String pendingType,
+                                           String keyId, String createdAt, String firstSeenAt) {
+        return casePendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt, 0L, null, null);
     }
 
-    /**
-     * Overload that lets callers control {@code retry_count} and its Java type.
-     * Pass a {@link String} to simulate BQ's {@code readTableRows()} behaviour,
-     * which returns INTEGER columns as {@code String} rather than {@code Long}.
-     */
-    private static TableRow pendingRow(String imageId, String pendingType,
-                                       String keyId, String createdAt, String firstSeenAt,
-                                       Object retryCount) {
-        return new TableRow()
+    private static TableRow casePendingRow(String imageId, String pendingType,
+                                           String keyId, String createdAt, String firstSeenAt,
+                                           Object retryCount, String caseId, String matchedAiKeys) {
+        TableRow row = new TableRow()
                 .set("image_id",        imageId)
                 .set("segment",         "main")
                 .set("pending_type",    pendingType)
-                .set("payload",         "{\"image_name\":\"" + imageId + "\"}")
+                .set("payload",         payloadFor(imageId))
+                .set("key_id",          keyId)
+                .set("created_at",      createdAt)
+                .set("first_seen_at",   firstSeenAt)
+                .set("last_retried_at", firstSeenAt)
+                .set("retry_count",     retryCount);
+        if (caseId != null) row.set("case_id", caseId);
+        if (matchedAiKeys != null) row.set("matched_ai_keys", matchedAiKeys);
+        return row;
+    }
+
+    /** Creates an AI pending (replay pool) TableRow. */
+    private static TableRow aiPendingRow(String imageId, String keyId,
+                                         String createdAt, String firstSeenAt) {
+        return aiPendingRow(imageId, keyId, createdAt, firstSeenAt, 0L);
+    }
+
+    private static TableRow aiPendingRow(String imageId, String keyId,
+                                         String createdAt, String firstSeenAt, Object retryCount) {
+        return new TableRow()
+                .set("image_id",        imageId)
+                .set("segment",         "main")
+                .set("payload",         payloadFor(imageId))
                 .set("key_id",          keyId)
                 .set("created_at",      createdAt)
                 .set("first_seen_at",   firstSeenAt)
@@ -80,41 +113,49 @@ public class FilterAndPairFnTest {
                 .set("retry_count",     retryCount);
     }
 
-    /** Wires source + pending rows through CoGroupByKey → FilterAndPairFn. */
+    /** Wires source + case pending + AI pending rows through CoGroupByKey → FilterAndPairFn. */
     private PCollectionTuple runPipeline(String imageId,
                                           List<TableRow> sourceRows,
-                                          List<TableRow> pendingRows) {
+                                          List<TableRow> casePendingRows,
+                                          List<TableRow> aiPendingRows) {
         PCollection<KV<String, TableRow>> keyedSource = pipeline
                 .apply("CreateSource", Create.of(sourceRows).withCoder(TableRowJsonCoder.of()))
                 .apply("KeySource", WithKeys.<String, TableRow>of(r -> imageId)
                         .withKeyType(TypeDescriptors.strings()));
 
-        PCollection<KV<String, TableRow>> keyedPending;
-        if (pendingRows.isEmpty()) {
-            keyedPending = pipeline.apply("CreatePending",
-                    Create.empty(KvCoder.of(StringUtf8Coder.of(), TableRowJsonCoder.of())));
-        } else {
-            keyedPending = pipeline
-                    .apply("CreatePending", Create.of(pendingRows).withCoder(TableRowJsonCoder.of()))
-                    .apply("KeyPending", WithKeys.<String, TableRow>of(r -> imageId)
-                            .withKeyType(TypeDescriptors.strings()));
-        }
+        PCollection<KV<String, TableRow>> keyedCasePending = keyRows(casePendingRows, imageId, "KeyCasePending");
+        PCollection<KV<String, TableRow>> keyedAiPending   = keyRows(aiPendingRows, imageId, "KeyAiPending");
 
         SchemaRegistry registry = SchemaRegistry.getInstance();
         String segJson = "[{\"name\":\"main\",\"aiMethod\":\"" + AI_METHOD
                 + "\",\"humanMethod\":\"" + HUMAN_METHOD + "\"}]";
         return KeyedPCollectionTuple
                 .of(FilterAndPairFn.SOURCE_TAG, keyedSource)
-                .and(FilterAndPairFn.PENDING_TAG, keyedPending)
+                .and(FilterAndPairFn.CASE_PENDING_TAG, keyedCasePending)
+                .and(FilterAndPairFn.AI_PENDING_TAG, keyedAiPending)
                 .apply("CoGroup", CoGroupByKey.create())
                 .apply("FilterAndPair",
                         ParDo.of(new FilterAndPairFn(
                                         ValueProvider.StaticValueProvider.of(segJson),
                                         registry.get(SchemaRegistry.PAYLOAD_ROW),
-                                        registry.get(SchemaRegistry.PENDING_ROW)))
+                                        registry.get(SchemaRegistry.PENDING_ROW),
+                                        registry.get(SchemaRegistry.AI_PENDING_ROW)))
                              .withOutputTags(FilterAndPairFn.MATCHED,
-                                     TupleTagList.of(FilterAndPairFn.NEW_PENDING)
-                                                 .and(FilterAndPairFn.AGED_OUT)));
+                                     TupleTagList.of(FilterAndPairFn.CASE_PENDING)
+                                                 .and(FilterAndPairFn.CASE_AGED_OUT)
+                                                 .and(FilterAndPairFn.AI_PENDING)
+                                                 .and(FilterAndPairFn.AI_AGED_OUT)));
+    }
+
+    private PCollection<KV<String, TableRow>> keyRows(List<TableRow> rows, String imageId, String stepName) {
+        if (rows.isEmpty()) {
+            return pipeline.apply("Create" + stepName,
+                    Create.empty(KvCoder.of(StringUtf8Coder.of(), TableRowJsonCoder.of())));
+        }
+        return pipeline
+                .apply("Create" + stepName, Create.of(rows).withCoder(TableRowJsonCoder.of()))
+                .apply(stepName, WithKeys.<String, TableRow>of(r -> imageId)
+                        .withKeyType(TypeDescriptors.strings()));
     }
 
     private PCollection<KV<String, KV<GenericRecord, GenericRecord>>> matched(PCollectionTuple t) {
@@ -126,27 +167,42 @@ public class FilterAndPairFnTest {
                         KvCoder.of(payloadCoder, payloadCoder)));
     }
 
-    private PCollection<GenericRecord> newPending(PCollectionTuple t) {
-        return t.get(FilterAndPairFn.NEW_PENDING)
+    private PCollection<GenericRecord> casePending(PCollectionTuple t) {
+        return t.get(FilterAndPairFn.CASE_PENDING)
                 .setCoder(AvroCoder.of(GenericRecord.class,
                         SchemaRegistry.getInstance().get(SchemaRegistry.PENDING_ROW)));
     }
 
-    private PCollection<GenericRecord> agedOut(PCollectionTuple t) {
-        return t.get(FilterAndPairFn.AGED_OUT)
+    private PCollection<GenericRecord> caseAgedOut(PCollectionTuple t) {
+        return t.get(FilterAndPairFn.CASE_AGED_OUT)
                 .setCoder(AvroCoder.of(GenericRecord.class,
                         SchemaRegistry.getInstance().get(SchemaRegistry.PENDING_ROW)));
+    }
+
+    private PCollection<GenericRecord> aiPending(PCollectionTuple t) {
+        return t.get(FilterAndPairFn.AI_PENDING)
+                .setCoder(AvroCoder.of(GenericRecord.class,
+                        SchemaRegistry.getInstance().get(SchemaRegistry.AI_PENDING_ROW)));
+    }
+
+    private PCollection<GenericRecord> aiAgedOut(PCollectionTuple t) {
+        return t.get(FilterAndPairFn.AI_AGED_OUT)
+                .setCoder(AvroCoder.of(GenericRecord.class,
+                        SchemaRegistry.getInstance().get(SchemaRegistry.AI_PENDING_ROW)));
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /**
-     * Core scenario: 1 human + 2 AI iterations arrive in the same window.
+     * Core scenario: 1 human + 2 AI iterations arrive in the same window, no case_id
+     * (single-case segment).
      *
      * Expected:
-     *  - MATCHED:     2 pairs — img001::1 (human, AI@08:00) and img001::2 (human, AI@09:00)
-     *  - NEW_PENDING: 1 record — human re-pended for future AI iterations
-     *  - AGED_OUT:    empty
+     *  - MATCHED:      2 pairs — img001::main::::1 (AI@08:00) and img001::main::::2 (AI@09:00)
+     *  - CASE_PENDING:  1 record — human re-pended for future AI iterations
+     *  - AI_PENDING:    2 records — both AI rows are retained even though matched,
+     *                    so a case discovered later could still replay against them
+     *  - *_AGED_OUT:    empty
      */
     @Test
     public void oneHumanTwoAiIterationsEmitsTwoPairsAndRependHuman() {
@@ -155,7 +211,7 @@ public class FilterAndPairFnTest {
         TableRow ai2   = sourceRow("img001", AI_METHOD,    "key1", "2026-04-01T09:00:00Z"); // later   → iter 2
 
         PCollectionTuple routed = runPipeline("img001",
-                List.of(human, ai1, ai2), List.of());
+                List.of(human, ai1, ai2), List.of(), List.of());
 
         // ── MATCHED: exactly 2 pairs ──────────────────────────────────────────
         PAssert.that(matched(routed)).satisfies(pairs -> {
@@ -165,8 +221,8 @@ public class FilterAndPairFnTest {
             assertEquals("Expected 2 matched pairs (one per AI iteration)", 2, list.size());
 
             Set<String> keys = list.stream().map(KV::getKey).collect(Collectors.toSet());
-            assertTrue("Missing pair key img001::main::1", keys.contains("img001::main::1"));
-            assertTrue("Missing pair key img001::main::2", keys.contains("img001::main::2"));
+            assertTrue("Missing pair key img001::main::::1", keys.contains("img001::main::::1"));
+            assertTrue("Missing pair key img001::main::::2", keys.contains("img001::main::::2"));
 
             // Both pairs reference the same human payload
             for (KV<String, KV<GenericRecord, GenericRecord>> pair : list) {
@@ -181,15 +237,15 @@ public class FilterAndPairFnTest {
                         pair.getValue().getValue().get("created_at").toString());
             }
             assertEquals("Iteration 1 should be the earlier AI (08:00)",
-                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::1"));
+                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::::1"));
             assertEquals("Iteration 2 should be the later AI (09:00)",
-                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::2"));
+                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::::2"));
 
             return null;
         });
 
-        // ── NEW_PENDING: human kept alive for future AI iterations ────────────
-        PAssert.that(newPending(routed)).satisfies(records -> {
+        // ── CASE_PENDING: human kept alive for future AI iterations ────────────
+        PAssert.that(casePending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
 
@@ -200,34 +256,42 @@ public class FilterAndPairFnTest {
             return null;
         });
 
-        // ── AGED_OUT: nothing should age out ─────────────────────────────────
-        PAssert.that(agedOut(routed)).empty();
+        // ── AI_PENDING: both AI rows retained even though matched ──────────────
+        PAssert.that(aiPending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("Both AI rows should still be retained for future cases", 2, list.size());
+            return null;
+        });
+
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
 
         pipeline.run().waitUntilFinish();
     }
 
     /**
      * Human arrives first, AI is pending from a prior run.
-     * Expected: 1 MATCHED pair, human re-pended.
+     * Expected: 1 MATCHED pair, human re-pended, AI row still retained.
      */
     @Test
     public void pendingAiMatchesArrivingHuman() {
-        TableRow human      = sourceRow("img002", HUMAN_METHOD, "key1", "2026-04-02T10:00:00Z");
-        TableRow pendingAi  = pendingRow("img002", "ai", "key1",
+        TableRow human     = sourceRow("img002", HUMAN_METHOD, "key1", "2026-04-02T10:00:00Z");
+        TableRow pendingAi = aiPendingRow("img002", "key1",
                 "2026-04-01T08:00:00Z", Instant.now().minusSeconds(3600).toString());
 
         PCollectionTuple routed = runPipeline("img002",
-                List.of(human), List.of(pendingAi));
+                List.of(human), List.of(), List.of(pendingAi));
 
         PAssert.that(matched(routed)).satisfies(pairs -> {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img002::main::1", list.get(0).getKey());
+            assertEquals("img002::main::::1", list.get(0).getKey());
             return null;
         });
 
-        PAssert.that(newPending(routed)).satisfies(records -> {
+        PAssert.that(casePending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals("Human should be re-pended", 1, list.size());
@@ -235,56 +299,65 @@ public class FilterAndPairFnTest {
             return null;
         });
 
-        PAssert.that(agedOut(routed)).empty();
+        PAssert.that(aiPending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("Matched AI row should still be retained", 1, list.size());
+            return null;
+        });
+
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
         pipeline.run().waitUntilFinish();
     }
 
     /**
      * AI arrives alone — no human in source or pending.
-     * Expected: 0 MATCHED, 1 NEW_PENDING (the AI iteration).
+     * Expected: 0 MATCHED, 1 AI_PENDING (the AI iteration), 0 CASE_PENDING.
      */
     @Test
     public void aiOnlyEmitsNewPending() {
         TableRow ai = sourceRow("img003", AI_METHOD, "key1", "2026-04-01T08:00:00Z");
 
-        PCollectionTuple routed = runPipeline("img003", List.of(ai), List.of());
+        PCollectionTuple routed = runPipeline("img003", List.of(ai), List.of(), List.of());
 
         PAssert.that(matched(routed)).empty();
+        PAssert.that(casePending(routed)).empty();
 
-        PAssert.that(newPending(routed)).satisfies(records -> {
+        PAssert.that(aiPending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals("Expected 1 pending AI row", 1, list.size());
-            assertEquals("ai", list.get(0).get("pending_type").toString());
             return null;
         });
 
-        PAssert.that(agedOut(routed)).empty();
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
         pipeline.run().waitUntilFinish();
     }
 
     /**
-     * AI has been pending for more than MAX_WAIT_DAYS with no human.
-     * Expected: 0 MATCHED, 0 NEW_PENDING, 1 AGED_OUT.
+     * AI has been pending for more than MAX_WAIT_DAYS with no case ever matching it.
+     * Expected: 0 MATCHED, 0 AI_PENDING, 1 AI_AGED_OUT — aged independently of any case.
      */
     @Test
     public void agedOutAiRoutesToDeadLetter() {
         String oldTimestamp = Instant.now()
                 .minus(FilterAndPairFn.MAX_WAIT_DAYS + 1, ChronoUnit.DAYS)
                 .toString();
-        TableRow staleAi = pendingRow("img004", "ai", "key1",
-                "2026-03-01T08:00:00Z", oldTimestamp);
+        TableRow staleAi = aiPendingRow("img004", "key1", "2026-03-01T08:00:00Z", oldTimestamp);
 
-        PCollectionTuple routed = runPipeline("img004", List.of(), List.of(staleAi));
+        PCollectionTuple routed = runPipeline("img004", List.of(), List.of(), List.of(staleAi));
 
         PAssert.that(matched(routed)).empty();
-        PAssert.that(newPending(routed)).empty();
+        PAssert.that(aiPending(routed)).empty();
+        PAssert.that(casePending(routed)).empty();
+        PAssert.that(caseAgedOut(routed)).empty();
 
-        PAssert.that(agedOut(routed)).satisfies(records -> {
+        PAssert.that(aiAgedOut(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
-            assertEquals("Expected 1 aged-out row", 1, list.size());
-            assertEquals("ai", list.get(0).get("pending_type").toString());
+            assertEquals("Expected 1 aged-out AI row", 1, list.size());
             return null;
         });
 
@@ -293,34 +366,32 @@ public class FilterAndPairFnTest {
 
     /**
      * BQ's readTableRows() returns INTEGER columns as String, not Long.
-     * On the second execution the pending row read back from BQ will have
+     * On the second execution the AI pending row read back from BQ will have
      * retry_count = "1" (String).  This must not throw a ClassCastException.
      *
-     * Expected: 1 MATCHED pair, human re-pended with retry_count incremented.
+     * Expected: 1 MATCHED pair, human re-pended with retry_count 0 (unrelated to the
+     * AI row's own retry count).
      */
     @Test
     public void retryCountAsStringDoesNotThrow() {
         TableRow human = sourceRow("img005", HUMAN_METHOD, "key1", "2026-04-03T10:00:00Z");
         // Simulate BQ returning retry_count as a String (second run round-trip)
-        TableRow pendingAi = pendingRow("img005", "ai", "key1",
+        TableRow pendingAi = aiPendingRow("img005", "key1",
                 "2026-04-02T08:00:00Z", Instant.now().minusSeconds(3600).toString(),
                 "1" /* String, not Long */);
 
         PCollectionTuple routed = runPipeline("img005",
-                List.of(human), List.of(pendingAi));
+                List.of(human), List.of(), List.of(pendingAi));
 
         PAssert.that(matched(routed)).satisfies(pairs -> {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img005::main::1", list.get(0).getKey());
+            assertEquals("img005::main::::1", list.get(0).getKey());
             return null;
         });
 
-        // Human should be re-pended. retry_count is 0 because the human arrived
-        // from the source table (no prior pending meta for it); the AI pending
-        // row's retry_count does not transfer to the human.
-        PAssert.that(newPending(routed)).satisfies(records -> {
+        PAssert.that(casePending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals(1, list.size());
@@ -329,7 +400,76 @@ public class FilterAndPairFnTest {
             return null;
         });
 
-        PAssert.that(agedOut(routed)).empty();
+        PAssert.that(aiPending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("Matched AI row should still be retained, retry_count incremented",
+                    1, list.size());
+            assertEquals(2L, list.get(0).get("retry_count"));
+            return null;
+        });
+
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
+        pipeline.run().waitUntilFinish();
+    }
+
+    /**
+     * Two cases share one image's AI history. Case-1 already matched AI1 in a prior
+     * run (its matched_ai_keys already contains AI1's identity key); case-2 shows up
+     * fresh this run, having never matched anything.
+     *
+     * Expected: case-2 "replays" the full AI history (matches AI1), case-1 does not
+     * re-match AI1 (already in its matched_ai_keys). Both cases and the AI row are
+     * re-pended.
+     */
+    @Test
+    public void newCaseReplaysExistingAiHistory() {
+        String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
+        String ai1Key = aiDedupKey("img006", aiCreatedAt);
+
+        TableRow ai1Pending = aiPendingRow("img006", "key1", aiCreatedAt,
+                Instant.now().minusSeconds(3600).toString());
+
+        TableRow case1Pending = casePendingRow("img006", "human", "key1",
+                "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
+                0L, "case1", ai1Key);
+
+        TableRow case2Fresh = sourceRow("img006", HUMAN_METHOD, "key1",
+                "2026-04-01T11:00:00Z", "case2");
+
+        PCollectionTuple routed = runPipeline("img006",
+                List.of(case2Fresh), List.of(case1Pending), List.of(ai1Pending));
+
+        PAssert.that(matched(routed)).satisfies(pairs -> {
+            List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
+            pairs.forEach(list::add);
+            assertEquals("Only case-2 should match AI1 (case-1 already matched it)", 1, list.size());
+            assertEquals("img006::main::case2::1", list.get(0).getKey());
+            return null;
+        });
+
+        PAssert.that(casePending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("Both case-1 and case-2 should be re-pended", 2, list.size());
+            Set<String> caseIds = list.stream()
+                    .map(r -> String.valueOf(r.get("case_id")))
+                    .collect(Collectors.toSet());
+            assertTrue(caseIds.contains("case1"));
+            assertTrue(caseIds.contains("case2"));
+            return null;
+        });
+
+        PAssert.that(aiPending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("AI1 should still be retained for any future case", 1, list.size());
+            return null;
+        });
+
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
         pipeline.run().waitUntilFinish();
     }
 }

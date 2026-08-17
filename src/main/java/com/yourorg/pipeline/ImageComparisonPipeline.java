@@ -94,6 +94,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *       --humanSourceTable=project:human_dataset.human_payloads \
  *       --outputTable=project:dataset.comparison_results \
  *       --pendingTable=project:dataset.pending_comparisons \
+ *       --aiPendingTable=project:dataset.ai_pending_comparisons \
  *       --deadLetterTable=project:dataset.dead_letter_comparisons \
  *       --segmentConfigs='[...]' \
  *       --firestoreCollection=dek_store \
@@ -138,11 +139,18 @@ public class ImageComparisonPipeline {
         ValueProvider<String> getOutputTable();
         void setOutputTable(ValueProvider<String> value);
 
-        @Description("BigQuery table for pending state (rows awaiting their counterpart). "
-                + "Format: project:dataset.table")
+        @Description("BigQuery table for case (human-side) pending state — cases awaiting more "
+                + "AI iterations. Format: project:dataset.table")
         @Validation.Required
         ValueProvider<String> getPendingTable();
         void setPendingTable(ValueProvider<String> value);
+
+        @Description("BigQuery table for the AI replay pool — AI payloads retained regardless of "
+                + "match status so late-arriving cases can still be compared against AI history. "
+                + "Format: project:dataset.table")
+        @Validation.Required
+        ValueProvider<String> getAiPendingTable();
+        void setAiPendingTable(ValueProvider<String> value);
 
         @Description("BigQuery table for payloads that exceeded the max wait threshold. "
                 + "Format: project:dataset.table")
@@ -220,6 +228,7 @@ public class ImageComparisonPipeline {
         SchemaRegistry registry = SchemaRegistry.getInstance();
         Schema payloadSchema    = registry.get(SchemaRegistry.PAYLOAD_ROW);
         Schema pendingSchema    = registry.get(SchemaRegistry.PENDING_ROW);
+        Schema aiPendingSchema  = registry.get(SchemaRegistry.AI_PENDING_ROW);
 
         // No ValueProvider.get() calls here — the graph structure is fixed
         // (one AI read, one human read, one pending read) regardless of how many
@@ -275,49 +284,73 @@ public class ImageComparisonPipeline {
                 PCollectionList.of(keyedAi).and(keyedHuman)
                                .apply("FlattenSourceRows", Flatten.pCollections());
 
-        // ── Pending rows (all segments in one read) ───────────────────────────
-        PCollection<KV<String, TableRow>> keyedPending = pipeline
-                .apply("ReadPending",
+        // ── Case pending rows (human side, all segments in one read) ──────────
+        PCollection<KV<String, TableRow>> keyedCasePending = pipeline
+                .apply("ReadCasePending",
                         BigQueryIO.readTableRows()
                                 .fromQuery(new PendingQueryProvider(options.getPendingTable()))
                                 .usingStandardSql()
                                 .withQueryTempDataset(queryTempDataset))
-                .apply("KeyPending",
+                .apply("KeyCasePending",
                         WithKeys.of((TableRow row) ->
                                 row.get("image_id") + "::" + row.get("segment"))
                                 .withKeyType(TypeDescriptors.strings()));
 
-        // ── Co-group source + pending by "imageId::segment" ───────────────────
+        // ── AI replay pool (all segments in one read) ─────────────────────────
+        // Retained regardless of match status — see FilterAndPairFn class doc.
+        PCollection<KV<String, TableRow>> keyedAiPending = pipeline
+                .apply("ReadAiPending",
+                        BigQueryIO.readTableRows()
+                                .fromQuery(new PendingQueryProvider(options.getAiPendingTable()))
+                                .usingStandardSql()
+                                .withQueryTempDataset(queryTempDataset))
+                .apply("KeyAiPending",
+                        WithKeys.of((TableRow row) ->
+                                row.get("image_id") + "::" + row.get("segment"))
+                                .withKeyType(TypeDescriptors.strings()));
+
+        // ── Co-group source + case pending + AI pending by "imageId::segment" ──
         PCollection<KV<String, CoGbkResult>> coGrouped =
                 KeyedPCollectionTuple
                         .of(FilterAndPairFn.SOURCE_TAG, keyedSource)
-                        .and(FilterAndPairFn.PENDING_TAG, keyedPending)
+                        .and(FilterAndPairFn.CASE_PENDING_TAG, keyedCasePending)
+                        .and(FilterAndPairFn.AI_PENDING_TAG, keyedAiPending)
                         .apply("CoGroupByImageIdAndSegment", CoGroupByKey.create());
 
         // ── Filter & pair ─────────────────────────────────────────────────────
         PCollectionTuple routed = coGrouped.apply(
                 "FilterAndPair",
-                ParDo.of(new FilterAndPairFn(options.getSegmentConfigs(), payloadSchema, pendingSchema))
+                ParDo.of(new FilterAndPairFn(
+                                options.getSegmentConfigs(), payloadSchema, pendingSchema, aiPendingSchema))
                      .withOutputTags(
                              FilterAndPairFn.MATCHED,
                              TupleTagList
-                                     .of(FilterAndPairFn.NEW_PENDING)
-                                     .and(FilterAndPairFn.AGED_OUT)));
+                                     .of(FilterAndPairFn.CASE_PENDING)
+                                     .and(FilterAndPairFn.CASE_AGED_OUT)
+                                     .and(FilterAndPairFn.AI_PENDING)
+                                     .and(FilterAndPairFn.AI_AGED_OUT)));
 
         // ── Register Avro coders ──────────────────────────────────────────────
-        AvroCoder<GenericRecord> payloadCoder = AvroCoder.of(GenericRecord.class, payloadSchema);
-        AvroCoder<GenericRecord> pendingCoder = AvroCoder.of(GenericRecord.class, pendingSchema);
+        AvroCoder<GenericRecord> payloadCoder   = AvroCoder.of(GenericRecord.class, payloadSchema);
+        AvroCoder<GenericRecord> pendingCoder   = AvroCoder.of(GenericRecord.class, pendingSchema);
+        AvroCoder<GenericRecord> aiPendingCoder = AvroCoder.of(GenericRecord.class, aiPendingSchema);
 
         PCollection<KV<String, KV<GenericRecord, GenericRecord>>> matched =
                 routed.get(FilterAndPairFn.MATCHED)
                       .setCoder(KvCoder.of(StringUtf8Coder.of(),
                               KvCoder.of(payloadCoder, payloadCoder)));
 
-        PCollection<GenericRecord> newPending =
-                routed.get(FilterAndPairFn.NEW_PENDING).setCoder(pendingCoder);
+        PCollection<GenericRecord> casePending =
+                routed.get(FilterAndPairFn.CASE_PENDING).setCoder(pendingCoder);
 
-        PCollection<GenericRecord> agedOut =
-                routed.get(FilterAndPairFn.AGED_OUT).setCoder(pendingCoder);
+        PCollection<GenericRecord> caseAgedOut =
+                routed.get(FilterAndPairFn.CASE_AGED_OUT).setCoder(pendingCoder);
+
+        PCollection<GenericRecord> aiPending =
+                routed.get(FilterAndPairFn.AI_PENDING).setCoder(aiPendingCoder);
+
+        PCollection<GenericRecord> aiAgedOut =
+                routed.get(FilterAndPairFn.AI_AGED_OUT).setCoder(aiPendingCoder);
 
         // ── Flatten & compare matched pairs ───────────────────────────────────
         PCollection<TableRow> comparisonResults = matched
@@ -328,15 +361,29 @@ public class ImageComparisonPipeline {
                                 options.getSegmentConfigs())));
 
         // ── Intermediate TableRow PCollections (also used as Write inputs) ────
-        PCollection<TableRow> newPendingRows = newPending
-                .apply("MapPendingToTableRow",
+        PCollection<TableRow> casePendingRows = casePending
+                .apply("MapCasePendingToTableRow",
                         MapElements.into(TypeDescriptor.of(TableRow.class))
-                                   .via(r -> fromPendingRecord(r)));
+                                   .via(r -> fromCasePendingRecord(r)));
 
-        PCollection<TableRow> agedOutRows = agedOut
-                .apply("MapAgedOutToTableRow",
+        PCollection<TableRow> aiPendingRows = aiPending
+                .apply("MapAiPendingToTableRow",
                         MapElements.into(TypeDescriptor.of(TableRow.class))
-                                   .via(r -> fromAgedOutRecord(r)));
+                                   .via(r -> fromAiPendingRecord(r)));
+
+        PCollection<TableRow> caseAgedOutRows = caseAgedOut
+                .apply("MapCaseAgedOutToTableRow",
+                        MapElements.into(TypeDescriptor.of(TableRow.class))
+                                   .via(r -> fromCaseAgedOutRecord(r)));
+
+        PCollection<TableRow> aiAgedOutRows = aiAgedOut
+                .apply("MapAiAgedOutToTableRow",
+                        MapElements.into(TypeDescriptor.of(TableRow.class))
+                                   .via(r -> fromAiAgedOutRecord(r)));
+
+        PCollection<TableRow> deadLetterRows =
+                PCollectionList.of(caseAgedOutRows).and(aiAgedOutRows)
+                               .apply("FlattenAgedOutRows", Flatten.pCollections());
 
         // ── Write all outputs; capture WriteResults for advance signal ─────────
         WriteResult compWrite = comparisonResults
@@ -347,7 +394,7 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        WriteResult pendingWrite = newPendingRows
+        WriteResult casePendingWrite = casePendingRows
                 .apply("WritePendingTable",
                         BigQueryIO.writeTableRows()
                                 .to(options.getPendingTable())
@@ -355,7 +402,15 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
-        WriteResult deadLetterWrite = agedOutRows
+        WriteResult aiPendingWrite = aiPendingRows
+                .apply("WriteAiPendingTable",
+                        BigQueryIO.writeTableRows()
+                                .to(options.getAiPendingTable())
+                                .withSchema(SchemaUtil.aiPendingSchema())
+                                .withWriteDisposition(WriteDisposition.WRITE_TRUNCATE)
+                                .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
+
+        WriteResult deadLetterWrite = deadLetterRows
                 .apply("WriteDeadLetterTable",
                         BigQueryIO.writeTableRows()
                                 .to(options.getDeadLetterTable())
@@ -373,7 +428,8 @@ public class ImageComparisonPipeline {
         pipeline.apply("AdvanceTrigger", Create.of("done"))
                 .apply("WaitForAllWrites", Wait.on(
                         compWrite.getSuccessfulTableLoads(),
-                        pendingWrite.getSuccessfulTableLoads(),
+                        casePendingWrite.getSuccessfulTableLoads(),
+                        aiPendingWrite.getSuccessfulTableLoads(),
                         deadLetterWrite.getSuccessfulTableLoads()))
                 .apply("AdvanceWindow",
                         ParDo.of(new AdvanceWindowFn(
@@ -572,13 +628,29 @@ public class ImageComparisonPipeline {
 
     // ── Row conversion helpers ────────────────────────────────────────────────
 
-    private static TableRow fromPendingRecord(GenericRecord r) {
+    private static TableRow fromCasePendingRecord(GenericRecord r) {
         return new TableRow()
                 .set("image_id",        str(r.get("image_id")))
                 .set("key_id",          str(r.get("key_id")))
                 .set("segment",         str(r.get("segment")) != null
                         ? str(r.get("segment")) : "main")
+                .set("case_id",         str(r.get("case_id")))
                 .set("pending_type",    str(r.get("pending_type")))
+                .set("payload",         str(r.get("payload")))
+                .set("created_at",      str(r.get("created_at")))
+                .set("first_seen_at",   str(r.get("first_seen_at")))
+                .set("last_retried_at", str(r.get("last_retried_at")))
+                .set("retry_count",     r.get("retry_count") != null
+                        ? ((Number) r.get("retry_count")).longValue() : 0L)
+                .set("matched_ai_keys", str(r.get("matched_ai_keys")));
+    }
+
+    private static TableRow fromAiPendingRecord(GenericRecord r) {
+        return new TableRow()
+                .set("image_id",        str(r.get("image_id")))
+                .set("key_id",          str(r.get("key_id")))
+                .set("segment",         str(r.get("segment")) != null
+                        ? str(r.get("segment")) : "main")
                 .set("payload",         str(r.get("payload")))
                 .set("created_at",      str(r.get("created_at")))
                 .set("first_seen_at",   str(r.get("first_seen_at")))
@@ -587,18 +659,34 @@ public class ImageComparisonPipeline {
                         ? ((Number) r.get("retry_count")).longValue() : 0L);
     }
 
-    private static TableRow fromAgedOutRecord(GenericRecord r) {
+    private static TableRow fromCaseAgedOutRecord(GenericRecord r) {
         return new TableRow()
                 .set("image_id",      str(r.get("image_id")))
                 .set("key_id",        str(r.get("key_id")))
                 .set("segment",       str(r.get("segment")) != null
                         ? str(r.get("segment")) : "main")
+                .set("case_id",       str(r.get("case_id")))
                 .set("pending_type",  str(r.get("pending_type")))
                 .set("payload",       str(r.get("payload")))
                 .set("created_at",    str(r.get("created_at")))
                 .set("first_seen_at", str(r.get("first_seen_at")))
                 .set("aged_out_at",   TimestampUtil.formatInstant(Instant.now()))
-                .set("reason",        "No counterpart payload after "
+                .set("reason",        "No matching AI iteration within "
+                        + FilterAndPairFn.MAX_WAIT_DAYS + " days");
+    }
+
+    private static TableRow fromAiAgedOutRecord(GenericRecord r) {
+        return new TableRow()
+                .set("image_id",      str(r.get("image_id")))
+                .set("key_id",        str(r.get("key_id")))
+                .set("segment",       str(r.get("segment")) != null
+                        ? str(r.get("segment")) : "main")
+                .set("pending_type",  "ai")
+                .set("payload",       str(r.get("payload")))
+                .set("created_at",    str(r.get("created_at")))
+                .set("first_seen_at", str(r.get("first_seen_at")))
+                .set("aged_out_at",   TimestampUtil.formatInstant(Instant.now()))
+                .set("reason",        "No matching case within "
                         + FilterAndPairFn.MAX_WAIT_DAYS + " days");
     }
 

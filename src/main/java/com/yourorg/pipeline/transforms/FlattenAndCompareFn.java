@@ -33,8 +33,9 @@ import java.util.stream.Stream;
  * per field value, including a {@code segment} column for downstream filtering.
  *
  * <h3>Pair key format</h3>
- * {@code "imageId::segment::iteration"} — all three parts are embedded in the
- * pair key set by {@link FilterAndPairFn}.
+ * {@code "imageId::segment::caseId::iteration"} — all four parts are embedded in
+ * the pair key set by {@link FilterAndPairFn}. {@code caseId} is empty for
+ * segments with no real {@code case_id} (single-case segments).
  *
  * <h3>Array comparison</h3>
  * <ul>
@@ -154,20 +155,21 @@ public class FlattenAndCompareFn
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
-        // Pair key format: "imageId::segment::iteration"
+        // Pair key format: "imageId::segment::caseId::iteration"
         String pairKey = ctx.element().getKey();
-        String[] parts = pairKey.split("::", 3);
+        String[] parts = pairKey.split("::", 4);
 
-        if (parts.length != 3) {
+        if (parts.length != 4) {
             LOG.warn("Unexpected pairKey format: '{}' — skipping", pairKey);
             return;
         }
 
-        String imageId  = parts[0];
-        String segment  = parts[1];
+        String imageId = parts[0];
+        String segment = parts[1];
+        String caseId  = parts[2].isEmpty() ? null : parts[2];
         int    iteration;
         try {
-            iteration = Integer.parseInt(parts[2]);
+            iteration = Integer.parseInt(parts[3]);
         } catch (NumberFormatException e) {
             LOG.warn("Could not parse iteration from pairKey '{}' — skipping", pairKey);
             return;
@@ -247,7 +249,7 @@ public class FlattenAndCompareFn
                     for (int i = 0; i < count; i++) {
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
-                        emitRow(ctx, imageId, segment, keyId, iteration,
+                        emitRow(ctx, imageId, segment, caseId, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, loadTime,
                                 field, matchKey, humanVal, aiVal);
                         rowsEmitted++;
@@ -258,7 +260,7 @@ public class FlattenAndCompareFn
                 for (int i = 0; i < count; i++) {
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
-                    emitRow(ctx, imageId, segment, keyId, iteration,
+                    emitRow(ctx, imageId, segment, caseId, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, loadTime,
                             field, null, humanVal, aiVal);
                     rowsEmitted++;
@@ -266,8 +268,8 @@ public class FlattenAndCompareFn
             }
         }
 
-        LOG.info("Compared imageId='{}' segment='{}' iteration={} — {} rows ({} fields)",
-                imageId, segment, iteration, rowsEmitted, allFields.size());
+        LOG.info("Compared imageId='{}' segment='{}' case='{}' iteration={} — {} rows ({} fields)",
+                imageId, segment, caseId, iteration, rowsEmitted, allFields.size());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -495,7 +497,7 @@ public class FlattenAndCompareFn
     }
 
     private void emitRow(ProcessContext ctx,
-                         String imageId, String segment, String keyId, int iteration,
+                         String imageId, String segment, String caseId, String keyId, int iteration,
                          String aiCreatedAt, String humanCreatedAt, String loadTime,
                          String field, String arrayKey,
                          String humanVal, String aiVal) {
@@ -511,6 +513,7 @@ public class FlattenAndCompareFn
                 .set("image_id",         imageId)
                 .set("key_id",           keyId)
                 .set("segment",          segment)
+                .set("case_id",          caseId)
                 .set("ai_iteration",     iteration)
                 .set("ai_created_at",    aiCreatedAt)
                 .set("human_created_at", humanCreatedAt)

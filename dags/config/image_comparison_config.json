@@ -14,6 +14,7 @@
     "human_source_table":     "your-project:human_dataset.human_payloads",
     "output_table":           "your-project:dataset.comparison_results",
     "pending_table":          "your-project:dataset.pending_comparisons",
+    "ai_pending_table":       "your-project:dataset.ai_pending_comparisons",
     "dead_letter_table":      "your-project:dataset.dead_letter_comparisons",
     "query_temp_dataset":     "your-project:pipeline_temp",
 

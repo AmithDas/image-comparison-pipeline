@@ -81,6 +81,7 @@ def _dataflow_parameters() -> dict:
         "humanSourceTable":     _PIPE["human_source_table"],
         "outputTable":          _PIPE["output_table"],
         "pendingTable":         _PIPE["pending_table"],
+        "aiPendingTable":       _PIPE["ai_pending_table"],
         "deadLetterTable":      _PIPE["dead_letter_table"],
         "segmentConfigs":       _SEGMENT_CONFIGS_JSON,
         "imageNameField":       _PIPE["image_name_field"],

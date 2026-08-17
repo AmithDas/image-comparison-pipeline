@@ -44,6 +44,7 @@ public final class SchemaRegistry {
 
     public static final String PAYLOAD_ROW      = "payload_row";
     public static final String PENDING_ROW      = "pending_row";
+    public static final String AI_PENDING_ROW   = "ai_pending_row";
     public static final String COMPARISON_RESULT = "comparison_result";
     public static final String DEAD_LETTER_ROW  = "dead_letter_row";
 

@@ -27,7 +27,10 @@ import java.util.Map;
  *       AI payloads are always plain JSON.</li>
  *   <li><b>Human rows</b>: routed to exactly one segment by checking
  *       {@code humanSubTypes[].discriminatorField} presence in the decrypted JSON.
- *       Rows with no matching segment/sub-type are silently dropped.</li>
+ *       Rows with no matching segment/sub-type are silently dropped. The row's plain
+ *       {@code case_id} column (not inside the encrypted payload) is carried through
+ *       unchanged so {@link FilterAndPairFn} can group multiple cases sharing one
+ *       image's AI history separately.</li>
  * </ul>
  *
  * <h3>Payload formats</h3>
@@ -158,6 +161,8 @@ public class DecryptAndKeyFn extends DoFn<TableRow, KV<String, TableRow>> {
 
                 TableRow emitted = row.clone();
                 emitted.set("_human_sub_type", subTypeName);
+                Object caseId = row.get("case_id");
+                if (caseId != null) emitted.set("case_id", caseId.toString());
                 ctx.output(KV.of(imageKey.trim().toLowerCase() + "::" + seg.name, emitted));
             }
         }

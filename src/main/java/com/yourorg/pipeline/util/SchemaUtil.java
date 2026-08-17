@@ -24,6 +24,10 @@ public final class SchemaUtil {
         return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.PENDING_ROW));
     }
 
+    public static TableSchema aiPendingSchema() {
+        return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.AI_PENDING_ROW));
+    }
+
     public static TableSchema deadLetterSchema() {
         return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.DEAD_LETTER_ROW));
     }

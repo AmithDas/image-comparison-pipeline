@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS `your_project.human_dataset.human_payloads` (
   key_id        STRING    NOT NULL,   -- Barricade encryption key identifier
   method        STRING    NOT NULL,   -- e.g. 'controller.SubmitDispute', 'auth.human'
   payload       STRING    NOT NULL,   -- Barricade-encrypted JSON (or id_request wire format)
+  case_id       STRING,               -- distinguishes multiple cases sharing one image's AI
+                                       -- payload; null/absent for segments with a single case
   created_at    TIMESTAMP NOT NULL
 )
 PARTITION BY DATE(created_at)
@@ -53,7 +55,12 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.comparison_results` (
   image_id          STRING    NOT NULL,
   key_id            STRING    NOT NULL,   -- Barricade key used to encrypt human_value and ai_value
   segment           STRING    NOT NULL,   -- segment name from --segmentConfigs, e.g. 'main', 'auth', 'docreview'
-  ai_iteration      INT64     NOT NULL,   -- 1-based, ordered by created_at ASC
+  case_id           STRING,               -- distinguishes multiple cases sharing one image's AI
+                                           -- payload; null for segments with a single case
+  ai_iteration      INT64     NOT NULL,   -- 1-based per case, in the order each AI payload was
+                                           -- discovered/matched for that case (see FilterAndPairFn;
+                                           -- not a guarantee of strict created_at ordering across
+                                           -- pipeline runs when AI payloads arrive out of order)
   ai_created_at     TIMESTAMP,
   human_created_at  TIMESTAMP,
   field_name        STRING    NOT NULL,   -- dot-notation path e.g. "terms.code"
@@ -72,46 +79,80 @@ OPTIONS (
 
 
 -- ------------------------------------------------------------
--- 3. Pending comparisons table (durable state store)
---    Stores orphaned payloads awaiting their counterpart.
---    Overwritten (WRITE_TRUNCATE) on every pipeline run — resolved rows
+-- 3. Pending comparisons table (durable state store — case/human side only)
+--    Stores incomplete or already-matched cases waiting for more AI iterations.
+--    Overwritten (WRITE_TRUNCATE) on every pipeline run — resolved/aged rows
 --    disappear automatically by not being re-emitted.
 --    Mirrors src/main/resources/avro/pending_row.json.
---    pending_type: 'human', 'ai', 'human:merged', or 'human:<subTypeName>'
+--    pending_type: 'human', 'human:merged', or 'human:<subTypeName>'
+--    (AI payloads live in ai_pending_comparisons instead — see below.)
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_comparisons` (
   image_id          STRING    NOT NULL,
   key_id            STRING    NOT NULL,   -- Barricade encryption key identifier
   segment           STRING    NOT NULL,   -- segment name from --segmentConfigs
-  pending_type      STRING    NOT NULL,   -- 'human' | 'ai' | 'human:merged' | 'human:<subType>'
+  case_id           STRING,               -- distinguishes multiple cases sharing one image's AI
+                                           -- payload; null for segments with a single case
+  pending_type      STRING    NOT NULL,   -- 'human' | 'human:merged' | 'human:<subType>'
   payload           STRING    NOT NULL,   -- Barricade-encrypted payload
   created_at        TIMESTAMP,            -- original created_at from source table
   first_seen_at     TIMESTAMP NOT NULL,   -- when first written to pending
   last_retried_at   TIMESTAMP,            -- updated on each pipeline run
   retry_count       INT64     NOT NULL,   -- incremented on each retry
-  matched_ai_count  INT64     NOT NULL    -- AI iterations already matched for this human row across prior runs
+  matched_ai_keys   STRING                -- semicolon-joined identity keys of AI payloads already
+                                           -- matched against this case (see FilterAndPairFn dedup
+                                           -- key: payload + "|" + created_at); null/empty if none yet.
+                                           -- Its element count is this case's next ai_iteration - 1.
 )
 PARTITION BY DATE(first_seen_at)
 OPTIONS (
-  description = "Durable state table for orphaned payloads awaiting their counterpart. "
-                "Full refresh (WRITE_TRUNCATE) on every pipeline run — resolved rows "
-                "are automatically removed by not emitting them from the pipeline. "
-                "Aging out to dead_letter_comparisons is decided by FilterAndPairFn, "
-                "not by filtering this table's read query."
+  description = "Durable state table for cases (human payloads) waiting for more AI iterations. "
+                "Full refresh (WRITE_TRUNCATE) on every pipeline run. Aging is evaluated per case "
+                "against its own first_seen_at (see FilterAndPairFn), independent of other cases "
+                "or of ai_pending_comparisons."
 );
 
 
 -- ------------------------------------------------------------
--- 4. Dead-letter table
+-- 4. AI pending table (durable replay log — AI side only)
+--    An AI payload is retained here for as long as it hasn't individually
+--    aged out, regardless of whether it has already been matched to one or
+--    more cases — a case discovered later still needs to be compared against
+--    AI payloads that arrived before it existed. Rows are never removed just
+--    because they matched; see FilterAndPairFn's per-case matched_ai_keys.
+--    Mirrors src/main/resources/avro/ai_pending_row.json.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `your_project.your_dataset.ai_pending_comparisons` (
+  image_id          STRING    NOT NULL,
+  key_id            STRING    NOT NULL,   -- Barricade encryption key identifier
+  segment           STRING    NOT NULL,   -- segment name from --segmentConfigs
+  payload           STRING    NOT NULL,   -- Barricade-encrypted payload
+  created_at        TIMESTAMP,            -- original created_at from source table
+  first_seen_at     TIMESTAMP NOT NULL,   -- when first written to pending
+  last_retried_at   TIMESTAMP,            -- updated on each pipeline run
+  retry_count       INT64     NOT NULL    -- incremented on each retry
+)
+PARTITION BY DATE(first_seen_at)
+OPTIONS (
+  description = "Durable replay log of AI payloads awaiting (or already matched to) one or more "
+                "cases. Full refresh (WRITE_TRUNCATE) on every pipeline run. A row only ages out "
+                "based on its own first_seen_at, independent of pending_comparisons."
+);
+
+
+-- ------------------------------------------------------------
+-- 5. Dead-letter table
 --    Payloads that exceeded MAX_WAIT_DAYS (FilterAndPairFn.MAX_WAIT_DAYS)
---    without a counterpart.
+--    without a counterpart, from either pending_comparisons or
+--    ai_pending_comparisons.
 --    Mirrors src/main/resources/avro/dead_letter_row.json.
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `your_project.your_dataset.dead_letter_comparisons` (
   image_id      STRING    NOT NULL,
   key_id        STRING,
   segment       STRING    NOT NULL,   -- segment name from --segmentConfigs
-  pending_type  STRING    NOT NULL,   -- which side was orphaned: 'human' or 'ai'
+  case_id       STRING,               -- populated for aged-out case rows; null for aged-out AI rows
+  pending_type  STRING    NOT NULL,   -- which side was orphaned: 'human'/'human:...' or 'ai'
   payload       STRING,               -- the orphaned payload JSON (Barricade-encrypted)
   created_at    TIMESTAMP,
   first_seen_at TIMESTAMP,
@@ -125,7 +166,7 @@ OPTIONS (
 
 
 -- ------------------------------------------------------------
--- 5. Pipeline window lookup table
+-- 6. Pipeline window lookup table
 --    Drives the pipeline's own window management (see WindowManager /
 --    ImageComparisonPipeline.WindowValueProvider). The Dataflow job — not
 --    the Airflow DAG — claims and advances this row on each run:

@@ -32,6 +32,8 @@ public class SchemaUtilTest {
 
         assertEquals("STRING",  fields.get("image_id").getType());
         assertEquals("STRING",  fields.get("key_id").getType());
+        assertEquals("STRING",  fields.get("case_id").getType());
+        assertEquals("NULLABLE", fields.get("case_id").getMode());
         assertEquals("INTEGER", fields.get("ai_iteration").getType());
         assertEquals("BOOLEAN", fields.get("is_match").getType());
         assertEquals("STRING",  fields.get("human_value").getType());
@@ -66,8 +68,28 @@ public class SchemaUtilTest {
 
         assertEquals("STRING",  fields.get("image_id").getType());
         assertEquals("STRING",  fields.get("key_id").getType());
+        assertEquals("STRING",  fields.get("case_id").getType());
+        assertEquals("NULLABLE", fields.get("case_id").getMode());
         assertEquals("STRING",  fields.get("pending_type").getType());
+        assertEquals("STRING",  fields.get("matched_ai_keys").getType());
+        assertEquals("NULLABLE", fields.get("matched_ai_keys").getMode());
         assertEquals("INTEGER", fields.get("retry_count").getType());
+    }
+
+    // ── aiPendingSchema ────────────────────────────────────────────────────────
+
+    @Test
+    public void aiPendingSchemaFields() {
+        Map<String, TableFieldSchema> fields = fieldMap(SchemaUtil.aiPendingSchema());
+
+        assertEquals("TIMESTAMP", fields.get("created_at").getType());
+        assertEquals("TIMESTAMP", fields.get("first_seen_at").getType());
+        assertEquals("TIMESTAMP", fields.get("last_retried_at").getType());
+        assertEquals("STRING",  fields.get("payload").getType());
+        assertEquals("INTEGER", fields.get("retry_count").getType());
+        assertEquals("REQUIRED", fields.get("payload").getMode());
+        assertNull("aiPendingSchema should not carry pending_type", fields.get("pending_type"));
+        assertNull("aiPendingSchema should not carry case_id", fields.get("case_id"));
     }
 
     // ── deadLetterSchema ──────────────────────────────────────────────────────
@@ -90,6 +112,8 @@ public class SchemaUtilTest {
         // nullable timestamps
         assertEquals("NULLABLE", fields.get("created_at").getMode());
         assertEquals("NULLABLE", fields.get("first_seen_at").getMode());
+        // case_id is nullable — populated for aged-out cases, absent for aged-out AI rows
+        assertEquals("NULLABLE", fields.get("case_id").getMode());
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

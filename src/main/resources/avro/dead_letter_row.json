@@ -6,6 +6,7 @@
     {"name": "image_id",      "type": "string"},
     {"name": "key_id",        "type": ["null", "string"], "default": null},
     {"name": "segment",       "type": "string"},
+    {"name": "case_id",       "type": ["null", "string"], "default": null},
     {"name": "pending_type",  "type": "string"},
     {"name": "payload",       "type": ["null", "string"], "default": null},
     {"name": "created_at",    "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},

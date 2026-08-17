@@ -6,6 +6,7 @@
     {"name": "image_id",         "type": "string"},
     {"name": "key_id",           "type": "string"},
     {"name": "segment",          "type": "string"},
+    {"name": "case_id",          "type": ["null", "string"], "default": null},
     {"name": "ai_iteration",     "type": "int"},
     {"name": "ai_created_at",    "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
     {"name": "human_created_at", "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
