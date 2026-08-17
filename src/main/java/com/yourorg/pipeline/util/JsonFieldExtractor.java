@@ -347,7 +347,8 @@ public final class JsonFieldExtractor {
      *
      * <p>Missing or null components are substituted with the literal {@code "null"} so
      * the key always has a defined, consistent value on both sides.
-     * The final key is lower-cased for case-insensitive matching.
+     * Each component value has all whitespace stripped, and the final key is
+     * lower-cased, so keys match regardless of spacing or case.
      */
     private static String extractKeyValue(JsonElement el, String keySpec, String arrayPath) {
         String[] components = keySpec.split("-");
@@ -416,6 +417,6 @@ public final class JsonFieldExtractor {
         }
 
         if (current == null || current.isJsonNull()) return null;
-        return current.isJsonPrimitive() ? current.getAsString() : current.toString();
+        return current.isJsonPrimitive() ? current.getAsString().replaceAll("\\s+", "") : current.toString();
     }
 }
