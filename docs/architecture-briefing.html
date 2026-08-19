@@ -1,0 +1,519 @@
+<title>Multi-Case Reconciliation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --ink: #1B2430;
+    --muted: #5B6672;
+    --paper: #F2F4F7;
+    --surface: #FFFFFF;
+    --line: #D8DDE1;
+    --line-strong: #C1C9D1;
+    --accent: #1E6E62;
+    --accent-soft: #E4EFEC;
+    --warm: #B5772B;
+    --warm-soft: #F6ECDD;
+    --serif: 'IBM Plex Serif', ui-serif, Georgia, serif;
+    --sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink: #E7EAEE;
+      --muted: #93A0AC;
+      --paper: #14181D;
+      --surface: #1B2129;
+      --line: #2A313A;
+      --line-strong: #38414C;
+      --accent: #4FBBAA;
+      --accent-soft: #1C302C;
+      --warm: #E0A155;
+      --warm-soft: #332417;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ink: #E7EAEE;
+    --muted: #93A0AC;
+    --paper: #14181D;
+    --surface: #1B2129;
+    --line: #2A313A;
+    --line-strong: #38414C;
+    --accent: #4FBBAA;
+    --accent-soft: #1C302C;
+    --warm: #E0A155;
+    --warm-soft: #332417;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .page {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 4.5rem 1.75rem 6rem;
+  }
+
+  /* ── Header ────────────────────────────────────────────── */
+
+  .kicker {
+    display: block;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.9rem;
+  }
+
+  h1 {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: clamp(2rem, 4.5vw, 2.6rem);
+    line-height: 1.12;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.6rem;
+    text-wrap: balance;
+  }
+
+  .dek {
+    font-size: 1.05rem;
+    color: var(--muted);
+    max-width: 46ch;
+    margin: 0 0 1.6rem;
+  }
+
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.4rem;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--muted);
+    padding-top: 1.4rem;
+    border-top: 1px solid var(--line);
+  }
+
+  .meta-row span b { color: var(--ink); font-weight: 500; }
+
+  /* ── TL;DR ─────────────────────────────────────────────── */
+
+  .summary {
+    margin: 2.6rem 0 3rem;
+    padding: 1.5rem 1.6rem;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 3px;
+    font-size: 1.02rem;
+  }
+
+  .summary p { margin: 0; }
+  .summary p + p { margin-top: 0.8rem; }
+
+  /* ── Stat strip ────────────────────────────────────────── */
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 3.2rem;
+  }
+
+  .stat {
+    background: var(--surface);
+    padding: 1.1rem 1rem;
+    text-align: center;
+  }
+
+  .stat .n {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--accent);
+    display: block;
+  }
+
+  .stat .l {
+    display: block;
+    font-size: 0.74rem;
+    color: var(--muted);
+    margin-top: 0.3rem;
+    line-height: 1.35;
+  }
+
+  @media (max-width: 560px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  /* ── Sections ──────────────────────────────────────────── */
+
+  section { margin-bottom: 3.2rem; }
+  section:last-of-type { margin-bottom: 2rem; }
+
+  section > .kicker { margin-bottom: 0.5rem; }
+
+  h2 {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: 1.5rem;
+    margin: 0 0 1.1rem;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 1.02rem;
+    margin: 1.6rem 0 0.5rem;
+    color: var(--ink);
+  }
+
+  p { margin: 0 0 1rem; max-width: 66ch; }
+  ul, ol { margin: 0 0 1rem; padding-left: 1.3rem; max-width: 64ch; }
+  li { margin-bottom: 0.45rem; }
+  li::marker { color: var(--muted); }
+
+  strong { font-weight: 600; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: var(--accent-soft);
+    color: var(--accent);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+  }
+
+  /* ── Before/after table ───────────────────────────────── */
+
+  .compare-wrap { overflow-x: auto; margin: 1.2rem 0; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.92rem;
+  }
+
+  caption {
+    text-align: left;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+
+  th, td {
+    text-align: left;
+    padding: 0.7rem 0.9rem;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+
+  thead th {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+    border-bottom: 1px solid var(--line-strong);
+  }
+
+  tbody th {
+    font-weight: 500;
+    white-space: nowrap;
+    color: var(--muted);
+    width: 30%;
+  }
+
+  /* ── Callout (rollout / risk) ─────────────────────────── */
+
+  .callout {
+    background: var(--warm-soft);
+    border: 1px solid var(--warm);
+    border-radius: 3px;
+    padding: 1.4rem 1.6rem;
+    margin: 1.2rem 0;
+  }
+
+  .callout .kicker { color: var(--warm); margin-bottom: 0.6rem; }
+  .callout p:last-child { margin-bottom: 0; }
+
+  .steps {
+    counter-reset: step;
+    list-style: none;
+    padding-left: 0;
+    margin: 1rem 0 0;
+  }
+
+  .steps li {
+    counter-increment: step;
+    position: relative;
+    padding-left: 2.1rem;
+    margin-bottom: 0.7rem;
+  }
+
+  .steps li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 0.05em;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--warm);
+    background: var(--surface);
+    border: 1px solid var(--warm);
+    width: 1.3rem;
+    height: 1.3rem;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ── Reassurance list ──────────────────────────────────── */
+
+  .unchanged {
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+  }
+
+  .unchanged li {
+    padding-left: 1.6rem;
+    position: relative;
+  }
+
+  .unchanged li::before {
+    content: "✓";
+    position: absolute;
+    left: 0;
+    top: 0.05em;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  /* ── Footer ────────────────────────────────────────────── */
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding-top: 1.4rem;
+    margin-top: 3.5rem;
+    font-family: var(--mono);
+    font-size: 0.76rem;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .stat, .summary, .callout { transition: border-color 0.15s ease; }
+  }
+</style>
+
+<div class="page">
+
+  <header>
+    <span class="kicker">Architecture briefing — image comparison pipeline</span>
+    <h1>Multi-Case Reconciliation</h1>
+    <p class="dek">
+      How the pipeline now handles more than one human review case per image,
+      why a batch-window gap was silently dropping delayed AI submissions, and
+      what it takes to ship both fixes safely.
+    </p>
+    <div class="meta-row">
+      <span>Prepared for <b>engineering manager</b></span>
+      <span>Scope: <b>comparison pipeline</b></span>
+      <span>Status: <b>ready to deploy pending migration</b></span>
+    </div>
+  </header>
+
+  <div class="summary">
+    <p>
+      The pipeline used to assume <strong>one human case per image</strong>. It
+      now supports several independent cases sharing a single AI submission,
+      closes a gap where AI data arriving late — up to three hours behind, at
+      peak — was silently skipped, and fixes a sequencing bug in how AI
+      comparison rounds were numbered.
+    </p>
+    <p>
+      Existing usage is unaffected: images that only ever had one case behave
+      exactly as before. Shipping requires one database migration, run once,
+      before deploy — outlined below.
+    </p>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><span class="n">1</span><span class="l">new table</span></div>
+    <div class="stat"><span class="n">4</span><span class="l">tables updated</span></div>
+    <div class="stat"><span class="n">6h</span><span class="l">backlog tolerance</span></div>
+    <div class="stat"><span class="n">67</span><span class="l">automated tests passing</span></div>
+  </div>
+
+  <section>
+    <span class="kicker">Why</span>
+    <h2>One image, more than one case</h2>
+    <p>
+      A single AI submission for an image can now open several separate human
+      review cases — each one needs to be compared against that AI data
+      independently, tracked on its own timeline, matched to its own set of AI
+      iterations. The pipeline had no notion of a "case" distinct from
+      "image," so this wasn't representable before.
+    </p>
+    <p>
+      A second, unrelated problem surfaced while this work was underway: at
+      peak load, some AI submissions land in the source table up to three
+      hours after they logically occurred. The pipeline's batch windows only
+      ever move forward, so once a window closed, a late submission that
+      belonged to it was gone for good — the image was never compared, with no
+      error or alert to say so.
+    </p>
+  </section>
+
+  <section>
+    <span class="kicker">What changed</span>
+    <h2>Four changes, one release</h2>
+
+    <h3>Cases are now first-class</h3>
+    <p>
+      Matching, pending status, and expiry are tracked per case rather than
+      per image. Two cases opened against the same image are compared
+      independently and never interfere with each other.
+    </p>
+
+    <h3>AI submissions are kept, not consumed</h3>
+    <p>
+      Previously, once an AI submission matched a case, it was discarded — a
+      case discovered afterward could never be compared against it. AI
+      submissions are now retained and reused across every case for that
+      image, including cases opened well after the AI data first arrived.
+    </p>
+
+    <h3>Late AI data is no longer dropped</h3>
+    <p>
+      Batch reads now look six hours further back by default, catching
+      submissions delayed by backlog. A safeguard keyed to each submission's
+      own identity prevents this from re-processing anything already
+      handled — no duplicate comparison rows get created by re-reading the
+      same data.
+    </p>
+
+    <h3>Comparison round numbering, corrected</h3>
+    <p>
+      Under load, a submission could occasionally be assigned a lower round
+      number than one that was chronologically earlier but arrived later. This
+      is fixed for everything compared going forward. Rows already written
+      under the old numbering are not retroactively corrected — see Risk &amp;
+      Rollout below.
+    </p>
+
+    <div class="compare-wrap">
+      <table>
+        <caption>Core behavior — before and after</caption>
+        <thead>
+          <tr><th>Behavior</th><th>Before</th><th>After</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">Cases per image</th>
+            <td>Exactly one</td>
+            <td>Any number, tracked independently</td>
+          </tr>
+          <tr>
+            <th scope="row">AI submission lifecycle</th>
+            <td>Discarded after first match</td>
+            <td>Retained; reused by every case</td>
+          </tr>
+          <tr>
+            <th scope="row">Delayed AI data</th>
+            <td>Permanently missed once its window closed</td>
+            <td>Caught within a 6-hour trailing window</td>
+          </tr>
+          <tr>
+            <th scope="row">Expiry of stale items</th>
+            <td>One old item could expire an entire image's backlog at once</td>
+            <td>Each case and each AI submission expires on its own timeline</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <span class="kicker">Risk &amp; rollout</span>
+    <h2>What it takes to deploy</h2>
+    <p>
+      The new structure requires a one-time database migration before this
+      version is deployed — the pipeline will refuse to write against the old
+      table shape rather than silently corrupt data, so this is a hard
+      prerequisite, not an optional cleanup step.
+    </p>
+
+    <div class="callout">
+      <span class="kicker">Migration — run once, before deploy</span>
+      <ol class="steps">
+        <li>Create the new AI-submission table.</li>
+        <li>Move currently in-flight AI submissions into it.</li>
+        <li>Add case tracking to the existing pending-work table.</li>
+        <li>Add the new case field to the results and audit tables (additive — no downtime).</li>
+      </ol>
+    </div>
+
+    <p>
+      No submission or comparison data is lost in the migration — everything
+      that can be preserved is. The one exception is deliberate: the old
+      "how many rounds matched" counter is replaced by a more precise
+      per-round record, and that old counter never recorded <em>which</em>
+      rounds it referred to — so there's nothing more specific to carry
+      forward, and none of that data is still reachable elsewhere in the
+      system to recover.
+    </p>
+    <p>
+      Both fixes are covered by automated tests, including two written
+      specifically against the failure modes this change set out to close:
+      a case discovered after the fact still gets compared against prior AI
+      history, and a late-arriving AI submission is never compared twice.
+    </p>
+  </section>
+
+  <section>
+    <span class="kicker">Unaffected</span>
+    <h2>What didn't change</h2>
+    <ul class="unchanged">
+      <li>Field-level comparison and match logic — untouched.</li>
+      <li>Existing single-case images — identical behavior to today.</li>
+      <li>Primary output tables keep their names; only new, optional fields are added.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>Image Comparison Pipeline</span>
+    <span>Full technical change log available on request</span>
+  </footer>
+
+</div>

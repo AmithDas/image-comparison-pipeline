@@ -472,4 +472,52 @@ public class FilterAndPairFnTest {
         PAssert.that(aiAgedOut(routed)).empty();
         pipeline.run().waitUntilFinish();
     }
+
+    /**
+     * Regression test for the AI lookback: an AI row a case already matched (its
+     * dedup key is already in matched_ai_keys) reappears as a fresh SOURCE row on a
+     * later run — e.g. re-selected by --aiLookbackHours even though it's no longer
+     * present in the AI pending pool for this scenario. It must NOT be matched again.
+     *
+     * This is exactly the scenario that would have silently duplicated comparison_results
+     * rows under the old matched_ai_count (a count, not an identity set) design, once an
+     * AI source read could re-select an already-matched row across separate runs.
+     */
+    @Test
+    public void reappearingMatchedAiProducesNoDuplicate() {
+        String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
+        String matchedKey  = aiDedupKey("img007", aiCreatedAt);
+
+        TableRow casePending = casePendingRow("img007", "human", "key1",
+                "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
+                0L, null, matchedKey);
+
+        // Same AI payload reappears as a fresh source row (simulating a lookback re-read).
+        TableRow aiAgain = sourceRow("img007", AI_METHOD, "key1", aiCreatedAt);
+
+        PCollectionTuple routed = runPipeline("img007",
+                List.of(aiAgain), List.of(casePending), List.of());
+
+        PAssert.that(matched(routed)).empty();
+
+        PAssert.that(casePending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals(1, list.size());
+            assertEquals("matched_ai_keys should be unchanged — no new match",
+                    matchedKey, list.get(0).get("matched_ai_keys").toString());
+            return null;
+        });
+
+        PAssert.that(aiPending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("Reappeared AI row is retained, not re-matched", 1, list.size());
+            return null;
+        });
+
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
+        pipeline.run().waitUntilFinish();
+    }
 }
