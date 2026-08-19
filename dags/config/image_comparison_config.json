@@ -20,6 +20,7 @@
 
     "image_name_field":      "queueImages[0].fileName",
     "human_lookback_days":   180,
+    "ai_lookback_hours":     6,
     "firestore_collection":  "dek_store",
     "kms_key_path":          "projects/p/locations/l/keyRings/r/cryptoKeys/k",
 

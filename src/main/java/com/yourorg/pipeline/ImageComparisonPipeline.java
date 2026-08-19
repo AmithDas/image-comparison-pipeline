@@ -198,6 +198,16 @@ public class ImageComparisonPipeline {
         ValueProvider<Integer> getHumanLookbackDays();
         void setHumanLookbackDays(ValueProvider<Integer> value);
 
+        @Description("How far back (in hours) to read AI source rows relative to windowEnd. "
+                + "Allows AI payloads written late due to source-table backlog (created_at falls "
+                + "in an already-processed window, but the row isn't actually inserted until "
+                + "later) to still be picked up. Re-read rows are deduped against "
+                + "ai_pending_comparisons by (payload, created_at), so widening this does not "
+                + "produce duplicate matches. Default: 6.")
+        @Default.Integer(6)
+        ValueProvider<Integer> getAiLookbackHours();
+        void setAiLookbackHours(ValueProvider<Integer> value);
+
         @Description("Existing BigQuery dataset for temporary query materialisation tables. "
                 + "Prevents Dataflow from auto-creating a new temp dataset on each run. "
                 + "Format: project:dataset  (e.g. your-project:pipeline_temp)")
@@ -234,11 +244,12 @@ public class ImageComparisonPipeline {
         // (one AI read, one human read, one pending read) regardless of how many
         // segments are configured.  All runtime parameters are resolved on workers.
 
-        // Lazy window providers: first .get() per worker JVM claims the window
-        // in BigQuery using the Dataflow SA, then caches the result.
-        ValueProvider<String> windowStart =
-                new WindowValueProvider(options.getLookupTable(), options.getPipelineName(), true);
-        ValueProvider<String> windowEnd   =
+        // Lazy window provider: first .get() per worker JVM claims the window
+        // in BigQuery using the Dataflow SA, then caches the result. Only windowEnd
+        // is read externally — both AI and human reads use a trailing lookback from
+        // windowEnd rather than a hard windowStart floor, so late-arriving rows from
+        // either source aren't permanently missed once their window has passed.
+        ValueProvider<String> windowEnd =
                 new WindowValueProvider(options.getLookupTable(), options.getPipelineName(), false);
 
         // queryTempDataset is static infrastructure — resolved at template build time.
@@ -249,7 +260,8 @@ public class ImageComparisonPipeline {
                 .apply("ReadAi",
                         BigQueryIO.readTableRows()
                                 .fromQuery(new AiSourceQueryProvider(
-                                        options.getAiSourceTable(), windowStart, windowEnd))
+                                        options.getAiSourceTable(), windowEnd,
+                                        options.getAiLookbackHours()))
                                 .usingStandardSql()
                                 .withQueryTempDataset(queryTempDataset))
                 .apply("KeyAi",
@@ -497,32 +509,46 @@ public class ImageComparisonPipeline {
 
     // ── AiSourceQueryProvider ─────────────────────────────────────────────────
 
-    /** AI rows in the current processing window: {@code [windowStart, windowEnd)}. */
+    /**
+     * AI rows from {@code lookbackHours} before {@code windowEnd} up to {@code windowEnd}.
+     *
+     * <p>Uses a trailing lookback rather than a hard {@code windowStart} floor because the
+     * AI source table can have insertion backlog: a row's {@code created_at} can fall inside
+     * an already-processed window even though the row itself isn't written to the table
+     * until later. A hard floor would permanently miss such rows once the window has
+     * advanced past them. Re-reading a wider window is safe — rows already known are
+     * deduped against {@code ai_pending_comparisons} by {@code (payload, created_at)} in
+     * {@link FilterAndPairFn}, so this does not produce duplicate matches.
+     */
     private static final class AiSourceQueryProvider
             implements ValueProvider<String>, Serializable {
 
-        private final ValueProvider<String> table;
-        private final ValueProvider<String> windowStart;
-        private final ValueProvider<String> windowEnd;
+        private final ValueProvider<String>  table;
+        private final ValueProvider<String>  windowEnd;
+        private final ValueProvider<Integer> lookbackHours;
 
-        AiSourceQueryProvider(ValueProvider<String> table,
-                               ValueProvider<String> windowStart,
-                               ValueProvider<String> windowEnd) {
-            this.table       = table;
-            this.windowStart = windowStart;
-            this.windowEnd   = windowEnd;
+        AiSourceQueryProvider(ValueProvider<String>  table,
+                               ValueProvider<String>  windowEnd,
+                               ValueProvider<Integer> lookbackHours) {
+            this.table         = table;
+            this.windowEnd     = windowEnd;
+            this.lookbackHours = lookbackHours;
         }
 
         @Override
         public String get() {
             return String.format(
-                    "SELECT * FROM `%s` WHERE created_at >= '%s' AND created_at < '%s'",
-                    table.get().replace(':', '.'), windowStart.get(), windowEnd.get());
+                    "SELECT * FROM `%s`"
+                    + " WHERE created_at >= TIMESTAMP_SUB('%s', INTERVAL %d HOUR)"
+                    + " AND created_at < '%s'",
+                    table.get().replace(':', '.'),
+                    windowEnd.get(), lookbackHours.get(),
+                    windowEnd.get());
         }
 
         @Override
         public boolean isAccessible() {
-            return table.isAccessible() && windowStart.isAccessible() && windowEnd.isAccessible();
+            return table.isAccessible() && windowEnd.isAccessible() && lookbackHours.isAccessible();
         }
     }
 
