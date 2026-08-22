@@ -179,7 +179,7 @@ public class FilterAndPairFn
             String        caseKey  = normalizeCaseKey(str(p.get("case_id")));
             String        pType    = str(p.get("pending_type"));
             String        createdAt = str(p.get("created_at"));
-            casePendingMeta.put(caseKey + "|" + pType + ":" + createdAt, p);
+            casePendingMeta.merge(caseStateKey(caseKey, pType), p, FilterAndPairFn::mergeCaseMeta);
 
             GenericRecord rec = newPayloadRow(imageId, str(p.get("key_id")), "human",
                     str(p.get("payload")), createdAt);
@@ -217,7 +217,7 @@ public class FilterAndPairFn
                     GenericRecord r = e.getValue();
                     String cAt   = str(r.get("created_at"));
                     String pType = "default".equals(subType) ? "human" : "human:" + subType;
-                    GenericRecord meta = casePendingMeta.get(caseKey + "|" + pType + ":" + cAt);
+                    GenericRecord meta = casePendingMeta.get(caseStateKey(caseKey, pType));
                     Instant firstSeen = meta != null ? parseInstant(str(meta.get("first_seen_at"))) : null;
                     if (firstSeen == null) firstSeen = now;
                     long daysWaited = ChronoUnit.DAYS.between(firstSeen, now);
@@ -235,7 +235,7 @@ public class FilterAndPairFn
             String        humanPType = resolvedPendingType(subTypes, seg);
             String        hCAt       = str(humanRec.get("created_at"));
 
-            GenericRecord meta = casePendingMeta.get(caseKey + "|" + humanPType + ":" + hCAt);
+            GenericRecord meta = casePendingMeta.get(caseStateKey(caseKey, humanPType));
             Set<String> matchedKeys = parseKeys(meta != null ? str(meta.get("matched_ai_keys")) : null);
             Instant firstSeen = meta != null ? parseInstant(str(meta.get("first_seen_at"))) : null;
             if (firstSeen == null) firstSeen = now;
@@ -274,6 +274,35 @@ public class FilterAndPairFn
 
     private static String displayCase(String caseKey) {
         return caseKey.isEmpty() ? "<none>" : caseKey;
+    }
+
+    private static String caseStateKey(String caseKey, String pendingType) {
+        return caseKey + "|" + pendingType;
+    }
+
+    private static GenericRecord mergeCaseMeta(GenericRecord left, GenericRecord right) {
+        Set<String> matchedKeys = parseKeys(str(left.get("matched_ai_keys")));
+        matchedKeys.addAll(parseKeys(str(right.get("matched_ai_keys"))));
+
+        String leftFirstSeen  = str(left.get("first_seen_at"));
+        String rightFirstSeen = str(right.get("first_seen_at"));
+        if (rightFirstSeen != null
+                && (leftFirstSeen == null || rightFirstSeen.compareTo(leftFirstSeen) < 0)) {
+            left.put("first_seen_at", rightFirstSeen);
+        }
+
+        String leftRetried  = str(left.get("last_retried_at"));
+        String rightRetried = str(right.get("last_retried_at"));
+        if (rightRetried != null
+                && (leftRetried == null || rightRetried.compareTo(leftRetried) > 0)) {
+            left.put("last_retried_at", rightRetried);
+        }
+
+        left.put("retry_count", Math.max(
+                parseLong(left.get("retry_count")),
+                parseLong(right.get("retry_count"))));
+        left.put("matched_ai_keys", joinKeys(matchedKeys));
+        return left;
     }
 
     /** Folds a fresh SOURCE-tag human row in, keeping the latest on duplicate sub-type collision. */
