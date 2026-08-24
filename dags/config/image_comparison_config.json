@@ -16,6 +16,7 @@
     "pending_table":          "your-project:dataset.pending_comparisons",
     "ai_pending_table":       "your-project:dataset.ai_pending_comparisons",
     "dead_letter_table":      "your-project:dataset.dead_letter_comparisons",
+    "scope_events_table":     "your-project:dataset.comparison_scope_events",
     "query_temp_dataset":     "your-project:pipeline_temp",
 
     "image_name_field":      "queueImages[0].fileName",

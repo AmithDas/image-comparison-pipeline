@@ -197,27 +197,6 @@ public class FlattenAndCompareFn
         Map<String, String> rootToLabel = rootToLabelBySegment.getOrDefault(
                 segment, Collections.emptyMap());
 
-        // Scope the AI side to only the segment_type(s) this case's own human payload
-        // actually covers. Without this, a case only owning e.g. segment_type "docreview"
-        // gets compared against the full AI payload (which covers every segment_type for
-        // the image), producing false "human_value=null" mismatch rows for every field
-        // that belongs to a different, unrelated case's segment_type. Skipped entirely for
-        // the no-case bucket (caseId == null) and for segments with no segmentTypeMappings
-        // configured, so single-case behavior is completely unchanged — a real "AI has it,
-        // human never touched it" mismatch must still be reported there.
-        if (caseId != null && !rootToLabel.isEmpty()) {
-            Set<String> configuredSegmentTypes = new HashSet<>(rootToLabel.values());
-            Set<String> caseSegmentTypes = new HashSet<>();
-            for (Map.Entry<String, List<FieldValue>> e : humanFields.entrySet()) {
-                for (FieldValue fv : e.getValue()) {
-                    String st = resolveSegmentType(e.getKey(), fv.matchKey, rootToLabel);
-                    if (st != null) caseSegmentTypes.add(st);
-                }
-            }
-            aiFields = excludeForeignSegmentTypes(
-                    aiFields, rootToLabel, configuredSegmentTypes, caseSegmentTypes);
-        }
-
         // Soft-match: for each configured array, compute exact-first / positional-fallback
         // remaps and apply them scoped to that array path only.  Processing each array
         // independently prevents two arrays that share the same parent key prefix (e.g.
@@ -350,34 +329,6 @@ public class FlattenAndCompareFn
             return null;
         }
         return rootToLabel.getOrDefault(root, root);
-    }
-
-    /**
-     * Drops AI field values whose resolved segment_type is a *recognized* (configured
-     * in segmentTypeMappings) label that this case doesn't own. Values whose segment_type
-     * is null (no dot/arrayKey, or an unconfigured root) are left alone — those are either
-     * scalars with no segment_type concept at all, or fields shared across every case for
-     * this segment — only a genuinely foreign, configured segment_type is excluded.
-     */
-    private static Map<String, List<FieldValue>> excludeForeignSegmentTypes(
-            Map<String, List<FieldValue>> fields,
-            Map<String, String> rootToLabel,
-            Set<String> configuredSegmentTypes,
-            Set<String> caseSegmentTypes) {
-        Map<String, List<FieldValue>> result = new LinkedHashMap<>();
-        for (Map.Entry<String, List<FieldValue>> e : fields.entrySet()) {
-            List<FieldValue> kept = e.getValue().stream()
-                    .filter(fv -> {
-                        String st = resolveSegmentType(e.getKey(), fv.matchKey, rootToLabel);
-                        boolean foreign = st != null
-                                && configuredSegmentTypes.contains(st)
-                                && !caseSegmentTypes.contains(st);
-                        return !foreign;
-                    })
-                    .collect(Collectors.toList());
-            if (!kept.isEmpty()) result.put(e.getKey(), kept);
-        }
-        return result;
     }
 
     private static String rename(String key, Map<String, String> aiToHuman) {

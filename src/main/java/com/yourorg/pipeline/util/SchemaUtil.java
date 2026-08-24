@@ -20,6 +20,10 @@ public final class SchemaUtil {
         return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.COMPARISON_RESULT));
     }
 
+    public static TableSchema comparisonScopeEventSchema() {
+        return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.COMPARISON_SCOPE_EVENT));
+    }
+
     public static TableSchema pendingSchema() {
         return toTableSchema(SchemaRegistry.getInstance().get(SchemaRegistry.PENDING_ROW));
     }

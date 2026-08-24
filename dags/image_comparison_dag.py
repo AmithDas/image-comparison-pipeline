@@ -83,6 +83,7 @@ def _dataflow_parameters() -> dict:
         "pendingTable":         _PIPE["pending_table"],
         "aiPendingTable":       _PIPE["ai_pending_table"],
         "deadLetterTable":      _PIPE["dead_letter_table"],
+        "scopeEventsTable":     _PIPE["scope_events_table"],
         "segmentConfigs":       _SEGMENT_CONFIGS_JSON,
         "imageNameField":       _PIPE["image_name_field"],
         "humanLookbackDays":    str(_PIPE["human_lookback_days"]),

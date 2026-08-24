@@ -151,7 +151,32 @@ OPTIONS (
 
 
 -- ------------------------------------------------------------
--- 5. Dead-letter table
+-- 5. Comparison scope events table
+--    Append-only event stream used to derive currently unmatched AI scopes.
+--    Mirrors src/main/resources/avro/comparison_scope_event.json.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `your_project.your_dataset.comparison_scope_events` (
+  image_id      STRING    NOT NULL,
+  segment       STRING    NOT NULL,
+  ai_created_at TIMESTAMP,
+  segment_type  STRING    NOT NULL,
+  scope_level   STRING    NOT NULL,   -- 'segment_type', 'array_entity', or 'soft_array_parent'
+  scope_key     STRING    NOT NULL,   -- segment-only marker, array_key, or normalized parent array_key
+  event_type    STRING    NOT NULL,   -- 'AI_SCOPE_DISCOVERED' or 'HUMAN_SCOPE_COVERED'
+  case_id       STRING,               -- populated only for HUMAN_SCOPE_COVERED events
+  load_time     TIMESTAMP NOT NULL
+)
+PARTITION BY DATE(load_time)
+CLUSTER BY image_id, segment_type, scope_level, scope_key
+OPTIONS (
+  description = "Append-only scope event stream derived from comparison_results. "
+                "Used by unmatched_ai_scopes_current_view to show AI scopes that no "
+                "human case has covered yet."
+);
+
+
+-- ------------------------------------------------------------
+-- 6. Dead-letter table
 --    Payloads that exceeded MAX_WAIT_DAYS (FilterAndPairFn.MAX_WAIT_DAYS)
 --    without a counterpart, from either pending_comparisons or
 --    ai_pending_comparisons.
@@ -176,7 +201,7 @@ OPTIONS (
 
 
 -- ------------------------------------------------------------
--- 6. Pipeline window lookup table
+-- 7. Pipeline window lookup table
 --    Drives the pipeline's own window management (see WindowManager /
 --    ImageComparisonPipeline.WindowValueProvider). The Dataflow job — not
 --    the Airflow DAG — claims and advances this row on each run:

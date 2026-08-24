@@ -51,6 +51,36 @@ public class SchemaUtilTest {
         assertEquals("NULLABLE", fields.get("human_value").getMode());
     }
 
+    // ── comparisonScopeEventSchema ────────────────────────────────────────────
+
+    @Test
+    public void comparisonScopeEventSchemaFields() {
+        Map<String, TableFieldSchema> fields = fieldMap(SchemaUtil.comparisonScopeEventSchema());
+
+        assertEquals("STRING", fields.get("image_id").getType());
+        assertEquals("STRING", fields.get("segment").getType());
+        assertEquals("TIMESTAMP", fields.get("ai_created_at").getType());
+        assertEquals("STRING", fields.get("segment_type").getType());
+        assertEquals("STRING", fields.get("scope_level").getType());
+        assertEquals("STRING", fields.get("scope_key").getType());
+        assertEquals("STRING", fields.get("event_type").getType());
+        assertEquals("STRING", fields.get("case_id").getType());
+        assertEquals("TIMESTAMP", fields.get("load_time").getType());
+    }
+
+    @Test
+    public void comparisonScopeEventSchemaModes() {
+        Map<String, TableFieldSchema> fields = fieldMap(SchemaUtil.comparisonScopeEventSchema());
+
+        assertEquals("REQUIRED", fields.get("image_id").getMode());
+        assertEquals("REQUIRED", fields.get("segment_type").getMode());
+        assertEquals("REQUIRED", fields.get("scope_level").getMode());
+        assertEquals("REQUIRED", fields.get("scope_key").getMode());
+        assertEquals("REQUIRED", fields.get("event_type").getMode());
+        assertEquals("NULLABLE", fields.get("case_id").getMode());
+        assertEquals("NULLABLE", fields.get("ai_created_at").getMode());
+    }
+
     // ── pendingSchema ─────────────────────────────────────────────────────────
 
     @Test

@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "ComparisonScopeEvent",
+  "namespace": "com.yourorg.pipeline",
+  "fields": [
+    {"name": "image_id",      "type": "string"},
+    {"name": "segment",       "type": "string"},
+    {"name": "ai_created_at", "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
+    {"name": "segment_type",  "type": "string"},
+    {"name": "scope_level",   "type": "string"},
+    {"name": "scope_key",     "type": "string"},
+    {"name": "event_type",    "type": "string"},
+    {"name": "case_id",       "type": ["null", "string"], "default": null},
+    {"name": "load_time",     "type": "string", "bqType": "TIMESTAMP"}
+  ]
+}

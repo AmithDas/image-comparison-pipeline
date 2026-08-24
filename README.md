@@ -122,7 +122,8 @@ mvn compile exec:java \
     --sourceTable=project:dataset.image_payloads \
     --outputTable=project:dataset.image_comparison_results \
     --pendingTable=project:dataset.pending_comparisons \
-    --deadLetterTable=project:dataset.dead_letter_comparisons"
+    --deadLetterTable=project:dataset.dead_letter_comparisons \
+    --scopeEventsTable=project:dataset.comparison_scope_events"
 ```
 
 ## Running on Dataflow
@@ -140,7 +141,8 @@ java -jar target/image-comparison-pipeline-1.0.0.jar \
   --sourceTable=your-project:your_dataset.image_payloads \
   --outputTable=your-project:your_dataset.image_comparison_results \
   --pendingTable=your-project:your_dataset.pending_comparisons \
-  --deadLetterTable=your-project:your_dataset.dead_letter_comparisons
+  --deadLetterTable=your-project:your_dataset.dead_letter_comparisons \
+  --scopeEventsTable=your-project:your_dataset.comparison_scope_events
 ```
 
 ## Scheduling (Cloud Scheduler)
@@ -157,6 +159,7 @@ Use Cloud Scheduler → Cloud Run Jobs or Dataflow Flex Templates for hourly/dai
 | `--outputTable` | Comparison results output table |
 | `--pendingTable` | Pending state table (WRITE_TRUNCATE each run) |
 | `--deadLetterTable` | Dead-letter table for aged-out payloads |
+| `--scopeEventsTable` | Append-only comparison scope event table |
 
 To change the maximum wait threshold, update `MAX_WAIT_DAYS` in `FilterAndPairFn.java` (default: 7 days).
 

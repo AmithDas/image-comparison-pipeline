@@ -96,6 +96,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *       --pendingTable=project:dataset.pending_comparisons \
  *       --aiPendingTable=project:dataset.ai_pending_comparisons \
  *       --deadLetterTable=project:dataset.dead_letter_comparisons \
+ *       --scopeEventsTable=project:dataset.comparison_scope_events \
  *       --segmentConfigs='[...]' \
  *       --firestoreCollection=dek_store \
  *       --kmsKeyPath=projects/p/locations/l/keyRings/r/cryptoKeys/k"
@@ -157,6 +158,13 @@ public class ImageComparisonPipeline {
         @Validation.Required
         ValueProvider<String> getDeadLetterTable();
         void setDeadLetterTable(ValueProvider<String> value);
+
+        @Description("Append-only BigQuery table of AI scope discovered and human scope covered "
+                + "events. Used to derive currently unmatched AI scopes. "
+                + "Format: project:dataset.table")
+        @Validation.Required
+        ValueProvider<String> getScopeEventsTable();
+        void setScopeEventsTable(ValueProvider<String> value);
 
         @Description(
                 "JSON array of segment configurations. Each entry must have: "
@@ -430,6 +438,15 @@ public class ImageComparisonPipeline {
                                 .withWriteDisposition(WriteDisposition.WRITE_APPEND)
                                 .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
 
+        WriteResult scopeEventWrite = comparisonResults
+                .apply("BuildComparisonScopeEvents", ParDo.of(new ComparisonScopeEventFn()))
+                .apply("WriteComparisonScopeEvents",
+                        BigQueryIO.writeTableRows()
+                                .to(options.getScopeEventsTable())
+                                .withSchema(SchemaUtil.comparisonScopeEventSchema())
+                                .withWriteDisposition(WriteDisposition.WRITE_APPEND)
+                                .withCreateDisposition(CreateDisposition.CREATE_IF_NEEDED));
+
         // ── Advance window checkpoint after all writes succeed ─────────────────
         // Wait.on blocks the trigger element until all WriteResult signals are done.
         // getSuccessfulTableLoads() fires once per BQ load job (batch FILE_LOADS);
@@ -442,7 +459,8 @@ public class ImageComparisonPipeline {
                         compWrite.getSuccessfulTableLoads(),
                         casePendingWrite.getSuccessfulTableLoads(),
                         aiPendingWrite.getSuccessfulTableLoads(),
-                        deadLetterWrite.getSuccessfulTableLoads()))
+                        deadLetterWrite.getSuccessfulTableLoads(),
+                        scopeEventWrite.getSuccessfulTableLoads()))
                 .apply("AdvanceWindow",
                         ParDo.of(new AdvanceWindowFn(
                                 options.getLookupTable(), options.getPipelineName())));
@@ -649,6 +667,87 @@ public class ImageComparisonPipeline {
             BigQuery bq  = BigQueryOptions.getDefaultInstance().getService();
             new WindowManager(bq, table, name).advance();
             LOG.info("WindowManager [{}]: checkpoint advanced (last_extracted = current_stop)", name);
+        }
+    }
+
+    // ── ComparisonScopeEventFn ───────────────────────────────────────────────
+
+    /**
+     * Converts field-level comparison rows into append-only scope events. A scope
+     * is the finest comparable unit available in the flattened output:
+     * segment_type, segment_type+array_key, or a soft-array parent for dispute
+     * code arrays whose emitted keys include AI/human code pairing suffixes.
+     */
+    private static final class ComparisonScopeEventFn extends DoFn<TableRow, TableRow> {
+
+        private static final String AI_SCOPE_DISCOVERED = "AI_SCOPE_DISCOVERED";
+        private static final String HUMAN_SCOPE_COVERED = "HUMAN_SCOPE_COVERED";
+        private static final String SEGMENT_TYPE_ONLY = "__SEGMENT_TYPE_ONLY__";
+
+        @ProcessElement
+        public void processElement(ProcessContext ctx) {
+            TableRow row = ctx.element();
+            String segmentType = str(row.get("segment_type"));
+            if (segmentType == null) return;
+
+            String arrayKey = str(row.get("array_key"));
+            String fieldName = str(row.get("field_name"));
+            String scopeLevel = scopeLevel(fieldName, arrayKey);
+            String scopeKey = scopeKey(fieldName, arrayKey);
+
+            if (row.get("ai_value") != null) {
+                ctx.output(scopeEvent(row, AI_SCOPE_DISCOVERED, null, scopeLevel, scopeKey));
+            }
+            if (row.get("human_value") != null) {
+                ctx.output(scopeEvent(row, HUMAN_SCOPE_COVERED, str(row.get("case_id")),
+                        scopeLevel, scopeKey));
+            }
+        }
+
+        private static TableRow scopeEvent(TableRow row, String eventType, String caseId,
+                                           String scopeLevel, String scopeKey) {
+            return new TableRow()
+                    .set("image_id",      str(row.get("image_id")))
+                    .set("segment",       str(row.get("segment")))
+                    .set("ai_created_at", str(row.get("ai_created_at")))
+                    .set("segment_type",  str(row.get("segment_type")))
+                    .set("scope_level",   scopeLevel)
+                    .set("scope_key",     scopeKey)
+                    .set("event_type",    eventType)
+                    .set("case_id",       caseId)
+                    .set("load_time",     str(row.get("load_time")));
+        }
+
+        private static String scopeLevel(String fieldName, String arrayKey) {
+            if (arrayKey != null && isSoftArrayField(fieldName)) return "soft_array_parent";
+            if (arrayKey != null) return "array_entity";
+            return "segment_type";
+        }
+
+        private static String scopeKey(String fieldName, String arrayKey) {
+            if (arrayKey != null && isSoftArrayField(fieldName)) return parentArrayKey(arrayKey);
+            if (arrayKey != null) return arrayKey;
+            return SEGMENT_TYPE_ONLY;
+        }
+
+        private static boolean isSoftArrayField(String fieldName) {
+            return fieldName != null && (
+                    fieldName.equals("tradelines.tradelineRequest.disputeCodes")
+                    || fieldName.startsWith("tradelines.tradelineRequest.disputeCodes.")
+                    || fieldName.equals("credit.dob.disputeCodes")
+                    || fieldName.startsWith("credit.dob.disputeCodes.")
+                    || fieldName.equals("credit.ssn.disputeCodes")
+                    || fieldName.startsWith("credit.ssn.disputeCodes.")
+                    || fieldName.equals("nonReported.disputeCodes")
+                    || fieldName.startsWith("nonReported.disputeCodes."));
+        }
+
+        private static String parentArrayKey(String arrayKey) {
+            int lastDash = arrayKey.lastIndexOf('-');
+            if (lastDash < 0) return arrayKey;
+            int secondLastDash = arrayKey.lastIndexOf('-', lastDash - 1);
+            if (secondLastDash < 0) return arrayKey;
+            return arrayKey.substring(0, secondLastDash);
         }
     }
 
