@@ -99,10 +99,20 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_comparisons` (
   first_seen_at     TIMESTAMP NOT NULL,   -- when first written to pending
   last_retried_at   TIMESTAMP,            -- updated on each pipeline run
   retry_count       INT64     NOT NULL,   -- incremented on each retry
-  matched_ai_keys   STRING                -- semicolon-joined identity keys of AI payloads already
+  matched_ai_keys   STRING,               -- semicolon-joined identity keys of AI payloads already
                                            -- matched against this case (see FilterAndPairFn dedup
                                            -- key: payload + "|" + created_at); null/empty if none yet.
-                                           -- Its element count is this case's next ai_iteration - 1.
+                                           -- Used ONLY to check "have I matched this exact AI row
+                                           -- before" — never used to derive the next ai_iteration
+                                           -- number, since its cardinality isn't a safe proxy for a
+                                           -- sequence count (e.g. a defensive merge of two colliding
+                                           -- pending rows unions this set, which can grow it without
+                                           -- a corresponding real match).
+  next_ai_iteration INT64     NOT NULL    -- explicit, monotonically-incrementing counter: the next
+                                           -- ai_iteration number this case will assign. Incremented
+                                           -- by exactly the number of AI rows matched each run;
+                                           -- resolved via MAX (never derived from matched_ai_keys)
+                                           -- when two pending rows for the same case are merged.
 )
 PARTITION BY DATE(first_seen_at)
 OPTIONS (

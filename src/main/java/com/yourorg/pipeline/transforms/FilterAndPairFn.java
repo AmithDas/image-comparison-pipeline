@@ -226,7 +226,8 @@ public class FilterAndPairFn
                     emitCasePendingOrAgedOut(ctx, imageId, segment, caseKey,
                             str(r.get("key_id")), pType, str(r.get("payload")), cAt,
                             firstSeen, now, metaRetryCount(meta), daysWaited,
-                            meta != null ? str(meta.get("matched_ai_keys")) : null);
+                            meta != null ? str(meta.get("matched_ai_keys")) : null,
+                            metaNextIteration(meta));
                 }
                 continue;
             }
@@ -237,6 +238,11 @@ public class FilterAndPairFn
 
             GenericRecord meta = casePendingMeta.get(caseStateKey(caseKey, humanPType));
             Set<String> matchedKeys = parseKeys(meta != null ? str(meta.get("matched_ai_keys")) : null);
+            // The explicit counter — never matchedKeys.size() — is what determines the next
+            // iteration number. matchedKeys can grow via a defensive merge (see mergeCaseMeta)
+            // without a corresponding real match, so its cardinality is not a safe stand-in
+            // for "how many AI rows has this case actually been matched against."
+            long nextIteration = metaNextIteration(meta);
             Instant firstSeen = meta != null ? parseInstant(str(meta.get("first_seen_at"))) : null;
             if (firstSeen == null) firstSeen = now;
             long daysWaited = ChronoUnit.DAYS.between(firstSeen, now);
@@ -247,7 +253,7 @@ public class FilterAndPairFn
             }
 
             if (!unmatched.isEmpty()) {
-                long startIteration = matchedKeys.size();
+                long startIteration = nextIteration;
                 for (int i = 0; i < unmatched.size(); i++) {
                     long iteration = startIteration + i + 1;
                     ctx.output(MATCHED, KV.of(
@@ -255,14 +261,16 @@ public class FilterAndPairFn
                             KV.of(humanRec, unmatched.get(i))));
                     matchedKeys.add(dedupKey(unmatched.get(i)));
                 }
+                nextIteration += unmatched.size();
                 LOG.info("Matched imageId={} segment={} case={} — {} new AI iteration(s), "
                         + "iterations {}-{}", imageId, segment, displayCase(caseKey),
-                        unmatched.size(), startIteration + 1, matchedKeys.size());
+                        unmatched.size(), startIteration + 1, nextIteration);
             }
 
             emitCasePendingOrAgedOut(ctx, imageId, segment, caseKey,
                     str(humanRec.get("key_id")), humanPType, str(humanRec.get("payload")), hCAt,
-                    firstSeen, now, metaRetryCount(meta), daysWaited, joinKeys(matchedKeys));
+                    firstSeen, now, metaRetryCount(meta), daysWaited, joinKeys(matchedKeys),
+                    nextIteration);
         }
     }
 
@@ -284,6 +292,14 @@ public class FilterAndPairFn
         Set<String> matchedKeys = parseKeys(str(left.get("matched_ai_keys")));
         matchedKeys.addAll(parseKeys(str(right.get("matched_ai_keys"))));
 
+        // next_ai_iteration is resolved by MAX, never derived from matchedKeys.size() —
+        // the union above can grow the key set without a corresponding real match ever
+        // having happened, and deriving the iteration counter from it would let that
+        // inflate iteration numbers past what was actually emitted (skipping iteration 1
+        // on a case's genuine first match). MAX is safe because the counter only ever
+        // increases via real emissions on either side being merged.
+        long nextIteration = Math.max(metaNextIteration(left), metaNextIteration(right));
+
         String leftFirstSeen  = str(left.get("first_seen_at"));
         String rightFirstSeen = str(right.get("first_seen_at"));
         if (rightFirstSeen != null
@@ -302,6 +318,7 @@ public class FilterAndPairFn
                 parseLong(left.get("retry_count")),
                 parseLong(right.get("retry_count"))));
         left.put("matched_ai_keys", joinKeys(matchedKeys));
+        left.put("next_ai_iteration", nextIteration);
         return left;
     }
 
@@ -403,9 +420,9 @@ public class FilterAndPairFn
                                            String payload, String createdAt,
                                            Instant firstSeen, Instant now,
                                            long retryCount, long daysWaited,
-                                           String matchedAiKeys) {
+                                           String matchedAiKeys, long nextIteration) {
         GenericRecord row = newCasePendingRow(imageId, segment, caseKey, keyId, pendingType,
-                payload, createdAt, firstSeen, now, retryCount, matchedAiKeys);
+                payload, createdAt, firstSeen, now, retryCount, matchedAiKeys, nextIteration);
         if (daysWaited >= MAX_WAIT_DAYS) {
             ctx.output(CASE_AGED_OUT, row);
         } else {
@@ -423,6 +440,10 @@ public class FilterAndPairFn
         if (meta == null) return 0L;
         Object count = meta.get("retry_count");
         return count != null ? ((Number) count).longValue() + 1 : 0L;
+    }
+
+    private static long metaNextIteration(GenericRecord meta) {
+        return meta != null ? parseLong(meta.get("next_ai_iteration")) : 0L;
     }
 
     // ── Record construction ──────────────────────────────────────────────────
@@ -457,19 +478,21 @@ public class FilterAndPairFn
     private GenericRecord newCasePendingRow(String imageId, String segment, String caseKey,
                                              String keyId, String pendingType, String payload,
                                              String createdAt, Instant firstSeen, Instant now,
-                                             long retryCount, String matchedAiKeys) {
+                                             long retryCount, String matchedAiKeys,
+                                             long nextIteration) {
         GenericRecord r = new GenericData.Record(pendingSchema);
-        r.put("image_id",        imageId);
-        r.put("key_id",          keyId);
-        r.put("segment",         segment);
-        r.put("case_id",         caseKey.isEmpty() ? null : caseKey);
-        r.put("pending_type",    pendingType);
-        r.put("payload",         payload);
-        r.put("created_at",      createdAt);
-        r.put("first_seen_at",   TimestampUtil.formatInstant(firstSeen));
-        r.put("last_retried_at", TimestampUtil.formatInstant(now));
-        r.put("retry_count",     retryCount);
-        r.put("matched_ai_keys", matchedAiKeys);
+        r.put("image_id",          imageId);
+        r.put("key_id",            keyId);
+        r.put("segment",           segment);
+        r.put("case_id",           caseKey.isEmpty() ? null : caseKey);
+        r.put("pending_type",      pendingType);
+        r.put("payload",           payload);
+        r.put("created_at",        createdAt);
+        r.put("first_seen_at",     TimestampUtil.formatInstant(firstSeen));
+        r.put("last_retried_at",   TimestampUtil.formatInstant(now));
+        r.put("retry_count",       retryCount);
+        r.put("matched_ai_keys",   matchedAiKeys);
+        r.put("next_ai_iteration", nextIteration);
         return r;
     }
 
@@ -497,8 +520,9 @@ public class FilterAndPairFn
         r.put("created_at",      TimestampUtil.normalizeTimestamp(str(row.get("created_at"))));
         r.put("first_seen_at",   TimestampUtil.normalizeTimestamp(str(row.get("first_seen_at"))));
         r.put("last_retried_at", TimestampUtil.normalizeTimestamp(str(row.get("last_retried_at"))));
-        r.put("retry_count",     parseLong(row.get("retry_count")));
-        r.put("matched_ai_keys", row.get("matched_ai_keys"));
+        r.put("retry_count",        parseLong(row.get("retry_count")));
+        r.put("matched_ai_keys",    row.get("matched_ai_keys"));
+        r.put("next_ai_iteration",  parseLong(row.get("next_ai_iteration")));
         return r;
     }
 

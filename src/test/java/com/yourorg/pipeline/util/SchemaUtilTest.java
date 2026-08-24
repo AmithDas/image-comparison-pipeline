@@ -74,6 +74,8 @@ public class SchemaUtilTest {
         assertEquals("STRING",  fields.get("matched_ai_keys").getType());
         assertEquals("NULLABLE", fields.get("matched_ai_keys").getMode());
         assertEquals("INTEGER", fields.get("retry_count").getType());
+        assertEquals("INTEGER", fields.get("next_ai_iteration").getType());
+        assertEquals("REQUIRED", fields.get("next_ai_iteration").getMode());
     }
 
     // ── aiPendingSchema ────────────────────────────────────────────────────────

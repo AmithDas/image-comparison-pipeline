@@ -668,7 +668,9 @@ public class ImageComparisonPipeline {
                 .set("last_retried_at", str(r.get("last_retried_at")))
                 .set("retry_count",     r.get("retry_count") != null
                         ? ((Number) r.get("retry_count")).longValue() : 0L)
-                .set("matched_ai_keys", str(r.get("matched_ai_keys")));
+                .set("matched_ai_keys", str(r.get("matched_ai_keys")))
+                .set("next_ai_iteration", r.get("next_ai_iteration") != null
+                        ? ((Number) r.get("next_ai_iteration")).longValue() : 0L);
     }
 
     private static TableRow fromAiPendingRecord(GenericRecord r) {

@@ -79,16 +79,31 @@ public class FilterAndPairFnTest {
     private static TableRow casePendingRow(String imageId, String pendingType,
                                            String keyId, String createdAt, String firstSeenAt,
                                            Object retryCount, String caseId, String matchedAiKeys) {
+        // Default nextIteration to the key count — mirrors the (correct, in the absence of
+        // any merge artifact) common case where every matched key corresponds to exactly one
+        // real emission. Tests that need to demonstrate the two diverging use the explicit
+        // overload below instead.
+        long defaultNextIteration = matchedAiKeys == null || matchedAiKeys.isBlank()
+                ? 0L : matchedAiKeys.split(";").length;
+        return casePendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt,
+                retryCount, caseId, matchedAiKeys, defaultNextIteration);
+    }
+
+    private static TableRow casePendingRow(String imageId, String pendingType,
+                                           String keyId, String createdAt, String firstSeenAt,
+                                           Object retryCount, String caseId, String matchedAiKeys,
+                                           long nextIteration) {
         TableRow row = new TableRow()
-                .set("image_id",        imageId)
-                .set("segment",         "main")
-                .set("pending_type",    pendingType)
-                .set("payload",         payloadFor(imageId))
-                .set("key_id",          keyId)
-                .set("created_at",      createdAt)
-                .set("first_seen_at",   firstSeenAt)
-                .set("last_retried_at", firstSeenAt)
-                .set("retry_count",     retryCount);
+                .set("image_id",          imageId)
+                .set("segment",           "main")
+                .set("pending_type",      pendingType)
+                .set("payload",           payloadFor(imageId))
+                .set("key_id",            keyId)
+                .set("created_at",        createdAt)
+                .set("first_seen_at",     firstSeenAt)
+                .set("last_retried_at",   firstSeenAt)
+                .set("retry_count",       retryCount)
+                .set("next_ai_iteration", nextIteration);
         if (caseId != null) row.set("case_id", caseId);
         if (matchedAiKeys != null) row.set("matched_ai_keys", matchedAiKeys);
         return row;
@@ -616,6 +631,59 @@ public class FilterAndPairFnTest {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals("Both AI rows should be retained for future cases", 2, list.size());
+            return null;
+        });
+
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
+        pipeline.run().waitUntilFinish();
+    }
+
+    /**
+     * Regression test: the next ai_iteration must come from the explicit next_ai_iteration
+     * counter, never from matched_ai_keys.size(). Simulates a case whose matched_ai_keys was
+     * inflated to 2 entries by a defensive merge (mergeCaseMeta) without a second real match
+     * ever happening — next_ai_iteration correctly still says only 1 real match occurred.
+     *
+     * If iteration were derived from matched_ai_keys.size() instead, a genuinely new AI row
+     * would incorrectly be assigned iteration 3, skipping iteration 2 — this is exactly the
+     * "ai_iteration=2 with no ai_iteration=1" class of symptom the counter field prevents.
+     */
+    @Test
+    public void nextIterationComesFromCounterNotKeySetSize() {
+        String ai1CreatedAt = "2026-04-01T08:00:00.000000Z";
+        String ai2CreatedAt = "2026-04-01T09:00:00.000000Z";
+        String ai3CreatedAt = "2026-04-01T10:00:00.000000Z";
+        String ai1Key = aiDedupKey("img010", ai1CreatedAt);
+        String ai2Key = aiDedupKey("img010", ai2CreatedAt);
+
+        // matched_ai_keys has 2 entries, but next_ai_iteration says only 1 real match happened —
+        // simulating an inflated key set from a merge, not a normal case's state.
+        TableRow inflatedCaseState = casePendingRow("img010", "human", "key1",
+                "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
+                0L, "case1", ai1Key + ";" + ai2Key, /* nextIteration */ 1L);
+
+        TableRow updatedHuman = sourceRow("img010", HUMAN_METHOD, "key1",
+                "2026-04-02T10:00:00Z", "case1");
+        TableRow ai3New = sourceRow("img010", AI_METHOD, "key1", ai3CreatedAt);
+
+        PCollectionTuple routed = runPipeline("img010",
+                List.of(updatedHuman, ai3New), List.of(inflatedCaseState), List.of());
+
+        PAssert.that(matched(routed)).satisfies(pairs -> {
+            List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
+            pairs.forEach(list::add);
+            assertEquals("Only the genuinely new AI row should match", 1, list.size());
+            assertEquals("Iteration should continue from the counter (1), not the key count (2)",
+                    "img010::main::case1::2", list.get(0).getKey());
+            return null;
+        });
+
+        PAssert.that(casePending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals(1, list.size());
+            assertEquals(2L, list.get(0).get("next_ai_iteration"));
             return null;
         });
 
