@@ -1,0 +1,134 @@
+Comparison scope event tracking changes
+
+Branch:
+codex/comparison-scope-events
+
+Commit:
+fcd0ab1 - Add comparison scope event tracking
+
+Purpose:
+The pipeline now keeps comparison_results as the raw, auditable field-level
+output and adds a separate append-only comparison_scope_events table to track
+which AI scopes were discovered and which scopes were later covered by human
+cases.
+
+This solves the false mismatch problem where an early case compares against AI
+sections that actually belong to a later case. A later human case does not
+delete old rows. Instead, it adds HUMAN_SCOPE_COVERED events, and the final
+Looker view uses those events to reinterpret old AI-only mismatch rows.
+
+Main files changed:
+- src/main/java/com/yourorg/pipeline/ImageComparisonPipeline.java
+- src/main/java/com/yourorg/pipeline/transforms/FlattenAndCompareFn.java
+- src/main/java/com/yourorg/pipeline/util/SchemaRegistry.java
+- src/main/java/com/yourorg/pipeline/util/SchemaUtil.java
+- src/main/resources/avro/comparison_scope_event.json
+- src/main/resources/bigquery_ddl.sql
+- src/main/resources/migrations/004_create_comparison_scope_events.sql
+- dags/image_comparison_dag.py
+- dags/config/image_comparison_config.json
+- README.md
+- src/test/java/com/yourorg/pipeline/util/SchemaUtilTest.java
+
+New table:
+comparison_scope_events
+
+This table is append-only. Each Dataflow run writes new events with:
+- image_id
+- segment
+- ai_created_at
+- segment_type
+- scope_level
+- scope_key
+- event_type
+- case_id
+- load_time
+
+Event types:
+AI_SCOPE_DISCOVERED:
+Written when a comparison_results row has ai_value populated.
+
+HUMAN_SCOPE_COVERED:
+Written when a comparison_results row has human_value populated.
+
+Scope identity:
+The final matching scope is built from:
+- image_id
+- segment
+- ai_created_at
+- segment_type
+- scope_level
+- scope_key
+
+Scope levels:
+segment_type:
+Used when the comparison row has no array_key. The scope_key is
+__SEGMENT_TYPE_ONLY__.
+
+array_entity:
+Used for normal keyed arrays. The scope_key is the comparison row's array_key.
+
+soft_array_parent:
+Used for disputeCodes rows. Their array_key may include AI/human code suffixes
+such as parent-D1-D1, parent-D2-XXX, or parent-XXX-D3. The scope_key is
+normalized back to the parent key so all dispute-code fields belong to the same
+parent entity scope.
+
+Why FlattenAndCompareFn filtering was removed:
+The earlier upstream filtering suppressed foreign segment_type rows before they
+were written. That made it impossible to tell whether an AI scope like address
+was truly unmatched by all cases. The new design keeps comparison_results raw
+and lets views decide the current truth from scope events.
+
+How the final Looker view finds true mismatches:
+The Looker-facing view normalizes comparison_results into the same scope_level
+and scope_key used by comparison_scope_events. It then checks two things:
+
+1. Is this scope covered by any human case?
+2. Is this scope covered by the same case as the current comparison row?
+
+The suppression rule is:
+Hide only rows where all of these are true:
+- is_match = false
+- human_value is null
+- ai_value is not null
+- segment_type is not null
+- the scope is covered by some human case
+- the scope is not covered by this same case
+
+Rows that stay visible:
+- true missing fields inside the case's own covered scope
+- AI-only scopes that no human case has covered, such as address
+- matched rows
+- human-only mismatches
+- non-scope rows where segment_type is null
+
+Example:
+Day 1:
+AI has trade, collection, address.
+case1 has trade.
+
+Raw comparison_results may contain AI-only mismatches for collection and
+address under case1.
+
+comparison_scope_events contains:
+AI_SCOPE_DISCOVERED trade
+AI_SCOPE_DISCOVERED collection
+AI_SCOPE_DISCOVERED address
+HUMAN_SCOPE_COVERED trade case1
+
+At this point, collection and address are still current unmatched AI scopes.
+
+Day 2:
+case2 arrives with collection.
+
+comparison_scope_events appends:
+HUMAN_SCOPE_COVERED collection case2
+
+Now the final Looker view hides the old case1 collection AI-only mismatches,
+because collection is covered by another case. Address remains visible because
+no human case has covered address.
+
+Validation:
+- git diff --check passed
+- mvn test passed with 72 tests and 0 failures
