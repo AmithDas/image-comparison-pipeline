@@ -176,6 +176,7 @@ public class FilterAndPairFn
                 Object rawSubType = row.get("_human_sub_type");
                 String subType = (rawSubType != null) ? rawSubType.toString() : "default";
                 GenericRecord incoming = newPayloadRow(imageId, keyId, "human", payload, createdAt);
+                incoming = stampCaseIdByField(incoming, caseKey, seg, imageId, segment);
                 mergeFreshHuman(humanByCase, caseKey, subType, incoming, imageId, segment);
             } else {
                 freshAiCandidates.add(newPayloadRow(imageId, keyId, "ai", payload, createdAt));
@@ -263,8 +264,11 @@ public class FilterAndPairFn
         }
 
         // ── Consolidate every case's contribution into one group per subType ────
+        // Per-field case_id attribution no longer needs to be tracked here — every fresh
+        // record was already stamped with its own _caseIdByField at ingestion above (see
+        // stampCaseIdByField), so mergeAcrossCases derives attribution purely from what's
+        // already embedded in each side's JSON.
         Map<String, GenericRecord> humanBySubType   = new LinkedHashMap<>();
-        Map<String, String>        subTypeSoleCase  = new LinkedHashMap<>();
         Set<String>                allContributingCaseIds = new LinkedHashSet<>();
         String   canonicalCaseId = null;
         String   canonicalCreatedAt = null;
@@ -289,14 +293,9 @@ public class FilterAndPairFn
                 }
 
                 GenericRecord existing = humanBySubType.get(subType);
-                if (existing == null) {
-                    humanBySubType.put(subType, incoming);
-                    subTypeSoleCase.put(subType, caseKey);
-                } else {
-                    String existingSoleCase = subTypeSoleCase.remove(subType); // null once already multi
-                    humanBySubType.put(subType, mergeAcrossCases(
-                            existing, existingSoleCase, incoming, caseKey, seg, imageId, segment));
-                }
+                humanBySubType.put(subType, existing == null
+                        ? incoming
+                        : mergeAcrossCases(existing, incoming, seg, imageId, segment));
             }
         }
 
@@ -444,6 +443,63 @@ public class FilterAndPairFn
     // ── Cross-case field-level merge ─────────────────────────────────────────
 
     /**
+     * Embeds {@link #CASE_ID_BY_FIELD_KEY} covering every field of a fresh human record —
+     * recursively, at every level of nesting — with its own originating {@code case_id},
+     * right at ingestion, before this record has ever been through a cross-case merge. This
+     * is what lets a field that's never actually contested by another case still carry
+     * explicit, correct attribution: without it, such a field would fall back to the group's
+     * canonical case_id at read time, which is only guaranteed correct by circumstance (the
+     * group happening to have one case per bucket), not by design.
+     *
+     * <p>Recursion matters here specifically because {@link #mergeJsonObjects} also recurses
+     * into nested objects rather than treating them as one opaque value (see its own doc) —
+     * a nested object needs its own {@code _caseIdByField} so that recursive merge finds
+     * attribution for its children directly, instead of losing the parent's attribution the
+     * moment it descends a level.
+     *
+     * <p>A record with no real {@code case_id} (NO_CASE — e.g. every contribution to a
+     * {@code humanSubTypes} segment like authentication/docreview) is left completely
+     * untouched. Does not recurse into array elements — {@code mergeJsonObjects} attributes
+     * those via {@code _sourceCaseId} on the item itself instead, only if/when the array is
+     * actually concatenated across cases.
+     */
+    private GenericRecord stampCaseIdByField(GenericRecord record, String caseKey,
+                                              SegmentConfig seg, String imageId, String segment) {
+        if (caseKey == null || caseKey.isEmpty()) return record;
+        String keyId = str(record.get("key_id"));
+        JsonObject json = decryptToJson(keyId, str(record.get("payload")), seg);
+        if (json == null) {
+            LOG.warn("imageId={} segment={} case={} — could not parse human payload to stamp "
+                            + "case attribution; falls back to the group's canonical case_id instead",
+                    imageId, segment, caseKey);
+            return record;
+        }
+        if (json.has(CASE_ID_BY_FIELD_KEY)) return record; // already stamped
+
+        stampObjectRecursively(json, caseKey);
+
+        record.put("payload", BarricadeEncryptionUtil.encrypt(keyId, json.toString()));
+        return record;
+    }
+
+    /** Package-visible for direct unit testing (see {@link #mergeJsonObjects}). */
+    static void stampObjectRecursively(JsonObject obj, String caseKey) {
+        JsonObject caseIdByField = new JsonObject();
+        for (String key : obj.keySet()) {
+            caseIdByField.addProperty(key, caseKey);
+        }
+        obj.add(CASE_ID_BY_FIELD_KEY, caseIdByField);
+
+        for (String key : obj.keySet()) {
+            if (CASE_ID_BY_FIELD_KEY.equals(key)) continue;
+            JsonElement child = obj.get(key);
+            if (child.isJsonObject()) {
+                stampObjectRecursively(child.getAsJsonObject(), caseKey);
+            }
+        }
+    }
+
+    /**
      * Merges two records that collide on the same subType bucket — either two
      * case_ids in the same run, or a fresh row colliding with a persisted pending
      * row from an earlier run (both routed through this same method). Performs a
@@ -454,15 +510,18 @@ public class FilterAndPairFn
      *       item stamped with {@link #SOURCE_CASE_ID_KEY} (only if not already
      *       stamped, so repeated folds don't re-stamp).</li>
      *   <li>A scalar collision (same field, different value) is resolved by
-     *       earliest {@code created_at}, WARN logged.</li>
+     *       latest {@code created_at} — a correction/update should win over an
+     *       older submission of the same field — WARN logged.</li>
      * </ul>
-     * Provenance is embedded in the merged JSON via {@link #CASE_ID_BY_FIELD_KEY},
-     * added only once a bucket actually has more than one contributor — a normal
-     * single-contributor bucket (the only case for segments using
-     * {@code humanSubTypes}, e.g. authentication/docreview) is untouched.
+     * Provenance ({@link #CASE_ID_BY_FIELD_KEY}) is read from whatever's already embedded in
+     * each side — every fresh record was stamped with it at ingestion by
+     * {@link #stampCaseIdByField} — rather than passed in as a separate parameter, so this
+     * works uniformly regardless of how many prior merges either side has already been
+     * through. A normal single-contributor bucket (the only case for segments using
+     * {@code humanSubTypes}, e.g. authentication/docreview) never gets stamped in the first
+     * place, so it stays untouched here too.
      */
-    private GenericRecord mergeAcrossCases(GenericRecord existing, String existingSoleCaseId,
-                                            GenericRecord incoming, String incomingCaseId,
+    private GenericRecord mergeAcrossCases(GenericRecord existing, GenericRecord incoming,
                                             SegmentConfig seg, String imageId, String segment) {
         String keyId = str(existing.get("key_id"));
         String existingCreatedAt = str(existing.get("created_at"));
@@ -481,8 +540,8 @@ public class FilterAndPairFn
         Set<String> mergeArrayFields = (seg != null && seg.mergeArrayFields != null)
                 ? new HashSet<>(seg.mergeArrayFields) : new HashSet<>();
 
-        JsonObject merged = mergeJsonObjects(existingJson, existingSoleCaseId, existingCreatedAt,
-                incomingJson, incomingCaseId, incomingCreatedAt, mergeArrayFields, imageId, segment);
+        JsonObject merged = mergeJsonObjects(existingJson, existingCreatedAt,
+                incomingJson, incomingCreatedAt, mergeArrayFields, "", imageId, segment);
 
         String reEncrypted = BarricadeEncryptionUtil.encrypt(keyId, merged.toString());
         String earliestCreatedAt = minCreatedAt(existingCreatedAt, incomingCreatedAt);
@@ -500,37 +559,56 @@ public class FilterAndPairFn
      * Pure JSON-level merge, split out from {@link #mergeAcrossCases} so it's testable without
      * going through Barricade encrypt/decrypt (which needs live GCP KMS/Firestore access and
      * has no local test seam). See {@link #mergeAcrossCases} for the field-by-field rules.
-     * Package-visible for direct unit testing.
+     *
+     * <h3>Granularity — collision happens at the deepest level that actually differs</h3>
+     * A nested JSON object is never treated as one opaque value: when both sides have an
+     * object at the same key, this method recurses into it instead of comparing the two
+     * objects wholesale, so a difference in one nested field doesn't discard unrelated
+     * sibling fields nested alongside it. Each recursion level tracks its own
+     * {@link #CASE_ID_BY_FIELD_KEY} (covering only its own direct children), so provenance
+     * is as fine-grained as the collision itself. {@code pathPrefix} is the dot-notation path
+     * to the object currently being merged (empty at the root) — it's what lets
+     * {@code mergeArrayFields} contain nested paths (e.g. {@code "credit.dob.disputeCodes"},
+     * matching the dot-notation convention {@code ARRAY_MATCH_KEYS} already uses in
+     * {@link FlattenAndCompareFn}) and still match an array several levels deep, not just a
+     * top-level key.
+     *
+     * <p>A collision only actually fires — latest-created_at-wins, WARN logged, provenance
+     * recorded — for a genuine leaf-level difference: a scalar, a mismatched type, or an
+     * array not listed in {@code mergeArrayFields} at that path. Attribution for each side is
+     * read from that side's own {@link #CASE_ID_BY_FIELD_KEY} (absent entirely for NO_CASE
+     * data) rather than passed in as a flat case_id — both sides can be arbitrarily
+     * multi-case (already-merged) records, not just fresh single-case rows.
+     *
+     * <p>Package-visible for direct unit testing.
      */
-    static JsonObject mergeJsonObjects(JsonObject existingJson, String existingSoleCaseId,
-                                        String existingCreatedAt,
-                                        JsonObject incomingJson, String incomingCaseId,
-                                        String incomingCreatedAt,
+    static JsonObject mergeJsonObjects(JsonObject existingJson, String existingCreatedAt,
+                                        JsonObject incomingJson, String incomingCreatedAt,
                                         Set<String> mergeArrayFields,
+                                        String pathPrefix,
                                         String imageId, String segment) {
         existingJson = existingJson.deepCopy();
         incomingJson = incomingJson.deepCopy();
 
-        boolean firstCollision = !existingJson.has(CASE_ID_BY_FIELD_KEY);
-        JsonObject caseIdByField = firstCollision
-                ? new JsonObject()
-                : existingJson.getAsJsonObject(CASE_ID_BY_FIELD_KEY).deepCopy();
+        JsonObject existingByField = existingJson.has(CASE_ID_BY_FIELD_KEY)
+                ? existingJson.getAsJsonObject(CASE_ID_BY_FIELD_KEY) : new JsonObject();
+        JsonObject incomingByField = incomingJson.has(CASE_ID_BY_FIELD_KEY)
+                ? incomingJson.getAsJsonObject(CASE_ID_BY_FIELD_KEY) : new JsonObject();
         existingJson.remove(CASE_ID_BY_FIELD_KEY);
+        incomingJson.remove(CASE_ID_BY_FIELD_KEY);
 
-        if (firstCollision && existingSoleCaseId != null && !existingSoleCaseId.isEmpty()) {
-            for (String key : existingJson.keySet()) {
-                caseIdByField.addProperty(key, existingSoleCaseId);
-            }
-        }
-
+        // On a scalar value collision, the LATEST created_at wins — a case correcting/updating
+        // a field should take precedence over an earlier submission of the same field. A known
+        // timestamp still beats an unknown one either way (existingCreatedAt != null fallback).
         boolean existingWinsTies;
         if (existingCreatedAt != null && incomingCreatedAt != null) {
-            existingWinsTies = existingCreatedAt.compareTo(incomingCreatedAt) <= 0;
+            existingWinsTies = existingCreatedAt.compareTo(incomingCreatedAt) >= 0;
         } else {
             existingWinsTies = existingCreatedAt != null;
         }
 
         JsonObject merged = new JsonObject();
+        JsonObject caseIdByField = new JsonObject();
         Set<String> allKeys = new LinkedHashSet<>();
         allKeys.addAll(existingJson.keySet());
         allKeys.addAll(incomingJson.keySet());
@@ -538,46 +616,62 @@ public class FilterAndPairFn
         for (String key : allKeys) {
             boolean inE = existingJson.has(key);
             boolean inI = incomingJson.has(key);
+            String  path = pathPrefix.isEmpty() ? key : pathPrefix + "." + key;
 
             if (inE && !inI) {
                 merged.add(key, existingJson.get(key));
+                copyAttribution(existingByField, key, caseIdByField);
 
             } else if (!inE && inI) {
                 merged.add(key, incomingJson.get(key));
-                if (incomingCaseId != null && !incomingCaseId.isEmpty()) {
-                    caseIdByField.addProperty(key, incomingCaseId);
-                }
+                copyAttribution(incomingByField, key, caseIdByField);
 
             } else {
                 JsonElement ev = existingJson.get(key);
                 JsonElement iv = incomingJson.get(key);
 
-                if (mergeArrayFields.contains(key) && ev.isJsonArray() && iv.isJsonArray()) {
+                if (mergeArrayFields.contains(path) && ev.isJsonArray() && iv.isJsonArray()) {
+                    String existingArrayCase = attributionOf(existingByField, key);
+                    String incomingArrayCase = attributionOf(incomingByField, key);
                     JsonArray combined = new JsonArray();
                     for (JsonElement el : ev.getAsJsonArray()) {
-                        combined.add(stampSourceCaseId(el, existingSoleCaseId));
+                        combined.add(stampSourceCaseId(el, existingArrayCase));
                     }
                     for (JsonElement el : iv.getAsJsonArray()) {
-                        combined.add(stampSourceCaseId(el, incomingCaseId));
+                        combined.add(stampSourceCaseId(el, incomingArrayCase));
                     }
                     merged.add(key, combined);
-                    caseIdByField.remove(key);
+                    // Array-level attribution lives per-item (_sourceCaseId), not here.
+
+                } else if (ev.isJsonObject() && iv.isJsonObject()) {
+                    // Recurse rather than comparing wholesale — a difference in one nested
+                    // field must not discard unrelated sibling fields at this level.
+                    JsonObject nestedMerged = mergeJsonObjects(
+                            ev.getAsJsonObject(), existingCreatedAt,
+                            iv.getAsJsonObject(), incomingCreatedAt,
+                            mergeArrayFields, path, imageId, segment);
+                    merged.add(key, nestedMerged);
+                    // Attribution now lives inside the nested object's own _caseIdByField.
 
                 } else if (ev.equals(iv)) {
                     merged.add(key, ev);
+                    // Identical value on both sides — still attribute to whichever case is
+                    // LATEST, same tie-break direction as an actual collision below, falling
+                    // back to the other side only if the preferred one has no attribution
+                    // recorded at all.
+                    JsonObject preferred = existingWinsTies ? existingByField : incomingByField;
+                    JsonObject fallback  = existingWinsTies ? incomingByField : existingByField;
+                    if (!copyAttribution(preferred, key, caseIdByField)) {
+                        copyAttribution(fallback, key, caseIdByField);
+                    }
 
                 } else {
                     boolean keepExisting = existingWinsTies;
                     merged.add(key, keepExisting ? ev : iv);
-                    String winner = keepExisting ? existingSoleCaseId : incomingCaseId;
-                    if (winner != null && !winner.isEmpty()) {
-                        caseIdByField.addProperty(key, winner);
-                    } else {
-                        caseIdByField.remove(key);
-                    }
+                    copyAttribution(keepExisting ? existingByField : incomingByField, key, caseIdByField);
                     LOG.warn("imageId={} segment={} field={} — cross-case scalar collision, "
-                                    + "keeping {} value", imageId, segment, key,
-                            keepExisting ? "earlier" : "later");
+                                    + "keeping {} value", imageId, segment, path,
+                            keepExisting ? "later" : "earlier");
                 }
             }
         }
@@ -586,6 +680,20 @@ public class FilterAndPairFn
             merged.add(CASE_ID_BY_FIELD_KEY, caseIdByField);
         }
         return merged;
+    }
+
+    /** Copies {@code sourceByField[key]} into {@code target} if present. Returns whether it was. */
+    private static boolean copyAttribution(JsonObject sourceByField, String key, JsonObject target) {
+        if (sourceByField.has(key)) {
+            target.add(key, sourceByField.get(key));
+            return true;
+        }
+        return false;
+    }
+
+    private static String attributionOf(JsonObject byField, String key) {
+        return byField.has(key) && byField.get(key).isJsonPrimitive()
+                ? byField.get(key).getAsString() : null;
     }
 
     private static JsonElement stampSourceCaseId(JsonElement el, String caseId) {

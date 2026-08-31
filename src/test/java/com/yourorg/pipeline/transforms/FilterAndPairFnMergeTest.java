@@ -9,7 +9,6 @@ import java.util.Set;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
 
 /**
  * Direct unit tests for {@link FilterAndPairFn#mergeJsonObjects}, the pure JSON-level merge
@@ -17,6 +16,13 @@ import static org.junit.Assert.assertTrue;
  * FilterAndPairFn's Beam DoFn and Barricade encrypt/decrypt) since BarricadeEncryptionUtil
  * needs live GCP KMS/Firestore access with no local test seam — see FilterAndPairFnTest for
  * the end-to-end pipeline-level coverage of the surrounding matching/pending logic.
+ *
+ * <h3>Input convention</h3>
+ * Attribution is read from whatever {@code _caseIdByField} is already embedded in each input
+ * JsonObject — production code embeds this at ingestion via
+ * {@link FilterAndPairFn#stampCaseIdByField} before a record ever reaches this method. A test
+ * input with no {@code _caseIdByField} at all represents NO_CASE (e.g. authentication/
+ * docreview, which never carry a real case_id and so are never stamped).
  */
 public class FilterAndPairFnMergeTest {
 
@@ -25,19 +31,30 @@ public class FilterAndPairFnMergeTest {
     }
 
     /**
+     * A stamped record — every field of {@code json}, recursively at every nesting level,
+     * attributed to {@code caseId}. Mirrors exactly what
+     * {@link FilterAndPairFn#stampCaseIdByField} does at ingestion in production.
+     */
+    private static JsonObject stamped(String json, String caseId) {
+        JsonObject o = obj(json);
+        FilterAndPairFn.stampObjectRecursively(o, caseId);
+        return o;
+    }
+
+    /**
      * A field present in only one contributing case is kept as-is, and attributed to that
-     * case in _caseIdByField — this bucket has two distinct contributors (CASE-1, CASE-2),
-     * so provenance is recorded even though no single field's *value* was actually contested.
+     * case — both sides are pre-stamped (as production ingestion would do), so provenance is
+     * recorded per field even though no single field's *value* was actually contested.
      */
     @Test
     public void disjointFieldsAreUnionedAndEachAttributedToItsContributor() {
-        JsonObject existing = obj("{\"a\":\"1\"}");
-        JsonObject incoming = obj("{\"b\":\"2\"}");
+        JsonObject existing = stamped("{\"a\":\"1\"}", "CASE-1");
+        JsonObject incoming = stamped("{\"b\":\"2\"}", "CASE-2");
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                existing, "CASE-1", "2026-01-01T00:00:00.000000Z",
-                incoming, "CASE-2", "2026-01-02T00:00:00.000000Z",
-                Set.of(), "img", "main");
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), "", "img", "main");
 
         assertEquals("1", merged.get("a").getAsString());
         assertEquals("2", merged.get("b").getAsString());
@@ -47,37 +64,36 @@ public class FilterAndPairFnMergeTest {
     }
 
     /**
-     * A single-contributor bucket (existingSoleCaseId blank, matching the NO_CASE sentinel used
-     * for segments like authentication/docreview that never carry a real case_id) must stay
-     * completely free of provenance metadata even when this method merges two records — this
-     * is the "collision" that happens when NO_CASE resubmits, not a real cross-case merge.
+     * Unstamped input (NO_CASE — matching authentication/docreview, which never carry a real
+     * case_id and are never run through stampCaseIdByField) must stay completely free of
+     * provenance metadata after merging.
      */
     @Test
-    public void blankExistingSoleCaseIdAddsNoProvenanceForDisjointFields() {
+    public void unstampedInputAddsNoProvenanceForDisjointFields() {
         JsonObject existing = obj("{\"a\":\"1\"}");
         JsonObject incoming = obj("{\"b\":\"2\"}");
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                existing, "", "2026-01-01T00:00:00.000000Z",
-                incoming, "", "2026-01-02T00:00:00.000000Z",
-                Set.of(), "img", "main");
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), "", "img", "main");
 
         assertEquals("1", merged.get("a").getAsString());
         assertEquals("2", merged.get("b").getAsString());
-        assertFalse("Both sides are NO_CASE — no real provenance to record",
+        assertFalse("Neither side was ever stamped — no real provenance to record",
                 merged.has("_caseIdByField"));
     }
 
     /** A configured array field concatenates items from both sides and stamps each with its source case. */
     @Test
     public void configuredArrayFieldConcatenatesAndStampsSourceCaseId() {
-        JsonObject existing = obj("{\"documentProofs\":[{\"document\":\"passport\"}]}");
-        JsonObject incoming = obj("{\"documentProofs\":[{\"document\":\"utility_bill\"}]}");
+        JsonObject existing = stamped("{\"documentProofs\":[{\"document\":\"passport\"}]}", "CASE-1");
+        JsonObject incoming = stamped("{\"documentProofs\":[{\"document\":\"utility_bill\"}]}", "CASE-2");
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                existing, "CASE-1", "2026-01-01T00:00:00.000000Z",
-                incoming, "CASE-2", "2026-01-02T00:00:00.000000Z",
-                Set.of("documentProofs"), "img", "main");
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of("documentProofs"), "", "img", "main");
 
         var proofs = merged.getAsJsonArray("documentProofs");
         assertEquals(2, proofs.size());
@@ -89,56 +105,56 @@ public class FilterAndPairFnMergeTest {
                 merged.has("_caseIdByField") && merged.getAsJsonObject("_caseIdByField").has("documentProofs"));
     }
 
-    /** A scalar collision is resolved by earliest created_at, with provenance recorded. */
+    /** A scalar collision is resolved by latest created_at, with provenance recorded. */
     @Test
-    public void scalarCollisionKeepsEarliestAndRecordsProvenance() {
-        JsonObject existing = obj("{\"firstName\":\"John\",\"dob\":\"1990-01-01\"}");
-        JsonObject incoming = obj("{\"firstName\":\"Johnny\",\"middleName\":\"Q\"}");
+    public void scalarCollisionKeepsLatestAndRecordsProvenance() {
+        JsonObject existing = stamped("{\"firstName\":\"John\",\"dob\":\"1990-01-01\"}", "CASE-1");
+        JsonObject incoming = stamped("{\"firstName\":\"Johnny\",\"middleName\":\"Q\"}", "CASE-2");
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                existing, "CASE-1", "2026-01-01T00:00:00.000000Z",
-                incoming, "CASE-2", "2026-01-02T00:00:00.000000Z",
-                Set.of(), "img", "main");
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), "", "img", "main");
 
-        assertEquals("Earlier case's value wins on scalar collision", "John",
+        assertEquals("Later case's value wins on scalar collision", "Johnny",
                 merged.get("firstName").getAsString());
         assertEquals("1990-01-01", merged.get("dob").getAsString());
         assertEquals("Q", merged.get("middleName").getAsString());
 
         JsonObject byField = merged.getAsJsonObject("_caseIdByField");
-        assertEquals("CASE-1", byField.get("firstName").getAsString());
+        assertEquals("CASE-2", byField.get("firstName").getAsString());
         assertEquals("CASE-1", byField.get("dob").getAsString());
         assertEquals("CASE-2", byField.get("middleName").getAsString());
     }
 
-    /** Identical values on both sides need no collision resolution or provenance entry. */
+    /** Identical values on both sides need no collision resolution, but still keep provenance. */
     @Test
-    public void identicalValuesAttributeToTheEarlierSideWithNoWarningNeeded() {
-        JsonObject existing = obj("{\"status\":\"verified\"}");
-        JsonObject incoming = obj("{\"status\":\"verified\"}");
+    public void identicalValuesAttributeToTheLatestCase() {
+        JsonObject existing = stamped("{\"status\":\"verified\"}", "CASE-1");
+        JsonObject incoming = stamped("{\"status\":\"verified\"}", "CASE-2");
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                existing, "CASE-1", "2026-01-01T00:00:00.000000Z",
-                incoming, "CASE-2", "2026-01-02T00:00:00.000000Z",
-                Set.of(), "img", "main");
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), "", "img", "main");
 
         assertEquals("verified", merged.get("status").getAsString());
+        assertEquals("Same tie-break direction as an actual collision — latest wins",
+                "CASE-2", merged.getAsJsonObject("_caseIdByField").get("status").getAsString());
     }
 
     /** A third case colliding on an already-merged bucket extends, not resets, provenance. */
     @Test
-    public void thirdCaseColldingOnAlreadyMergedBucketExtendsProvenance() {
+    public void thirdCaseCollidingOnAlreadyMergedBucketExtendsProvenance() {
         JsonObject alreadyMerged = obj(
                 "{\"firstName\":\"John\",\"middleName\":\"Q\","
                         + "\"_caseIdByField\":{\"firstName\":\"CASE-1\",\"middleName\":\"CASE-2\"}}");
-        JsonObject caseThree = obj("{\"lastName\":\"Smith\"}");
+        JsonObject caseThree = stamped("{\"lastName\":\"Smith\"}", "CASE-3");
 
-        // existingSoleCaseId is null here because the bucket already has >1 contributor —
-        // mirrors FilterAndPairFn's subTypeSoleCaseId being removed on first collision.
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                alreadyMerged, null, "2026-01-01T00:00:00.000000Z",
-                caseThree, "CASE-3", "2026-01-03T00:00:00.000000Z",
-                Set.of(), "img", "main");
+                alreadyMerged, "2026-01-01T00:00:00.000000Z",
+                caseThree, "2026-01-03T00:00:00.000000Z",
+                Set.of(), "", "img", "main");
 
         assertEquals("John", merged.get("firstName").getAsString());
         assertEquals("Q", merged.get("middleName").getAsString());
@@ -155,13 +171,14 @@ public class FilterAndPairFnMergeTest {
     @Test
     public void reMergingDoesNotDoubleStampAlreadyTaggedArrayItems() {
         JsonObject alreadyMerged = obj(
-                "{\"documentProofs\":[{\"document\":\"passport\",\"_sourceCaseId\":\"CASE-1\"}]}");
-        JsonObject caseTwo = obj("{\"documentProofs\":[{\"document\":\"utility_bill\"}]}");
+                "{\"documentProofs\":[{\"document\":\"passport\",\"_sourceCaseId\":\"CASE-1\"}],"
+                        + "\"_caseIdByField\":{}}");
+        JsonObject caseTwo = stamped("{\"documentProofs\":[{\"document\":\"utility_bill\"}]}", "CASE-2");
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                alreadyMerged, null, "2026-01-01T00:00:00.000000Z",
-                caseTwo, "CASE-2", "2026-01-02T00:00:00.000000Z",
-                Set.of("documentProofs"), "img", "main");
+                alreadyMerged, "2026-01-01T00:00:00.000000Z",
+                caseTwo, "2026-01-02T00:00:00.000000Z",
+                Set.of("documentProofs"), "", "img", "main");
 
         var proofs = merged.getAsJsonArray("documentProofs");
         assertEquals(2, proofs.size());
@@ -169,21 +186,78 @@ public class FilterAndPairFnMergeTest {
         assertEquals("CASE-2", proofs.get(1).getAsJsonObject().get("_sourceCaseId").getAsString());
     }
 
-    /** authentication/docreview never carry a real case_id — a single-contributor merge input
-     *  (existingSoleCaseId null/blank, matching the NO_CASE sentinel) must never introduce
-     *  _caseIdByField even when this method is invoked. */
+    /**
+     * A difference nested inside an object must not discard unrelated sibling fields at that
+     * same nesting level — only the field that actually differs collides; the rest is unioned.
+     */
     @Test
-    public void blankCaseIdNeverIntroducesProvenanceMetadata() {
-        JsonObject existing = obj("{\"a\":\"1\"}");
-        JsonObject incoming = obj("{\"a\":\"2\"}");
+    public void nestedObjectDifferenceOnlyCollidesTheFieldThatActuallyDiffers() {
+        JsonObject existing = stamped("{\"address\":{\"city\":\"NY\",\"zip\":\"10001\"}}", "CASE-1");
+        JsonObject incoming = stamped("{\"address\":{\"city\":\"NY\",\"zip\":\"20002\"}}", "CASE-2");
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
-                existing, "", "2026-01-01T00:00:00.000000Z",
-                incoming, "", "2026-01-02T00:00:00.000000Z",
-                Set.of(), "img", "main");
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), "", "img", "main");
 
-        assertEquals("1", merged.get("a").getAsString());
-        assertNull("Blank case ids must never be recorded as provenance",
-                merged.has("_caseIdByField") ? merged.getAsJsonObject("_caseIdByField").get("a") : null);
+        JsonObject address = merged.getAsJsonObject("address");
+        assertEquals("Undisputed sibling field must survive the merge", "NY",
+                address.get("city").getAsString());
+        assertEquals("Later case wins the field that actually collided", "20002",
+                address.get("zip").getAsString());
+
+        assertFalse("No collision at the outer level — attribution lives inside 'address'",
+                merged.has("_caseIdByField"));
+        JsonObject byField = address.getAsJsonObject("_caseIdByField");
+        assertEquals("Undisputed field still attributes to the latest case", "CASE-2",
+                byField.get("city").getAsString());
+        assertEquals("CASE-2", byField.get("zip").getAsString());
+    }
+
+    /** mergeArrayFields supports a dot-notation path to concatenate an array nested inside an object. */
+    @Test
+    public void mergeArrayFieldsMatchesANestedDotNotationPath() {
+        JsonObject existing = stamped("{\"credit\":{\"disputeCodes\":[{\"code\":\"A\"}]}}", "CASE-1");
+        JsonObject incoming = stamped("{\"credit\":{\"disputeCodes\":[{\"code\":\"B\"}]}}", "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of("credit.disputeCodes"), "", "img", "main");
+
+        var codes = merged.getAsJsonObject("credit").getAsJsonArray("disputeCodes");
+        assertEquals(2, codes.size());
+        assertEquals("A", codes.get(0).getAsJsonObject().get("code").getAsString());
+        assertEquals("CASE-1", codes.get(0).getAsJsonObject().get("_sourceCaseId").getAsString());
+        assertEquals("B", codes.get(1).getAsJsonObject().get("code").getAsString());
+        assertEquals("CASE-2", codes.get(1).getAsJsonObject().get("_sourceCaseId").getAsString());
+    }
+
+    /**
+     * An array field with the SAME bare name at two different nesting depths must not cross-match
+     * — mergeArrayFields is matched by full path, so listing "credit.disputeCodes" must not
+     * accidentally also concatenate an unrelated top-level "disputeCodes" array.
+     */
+    @Test
+    public void mergeArrayFieldsPathMatchingDoesNotCrossNestingLevels() {
+        JsonObject existing = stamped(
+                "{\"disputeCodes\":[{\"code\":\"X\"}],\"credit\":{\"disputeCodes\":[{\"code\":\"A\"}]}}",
+                "CASE-1");
+        JsonObject incoming = stamped(
+                "{\"disputeCodes\":[{\"code\":\"Y\"}],\"credit\":{\"disputeCodes\":[{\"code\":\"B\"}]}}",
+                "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of("credit.disputeCodes"), "", "img", "main");
+
+        // Configured nested path concatenates.
+        assertEquals(2, merged.getAsJsonObject("credit").getAsJsonArray("disputeCodes").size());
+        // Unconfigured top-level array of the same bare name is a plain (non-array-equal)
+        // collision instead — latest wins, wholesale, not concatenated.
+        var topLevel = merged.getAsJsonArray("disputeCodes");
+        assertEquals(1, topLevel.size());
+        assertEquals("Y", topLevel.get(0).getAsJsonObject().get("code").getAsString());
     }
 }

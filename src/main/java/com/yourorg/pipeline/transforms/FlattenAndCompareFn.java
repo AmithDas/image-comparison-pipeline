@@ -205,11 +205,11 @@ public class FlattenAndCompareFn
         String humanPayload = BarricadeEncryptionUtil.decrypt(keyId, str(human.get("payload")));
         String aiPayload    = BarricadeEncryptionUtil.decrypt(keyId, str(ai.get("payload")));
 
-        // Strip the top-level _caseIdByField provenance map (present only when this group had
-        // more than one contributing case_id) before flattening, so it never gets compared as a
-        // real field. Resolved per root field name — same granularity as segment_type.
-        Map<String, String> rootCaseId = new HashMap<>();
-        humanPayload = extractAndStripCaseIdByField(humanPayload, rootCaseId);
+        // Strip every _caseIdByField provenance map — one may be present at any nesting level,
+        // not just the root — before flattening, so it never gets compared as a real field.
+        // Recorded under each field's fully-qualified dot-notation path.
+        Map<String, String> caseIdByPath = new HashMap<>();
+        humanPayload = extractAndStripCaseIdByField(humanPayload, caseIdByPath);
 
         Map<String, List<FieldValue>> humanFields =
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
@@ -280,7 +280,7 @@ public class FlattenAndCompareFn
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
                         String rowCaseId = resolveCaseId(field, matchKey, caseIdByMatchKey,
-                                rootCaseId, canonicalCaseId);
+                                caseIdByPath, canonicalCaseId);
                         emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
                                 field, matchKey, humanVal, aiVal);
@@ -293,7 +293,7 @@ public class FlattenAndCompareFn
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
                     String rowCaseId = resolveCaseId(field, null, caseIdByMatchKey,
-                            rootCaseId, canonicalCaseId);
+                            caseIdByPath, canonicalCaseId);
                     emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
                             field, null, humanVal, aiVal);
@@ -311,49 +311,77 @@ public class FlattenAndCompareFn
      * <ol>
      *   <li>The array item's {@code _sourceCaseId} stamp, looked up by matchKey — for a
      *       {@code mergeArrayFields} array with more than one contributing case.</li>
-     *   <li>{@code rootCaseId[root]} — the field's top-level root, from {@code _caseIdByField}
-     *       (present only when that section had more than one contributor).</li>
-     *   <li>{@code canonicalCaseId} — the common case: the section had a single contributor.</li>
+     *   <li>{@code caseIdByPath}, walking from the field's own full path up through each
+     *       ancestor path (removing one dot-segment at a time) until a match is found —
+     *       {@code _caseIdByField} is recorded at whatever depth a collision actually
+     *       happened (see {@code FilterAndPairFn.mergeJsonObjects}), so a leaf field with no
+     *       collision of its own inherits its nearest ancestor's attribution (e.g. a whole
+     *       nested object that came from a single case).</li>
+     *   <li>{@code canonicalCaseId} — nothing recorded at any level: the field's section had
+     *       a single contributor overall (the common case).</li>
      * </ol>
      */
     private static String resolveCaseId(String field, String matchKey,
                                          Map<String, String> caseIdByMatchKey,
-                                         Map<String, String> rootCaseId,
+                                         Map<String, String> caseIdByPath,
                                          String canonicalCaseId) {
         if (matchKey != null) {
             String fromArrayItem = caseIdByMatchKey.get(matchKey);
             if (fromArrayItem != null) return fromArrayItem;
         }
-        int dot = field.indexOf('.');
-        String root = dot > 0 ? field.substring(0, dot) : field;
-        String fromRoot = rootCaseId.get(root);
-        if (fromRoot != null) return fromRoot;
+        String path = field;
+        while (true) {
+            String fromPath = caseIdByPath.get(path);
+            if (fromPath != null) return fromPath;
+            int dot = path.lastIndexOf('.');
+            if (dot < 0) break;
+            path = path.substring(0, dot);
+        }
         return canonicalCaseId;
     }
 
     /**
-     * Parses {@code payload}, removes the top-level {@link #CASE_ID_BY_FIELD_KEY} map if
-     * present (populating {@code rootCaseId} with its contents), and returns the payload with
-     * that key stripped so it's never treated as a comparable field. Returns {@code payload}
-     * unchanged if it isn't valid JSON or has no such key.
+     * Recursively walks {@code payload}, removing every {@link #CASE_ID_BY_FIELD_KEY} map it
+     * finds — one may be present at any nesting level, not just the root, since
+     * {@code FilterAndPairFn.mergeJsonObjects} recurses into nested objects and records
+     * provenance at whatever depth a collision actually occurred. Each entry is recorded into
+     * {@code caseIdByPath} under its fully-qualified dot-notation path (parent path + field
+     * name) so {@link #resolveCaseId} can look it up the same way {@link JsonFieldExtractor}
+     * names flattened fields. Returns {@code payload} unchanged if it isn't valid JSON.
      */
-    private static String extractAndStripCaseIdByField(String payload, Map<String, String> rootCaseId) {
+    private static String extractAndStripCaseIdByField(String payload, Map<String, String> caseIdByPath) {
         try {
             JsonElement parsed = JsonParser.parseString(payload);
             if (!parsed.isJsonObject()) return payload;
             JsonObject obj = parsed.getAsJsonObject();
-            if (!obj.has(CASE_ID_BY_FIELD_KEY)) return payload;
-            JsonObject map = obj.getAsJsonObject(CASE_ID_BY_FIELD_KEY);
-            for (String field : map.keySet()) {
-                JsonElement v = map.get(field);
-                if (v.isJsonPrimitive()) rootCaseId.put(field, v.getAsString());
-            }
-            obj.remove(CASE_ID_BY_FIELD_KEY);
+            stripCaseIdByField(obj, "", caseIdByPath);
             return obj.toString();
         } catch (Exception e) {
             LOG.warn("Could not parse human payload to extract {} — leaving as-is: {}",
                     CASE_ID_BY_FIELD_KEY, e.getMessage());
             return payload;
+        }
+    }
+
+    private static void stripCaseIdByField(JsonObject obj, String pathPrefix,
+                                            Map<String, String> caseIdByPath) {
+        if (obj.has(CASE_ID_BY_FIELD_KEY)) {
+            JsonObject map = obj.getAsJsonObject(CASE_ID_BY_FIELD_KEY);
+            for (String field : map.keySet()) {
+                JsonElement v = map.get(field);
+                if (v.isJsonPrimitive()) {
+                    String path = pathPrefix.isEmpty() ? field : pathPrefix + "." + field;
+                    caseIdByPath.put(path, v.getAsString());
+                }
+            }
+            obj.remove(CASE_ID_BY_FIELD_KEY);
+        }
+        for (String key : obj.keySet()) {
+            JsonElement child = obj.get(key);
+            if (child.isJsonObject()) {
+                String path = pathPrefix.isEmpty() ? key : pathPrefix + "." + key;
+                stripCaseIdByField(child.getAsJsonObject(), path, caseIdByPath);
+            }
         }
     }
 
