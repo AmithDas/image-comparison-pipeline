@@ -55,12 +55,20 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.comparison_results` (
   image_id          STRING    NOT NULL,
   key_id            STRING    NOT NULL,   -- Barricade key used to encrypt human_value and ai_value
   segment           STRING    NOT NULL,   -- segment name from --segmentConfigs, e.g. 'main', 'auth', 'docreview'
-  case_id           STRING,               -- distinguishes multiple cases sharing one image's AI
-                                           -- payload; null for segments with a single case
-  ai_iteration      INT64     NOT NULL,   -- 1-based per case, in the order each AI payload was
-                                           -- discovered/matched for that case (see FilterAndPairFn;
-                                           -- not a guarantee of strict created_at ordering across
-                                           -- pipeline runs when AI payloads arrive out of order)
+  case_id           STRING,               -- the case_id that actually contributed this row's field —
+                                           -- resolved per row from metadata embedded in the merged
+                                           -- human payload JSON (_sourceCaseId on an array item,
+                                           -- _caseIdByField for a scalar field, falling back to the
+                                           -- pending row's canonical case_id when the field's section
+                                           -- had only one contributor). Null when no real case_id has
+                                           -- ever been seen for this image+segment. See FilterAndPairFn
+                                           -- and FlattenAndCompareFn — human payloads for the same
+                                           -- image_id+segment are always merged across case_ids, so
+                                           -- this is lineage, not a partition.
+  ai_iteration      INT64     NOT NULL,   -- 1-based per image+segment group, in the order each AI
+                                           -- payload was discovered/matched (see FilterAndPairFn; not
+                                           -- a guarantee of strict created_at ordering across pipeline
+                                           -- runs when AI payloads arrive out of order)
   ai_created_at     TIMESTAMP,
   human_created_at  TIMESTAMP,
   field_name        STRING    NOT NULL,   -- dot-notation path e.g. "terms.code"
@@ -91,8 +99,13 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_comparisons` (
   image_id          STRING    NOT NULL,
   key_id            STRING    NOT NULL,   -- Barricade encryption key identifier
   segment           STRING    NOT NULL,   -- segment name from --segmentConfigs
-  case_id           STRING,               -- distinguishes multiple cases sharing one image's AI
-                                           -- payload; null for segments with a single case
+  case_id           STRING,               -- canonical (earliest-arriving) case_id contributing to
+                                           -- this image+segment's consolidated human payload; null
+                                           -- when no real case_id has ever been seen. Human payloads
+                                           -- for the same image_id+segment are always merged across
+                                           -- case_ids (see FilterAndPairFn) — case_id is lineage, not
+                                           -- a matching partition. See merged_case_ids for the full
+                                           -- contributor set.
   pending_type      STRING    NOT NULL,   -- 'human' | 'human:merged' | 'human:<subType>'
   payload           STRING    NOT NULL,   -- Barricade-encrypted payload
   created_at        TIMESTAMP,            -- original created_at from source table
@@ -100,19 +113,28 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_comparisons` (
   last_retried_at   TIMESTAMP,            -- updated on each pipeline run
   retry_count       INT64     NOT NULL,   -- incremented on each retry
   matched_ai_keys   STRING,               -- semicolon-joined identity keys of AI payloads already
-                                           -- matched against this case (see FilterAndPairFn dedup
-                                           -- key: payload + "|" + created_at); null/empty if none yet.
-                                           -- Used ONLY to check "have I matched this exact AI row
-                                           -- before" — never used to derive the next ai_iteration
-                                           -- number, since its cardinality isn't a safe proxy for a
-                                           -- sequence count (e.g. a defensive merge of two colliding
-                                           -- pending rows unions this set, which can grow it without
-                                           -- a corresponding real match).
-  next_ai_iteration INT64     NOT NULL    -- explicit, monotonically-incrementing counter: the next
-                                           -- ai_iteration number this case will assign. Incremented
-                                           -- by exactly the number of AI rows matched each run;
-                                           -- resolved via MAX (never derived from matched_ai_keys)
-                                           -- when two pending rows for the same case are merged.
+                                           -- matched against this image+segment group (see
+                                           -- FilterAndPairFn dedup key: the AI payload string alone —
+                                           -- created_at is no longer part of the identity now that new
+                                           -- AI payloads get an assigned, monotonically-bumped
+                                           -- created_at rather than a passthrough of the source
+                                           -- timestamp); null/empty if none yet. Used ONLY to check
+                                           -- "have I matched this exact AI row before" — never used to
+                                           -- derive the next ai_iteration number, since its cardinality
+                                           -- isn't a safe proxy for a sequence count (e.g. a defensive
+                                           -- merge of two colliding pending rows unions this set, which
+                                           -- can grow it without a corresponding real match).
+  next_ai_iteration INT64     NOT NULL,   -- explicit, monotonically-incrementing counter: the next
+                                           -- ai_iteration number this image+segment group will assign.
+                                           -- Incremented by exactly the number of AI rows matched each
+                                           -- run; resolved via MAX (never derived from matched_ai_keys)
+                                           -- when two pending rows for the same group are merged.
+  merged_case_ids   STRING                -- semicolon-joined set of every case_id that has ever
+                                           -- contributed to this image+segment's consolidated human
+                                           -- payload. Internal bookkeeping only — per-field/per-row
+                                           -- attribution for comparison_results.case_id is resolved
+                                           -- from metadata embedded in the payload JSON itself
+                                           -- (_caseIdByField / _sourceCaseId), not from this column.
 )
 PARTITION BY DATE(first_seen_at)
 OPTIONS (

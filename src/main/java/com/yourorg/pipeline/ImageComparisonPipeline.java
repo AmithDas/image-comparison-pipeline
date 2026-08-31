@@ -670,7 +670,8 @@ public class ImageComparisonPipeline {
                         ? ((Number) r.get("retry_count")).longValue() : 0L)
                 .set("matched_ai_keys", str(r.get("matched_ai_keys")))
                 .set("next_ai_iteration", r.get("next_ai_iteration") != null
-                        ? ((Number) r.get("next_ai_iteration")).longValue() : 0L);
+                        ? ((Number) r.get("next_ai_iteration")).longValue() : 0L)
+                .set("merged_case_ids", str(r.get("merged_case_ids")));
     }
 
     private static TableRow fromAiPendingRecord(GenericRecord r) {

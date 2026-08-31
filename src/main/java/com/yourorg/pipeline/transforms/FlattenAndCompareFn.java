@@ -1,6 +1,9 @@
 package com.yourorg.pipeline.transforms;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
@@ -33,9 +36,13 @@ import java.util.stream.Stream;
  * per field value, including a {@code segment} column for downstream filtering.
  *
  * <h3>Pair key format</h3>
- * {@code "imageId::segment::caseId::iteration"} — all four parts are embedded in
- * the pair key set by {@link FilterAndPairFn}. {@code caseId} is empty for
- * segments with no real {@code case_id} (single-case segments).
+ * {@code "imageId::segment::iteration"} — set by {@link FilterAndPairFn}. There is
+ * one comparison stream per {@code imageId::segment} group; {@code case_id} is no
+ * longer part of the key since human payloads for every case sharing an
+ * image+segment are merged into one consolidated record before comparison (see
+ * {@link FilterAndPairFn#mergeAcrossCases}). The {@code case_id} written to each
+ * output row is instead resolved per field from provenance metadata embedded in
+ * the merged payload JSON — see {@link #resolveCaseId}.
  *
  * <h3>Array comparison</h3>
  * <ul>
@@ -153,23 +160,28 @@ public class FlattenAndCompareFn
 
     // ── Processing ────────────────────────────────────────────────────────────
 
+    /** Reserved JSON keys FilterAndPairFn embeds for cross-case provenance — see mergeAcrossCases. */
+    private static final String CASE_ID_BY_FIELD_KEY = "_caseIdByField";
+    private static final String SOURCE_CASE_ID_KEY   = "_sourceCaseId";
+    private static final String SOURCE_CASE_ID_SUFFIX = "." + SOURCE_CASE_ID_KEY;
+
     @ProcessElement
     public void processElement(ProcessContext ctx) {
-        // Pair key format: "imageId::segment::caseId::iteration"
+        // Pair key format: "imageId::segment::iteration" — one comparison stream per group,
+        // case_id is resolved per row below instead of carried in the key.
         String pairKey = ctx.element().getKey();
-        String[] parts = pairKey.split("::", 4);
+        String[] parts = pairKey.split("::", 3);
 
-        if (parts.length != 4) {
+        if (parts.length != 3) {
             LOG.warn("Unexpected pairKey format: '{}' — skipping", pairKey);
             return;
         }
 
         String imageId = parts[0];
         String segment = parts[1];
-        String caseId  = parts[2].isEmpty() ? null : parts[2];
         int    iteration;
         try {
-            iteration = Integer.parseInt(parts[3]);
+            iteration = Integer.parseInt(parts[2]);
         } catch (NumberFormatException e) {
             LOG.warn("Could not parse iteration from pairKey '{}' — skipping", pairKey);
             return;
@@ -186,37 +198,31 @@ public class FlattenAndCompareFn
         }
         String keyId = humanKeyId;
 
+        // Fallback case_id when a field's section had a single contributor (the common case) —
+        // see FilterAndPairFn.mergeAcrossCases / the humanRec.put("case_id", ...) call site.
+        String canonicalCaseId = str(human.get("case_id"));
+
         String humanPayload = BarricadeEncryptionUtil.decrypt(keyId, str(human.get("payload")));
         String aiPayload    = BarricadeEncryptionUtil.decrypt(keyId, str(ai.get("payload")));
+
+        // Strip the top-level _caseIdByField provenance map (present only when this group had
+        // more than one contributing case_id) before flattening, so it never gets compared as a
+        // real field. Resolved per root field name — same granularity as segment_type.
+        Map<String, String> rootCaseId = new HashMap<>();
+        humanPayload = extractAndStripCaseIdByField(humanPayload, rootCaseId);
 
         Map<String, List<FieldValue>> humanFields =
                 JsonFieldExtractor.flatten(humanPayload, ARRAY_MATCH_KEYS);
         Map<String, List<FieldValue>> aiFields =
                 applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS), segment);
 
+        // _sourceCaseId rides through flatten() as an ordinary sibling field of each merged
+        // array item (sharing that item's matchKey) — pull it out into a matchKey -> case_id
+        // lookup and drop it from the comparable field set.
+        Map<String, String> caseIdByMatchKey = extractAndStripSourceCaseId(humanFields);
+
         Map<String, String> rootToLabel = rootToLabelBySegment.getOrDefault(
                 segment, Collections.emptyMap());
-
-        // Scope the AI side to only the segment_type(s) this case's own human payload
-        // actually covers. Without this, a case only owning e.g. segment_type "docreview"
-        // gets compared against the full AI payload (which covers every segment_type for
-        // the image), producing false "human_value=null" mismatch rows for every field
-        // that belongs to a different, unrelated case's segment_type. Skipped entirely for
-        // the no-case bucket (caseId == null) and for segments with no segmentTypeMappings
-        // configured, so single-case behavior is completely unchanged — a real "AI has it,
-        // human never touched it" mismatch must still be reported there.
-        if (caseId != null && !rootToLabel.isEmpty()) {
-            Set<String> configuredSegmentTypes = new HashSet<>(rootToLabel.values());
-            Set<String> caseSegmentTypes = new HashSet<>();
-            for (Map.Entry<String, List<FieldValue>> e : humanFields.entrySet()) {
-                for (FieldValue fv : e.getValue()) {
-                    String st = resolveSegmentType(e.getKey(), fv.matchKey, rootToLabel);
-                    if (st != null) caseSegmentTypes.add(st);
-                }
-            }
-            aiFields = excludeForeignSegmentTypes(
-                    aiFields, rootToLabel, configuredSegmentTypes, caseSegmentTypes);
-        }
 
         // Soft-match: for each configured array, compute exact-first / positional-fallback
         // remaps and apply them scoped to that array path only.  Processing each array
@@ -273,7 +279,9 @@ public class FlattenAndCompareFn
                     for (int i = 0; i < count; i++) {
                         String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
                         String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
-                        emitRow(ctx, imageId, segment, caseId, keyId, iteration,
+                        String rowCaseId = resolveCaseId(field, matchKey, caseIdByMatchKey,
+                                rootCaseId, canonicalCaseId);
+                        emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
                                 field, matchKey, humanVal, aiVal);
                         rowsEmitted++;
@@ -284,7 +292,9 @@ public class FlattenAndCompareFn
                 for (int i = 0; i < count; i++) {
                     String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
                     String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
-                    emitRow(ctx, imageId, segment, caseId, keyId, iteration,
+                    String rowCaseId = resolveCaseId(field, null, caseIdByMatchKey,
+                            rootCaseId, canonicalCaseId);
+                    emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
                             field, null, humanVal, aiVal);
                     rowsEmitted++;
@@ -292,8 +302,83 @@ public class FlattenAndCompareFn
             }
         }
 
-        LOG.info("Compared imageId='{}' segment='{}' case='{}' iteration={} — {} rows ({} fields)",
-                imageId, segment, caseId, iteration, rowsEmitted, allFields.size());
+        LOG.info("Compared imageId='{}' segment='{}' iteration={} — {} rows ({} fields)",
+                imageId, segment, iteration, rowsEmitted, allFields.size());
+    }
+
+    /**
+     * Resolves the {@code case_id} to write for one output row, in precedence order:
+     * <ol>
+     *   <li>The array item's {@code _sourceCaseId} stamp, looked up by matchKey — for a
+     *       {@code mergeArrayFields} array with more than one contributing case.</li>
+     *   <li>{@code rootCaseId[root]} — the field's top-level root, from {@code _caseIdByField}
+     *       (present only when that section had more than one contributor).</li>
+     *   <li>{@code canonicalCaseId} — the common case: the section had a single contributor.</li>
+     * </ol>
+     */
+    private static String resolveCaseId(String field, String matchKey,
+                                         Map<String, String> caseIdByMatchKey,
+                                         Map<String, String> rootCaseId,
+                                         String canonicalCaseId) {
+        if (matchKey != null) {
+            String fromArrayItem = caseIdByMatchKey.get(matchKey);
+            if (fromArrayItem != null) return fromArrayItem;
+        }
+        int dot = field.indexOf('.');
+        String root = dot > 0 ? field.substring(0, dot) : field;
+        String fromRoot = rootCaseId.get(root);
+        if (fromRoot != null) return fromRoot;
+        return canonicalCaseId;
+    }
+
+    /**
+     * Parses {@code payload}, removes the top-level {@link #CASE_ID_BY_FIELD_KEY} map if
+     * present (populating {@code rootCaseId} with its contents), and returns the payload with
+     * that key stripped so it's never treated as a comparable field. Returns {@code payload}
+     * unchanged if it isn't valid JSON or has no such key.
+     */
+    private static String extractAndStripCaseIdByField(String payload, Map<String, String> rootCaseId) {
+        try {
+            JsonElement parsed = JsonParser.parseString(payload);
+            if (!parsed.isJsonObject()) return payload;
+            JsonObject obj = parsed.getAsJsonObject();
+            if (!obj.has(CASE_ID_BY_FIELD_KEY)) return payload;
+            JsonObject map = obj.getAsJsonObject(CASE_ID_BY_FIELD_KEY);
+            for (String field : map.keySet()) {
+                JsonElement v = map.get(field);
+                if (v.isJsonPrimitive()) rootCaseId.put(field, v.getAsString());
+            }
+            obj.remove(CASE_ID_BY_FIELD_KEY);
+            return obj.toString();
+        } catch (Exception e) {
+            LOG.warn("Could not parse human payload to extract {} — leaving as-is: {}",
+                    CASE_ID_BY_FIELD_KEY, e.getMessage());
+            return payload;
+        }
+    }
+
+    /**
+     * {@code _sourceCaseId} rides through {@link JsonFieldExtractor#flatten} as an ordinary
+     * sibling field of each merged array item, sharing that item's matchKey. Pulls those
+     * entries out into a {@code matchKey -> case_id} lookup and removes them from
+     * {@code humanFields} so they're never treated as a comparable field.
+     */
+    private static Map<String, String> extractAndStripSourceCaseId(
+            Map<String, List<FieldValue>> humanFields) {
+        Map<String, String> caseIdByMatchKey = new HashMap<>();
+        List<String> toRemove = new ArrayList<>();
+        for (Map.Entry<String, List<FieldValue>> e : humanFields.entrySet()) {
+            String key = e.getKey();
+            if (!key.equals(SOURCE_CASE_ID_KEY) && !key.endsWith(SOURCE_CASE_ID_SUFFIX)) continue;
+            toRemove.add(key);
+            for (FieldValue fv : e.getValue()) {
+                if (fv.matchKey != null && fv.value != null) {
+                    caseIdByMatchKey.put(fv.matchKey, fv.value);
+                }
+            }
+        }
+        toRemove.forEach(humanFields::remove);
+        return caseIdByMatchKey;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -350,34 +435,6 @@ public class FlattenAndCompareFn
             return null;
         }
         return rootToLabel.getOrDefault(root, root);
-    }
-
-    /**
-     * Drops AI field values whose resolved segment_type is a *recognized* (configured
-     * in segmentTypeMappings) label that this case doesn't own. Values whose segment_type
-     * is null (no dot/arrayKey, or an unconfigured root) are left alone — those are either
-     * scalars with no segment_type concept at all, or fields shared across every case for
-     * this segment — only a genuinely foreign, configured segment_type is excluded.
-     */
-    private static Map<String, List<FieldValue>> excludeForeignSegmentTypes(
-            Map<String, List<FieldValue>> fields,
-            Map<String, String> rootToLabel,
-            Set<String> configuredSegmentTypes,
-            Set<String> caseSegmentTypes) {
-        Map<String, List<FieldValue>> result = new LinkedHashMap<>();
-        for (Map.Entry<String, List<FieldValue>> e : fields.entrySet()) {
-            List<FieldValue> kept = e.getValue().stream()
-                    .filter(fv -> {
-                        String st = resolveSegmentType(e.getKey(), fv.matchKey, rootToLabel);
-                        boolean foreign = st != null
-                                && configuredSegmentTypes.contains(st)
-                                && !caseSegmentTypes.contains(st);
-                        return !foreign;
-                    })
-                    .collect(Collectors.toList());
-            if (!kept.isEmpty()) result.put(e.getKey(), kept);
-        }
-        return result;
     }
 
     private static String rename(String key, Map<String, String> aiToHuman) {

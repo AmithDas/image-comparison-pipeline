@@ -4,6 +4,13 @@
 -- only AI-only false mismatches that are covered by another case for the same
 -- image/segment/AI payload scope.
 --
+-- NOTE (post-004): as of migration 004, human payloads for the same
+-- image_id+segment are always merged across case_ids upstream, at ingest —
+-- the cross-case false-mismatch problem this view papers over no longer
+-- occurs for rows written after that change shipped. This view remains
+-- useful only for historical rows written before then; leave it in place
+-- rather than dropping it.
+--
 -- Replace your_project.your_dataset with the deployment project and dataset.
 
 CREATE OR REPLACE VIEW `your_project.your_dataset.comparison_results_clean_view` AS

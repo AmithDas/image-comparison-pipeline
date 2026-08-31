@@ -14,6 +14,7 @@
     {"name": "last_retried_at", "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
     {"name": "retry_count",         "type": "long",             "default": 0},
     {"name": "matched_ai_keys",     "type": ["null", "string"], "default": null},
-    {"name": "next_ai_iteration",   "type": "long",             "default": 0}
+    {"name": "next_ai_iteration",   "type": "long",             "default": 0},
+    {"name": "merged_case_ids",     "type": ["null", "string"], "default": null}
   ]
 }

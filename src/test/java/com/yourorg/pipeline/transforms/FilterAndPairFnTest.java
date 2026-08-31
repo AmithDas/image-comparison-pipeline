@@ -48,9 +48,19 @@ public class FilterAndPairFnTest {
         return "{\"image_name\":\"" + imageId + "\"}";
     }
 
-    /** The same AI identity key FilterAndPairFn derives internally: payload + "|" + created_at. */
-    private static String aiDedupKey(String imageId, String createdAt) {
-        return payloadFor(imageId) + "|" + createdAt;
+    /**
+     * Distinct AI payload content for a given marker. AI row identity is now the payload
+     * string alone (see FilterAndPairFn.dedupKey) — real Barricade ciphertext differs per
+     * submission via a random IV, so tests with more than one distinct AI event in the same
+     * run must use distinguishable payload content, not just a different created_at.
+     */
+    private static String aiPayloadFor(String imageId, String marker) {
+        return "{\"image_name\":\"" + imageId + "\",\"ai_marker\":\"" + marker + "\"}";
+    }
+
+    /** The AI identity key FilterAndPairFn derives internally: the payload string alone. */
+    private static String aiDedupKey(String payload) {
+        return payload;
     }
 
     /** Creates a source TableRow (payload is plain JSON — FilterAndPairFn never parses it). */
@@ -61,8 +71,13 @@ public class FilterAndPairFnTest {
 
     private static TableRow sourceRow(String imageId, String method,
                                       String keyId, String createdAt, String caseId) {
+        return sourceRowWithPayload(imageId, method, keyId, createdAt, caseId, payloadFor(imageId));
+    }
+
+    private static TableRow sourceRowWithPayload(String imageId, String method, String keyId,
+                                                  String createdAt, String caseId, String payload) {
         TableRow row = new TableRow()
-                .set("payload",    payloadFor(imageId))
+                .set("payload",    payload)
                 .set("key_id",     keyId)
                 .set("method",     method)
                 .set("created_at", createdAt);
@@ -117,10 +132,17 @@ public class FilterAndPairFnTest {
 
     private static TableRow aiPendingRow(String imageId, String keyId,
                                          String createdAt, String firstSeenAt, Object retryCount) {
+        return aiPendingRowWithPayload(imageId, keyId, createdAt, firstSeenAt, retryCount,
+                payloadFor(imageId));
+    }
+
+    private static TableRow aiPendingRowWithPayload(String imageId, String keyId,
+                                         String createdAt, String firstSeenAt, Object retryCount,
+                                         String payload) {
         return new TableRow()
                 .set("image_id",        imageId)
                 .set("segment",         "main")
-                .set("payload",         payloadFor(imageId))
+                .set("payload",         payload)
                 .set("key_id",          keyId)
                 .set("created_at",      createdAt)
                 .set("first_seen_at",   firstSeenAt)
@@ -223,8 +245,10 @@ public class FilterAndPairFnTest {
     @Test
     public void oneHumanTwoAiIterationsEmitsTwoPairsAndRependHuman() {
         TableRow human = sourceRow("img001", HUMAN_METHOD, "key1", "2026-04-01T10:00:00Z");
-        TableRow ai1   = sourceRow("img001", AI_METHOD,    "key1", "2026-04-01T08:00:00Z"); // earlier → iter 1
-        TableRow ai2   = sourceRow("img001", AI_METHOD,    "key1", "2026-04-01T09:00:00Z"); // later   → iter 2
+        TableRow ai1   = sourceRowWithPayload("img001", AI_METHOD, "key1", "2026-04-01T08:00:00Z",
+                null, aiPayloadFor("img001", "a")); // earlier → iter 1
+        TableRow ai2   = sourceRowWithPayload("img001", AI_METHOD, "key1", "2026-04-01T09:00:00Z",
+                null, aiPayloadFor("img001", "b")); // later   → iter 2
 
         PCollectionTuple routed = runPipeline("img001",
                 List.of(human, ai1, ai2), List.of(), List.of());
@@ -237,8 +261,8 @@ public class FilterAndPairFnTest {
             assertEquals("Expected 2 matched pairs (one per AI iteration)", 2, list.size());
 
             Set<String> keys = list.stream().map(KV::getKey).collect(Collectors.toSet());
-            assertTrue("Missing pair key img001::main::::1", keys.contains("img001::main::::1"));
-            assertTrue("Missing pair key img001::main::::2", keys.contains("img001::main::::2"));
+            assertTrue("Missing pair key img001::main::1", keys.contains("img001::main::1"));
+            assertTrue("Missing pair key img001::main::2", keys.contains("img001::main::2"));
 
             // Both pairs reference the same human payload
             for (KV<String, KV<GenericRecord, GenericRecord>> pair : list) {
@@ -246,16 +270,20 @@ public class FilterAndPairFnTest {
                 assertEquals("human", humanRec.get("payload_type").toString());
             }
 
-            // AI iterations ordered by created_at
+            // AI iterations ordered by created_at. Iteration 1 (the group's first-ever AI
+            // payload) keeps its own original timestamp; iteration 2 is a genuinely new AI
+            // payload discovered in the same run, so it's bumped to exactly +1s past
+            // iteration 1's created_at (see FilterAndPairFn.AI_TIMESTAMP_BUMP_SECONDS),
+            // regardless of its own original (09:00) timestamp.
             Map<String, String> pairKeyToAiCreatedAt = new HashMap<>();
             for (KV<String, KV<GenericRecord, GenericRecord>> pair : list) {
                 pairKeyToAiCreatedAt.put(pair.getKey(),
                         pair.getValue().getValue().get("created_at").toString());
             }
-            assertEquals("Iteration 1 should be the earlier AI (08:00)",
-                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::::1"));
-            assertEquals("Iteration 2 should be the later AI (09:00)",
-                    "2026-04-01T09:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::::2"));
+            assertEquals("Iteration 1 should keep its own original timestamp (08:00)",
+                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::1"));
+            assertEquals("Iteration 2 should be bumped +1s past iteration 1, not its own 09:00",
+                    "2026-04-01T08:00:01.000000Z", pairKeyToAiCreatedAt.get("img001::main::2"));
 
             return null;
         });
@@ -303,7 +331,7 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img002::main::::1", list.get(0).getKey());
+            assertEquals("img002::main::1", list.get(0).getKey());
             return null;
         });
 
@@ -403,7 +431,7 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img005::main::::1", list.get(0).getKey());
+            assertEquals("img005::main::1", list.get(0).getKey());
             return null;
         });
 
@@ -431,18 +459,22 @@ public class FilterAndPairFnTest {
     }
 
     /**
-     * Two cases share one image's AI history. Case-1 already matched AI1 in a prior
-     * run (its matched_ai_keys already contains AI1's identity key); case-2 shows up
-     * fresh this run, having never matched anything.
+     * Two case_ids share one image+segment. Case-1's contribution already matched AI1 in
+     * a prior run (persisted matched_ai_keys already contains AI1's identity key); case-2
+     * shows up fresh this run, contributing a different case_id for the same image+segment.
      *
-     * Expected: case-2 "replays" the full AI history (matches AI1), case-1 does not
-     * re-match AI1 (already in its matched_ai_keys). Both cases and the AI row are
-     * re-pended.
+     * Case_id is lineage, not a matching partition (see FilterAndPairFn class doc) — case-1's
+     * persisted contribution and case-2's fresh contribution merge into ONE consolidated
+     * group. Since the group's matched_ai_keys already covers AI1 and no new AI arrives,
+     * there must be no new match — the old per-case "case-2 replays independently" behavior
+     * no longer applies. Expected: 0 matched pairs, 1 re-pended group row (not 2 separate
+     * case rows) with case_id = case1 (the earlier-arriving, canonical contributor) and
+     * merged_case_ids covering both.
      */
     @Test
     public void newCaseReplaysExistingAiHistory() {
         String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
-        String ai1Key = aiDedupKey("img006", aiCreatedAt);
+        String ai1Key = aiDedupKey(payloadFor("img006"));
 
         TableRow ai1Pending = aiPendingRow("img006", "key1", aiCreatedAt,
                 Instant.now().minusSeconds(3600).toString());
@@ -460,27 +492,27 @@ public class FilterAndPairFnTest {
         PAssert.that(matched(routed)).satisfies(pairs -> {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
-            assertEquals("Only case-2 should match AI1 (case-1 already matched it)", 1, list.size());
-            assertEquals("img006::main::case2::1", list.get(0).getKey());
+            assertEquals("Group already matched AI1 via case-1's carried-forward state — "
+                    + "no new match for case-2's arrival", 0, list.size());
             return null;
         });
 
         PAssert.that(casePending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
-            assertEquals("Both case-1 and case-2 should be re-pended", 2, list.size());
-            Set<String> caseIds = list.stream()
-                    .map(r -> String.valueOf(r.get("case_id")))
-                    .collect(Collectors.toSet());
-            assertTrue(caseIds.contains("case1"));
-            assertTrue(caseIds.contains("case2"));
+            assertEquals("One consolidated group row, not two separate case rows", 1, list.size());
+            GenericRecord row = list.get(0);
+            assertEquals("Canonical case_id is the earlier-arriving contributor",
+                    "case1", row.get("case_id").toString());
+            Set<String> mergedCaseIds = Set.of(row.get("merged_case_ids").toString().split(";"));
+            assertEquals(Set.of("case1", "case2"), mergedCaseIds);
             return null;
         });
 
         PAssert.that(aiPending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
-            assertEquals("AI1 should still be retained for any future case", 1, list.size());
+            assertEquals("AI1 should still be retained for any future contribution", 1, list.size());
             return null;
         });
 
@@ -502,7 +534,7 @@ public class FilterAndPairFnTest {
     @Test
     public void reappearingMatchedAiProducesNoDuplicate() {
         String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
-        String matchedKey  = aiDedupKey("img007", aiCreatedAt);
+        String matchedKey  = aiDedupKey(payloadFor("img007"));
 
         TableRow casePending = casePendingRow("img007", "human", "key1",
                 "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
@@ -551,7 +583,7 @@ public class FilterAndPairFnTest {
     @Test
     public void sameCaseHumanUpdateDoesNotReplayMatchedAi() {
         String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
-        String matchedKey  = aiDedupKey("img008", aiCreatedAt);
+        String matchedKey  = aiDedupKey(payloadFor("img008"));
 
         TableRow oldCaseState = casePendingRow("img008", "human", "key1",
                 "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
@@ -591,8 +623,8 @@ public class FilterAndPairFnTest {
     public void sameCaseHumanUpdateMatchesOnlyNewAiAtNextIteration() {
         String ai1CreatedAt = "2026-04-01T08:00:00.000000Z";
         String ai2CreatedAt = "2026-04-01T09:00:00.000000Z";
-        String ai1Key       = aiDedupKey("img009", ai1CreatedAt);
-        String ai2Key       = aiDedupKey("img009", ai2CreatedAt);
+        String ai1Key       = aiDedupKey(payloadFor("img009"));
+        String ai2Key       = aiDedupKey(aiPayloadFor("img009", "b"));
 
         TableRow oldCaseState = casePendingRow("img009", "human", "key1",
                 "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
@@ -601,7 +633,8 @@ public class FilterAndPairFnTest {
         TableRow updatedHuman = sourceRow("img009", HUMAN_METHOD, "key1",
                 "2026-04-02T10:00:00Z", "case1");
         TableRow ai1Again = sourceRow("img009", AI_METHOD, "key1", ai1CreatedAt);
-        TableRow ai2New   = sourceRow("img009", AI_METHOD, "key1", ai2CreatedAt);
+        TableRow ai2New   = sourceRowWithPayload("img009", AI_METHOD, "key1", ai2CreatedAt,
+                null, aiPayloadFor("img009", "b"));
 
         PCollectionTuple routed = runPipeline("img009",
                 List.of(updatedHuman, ai1Again, ai2New), List.of(oldCaseState), List.of());
@@ -610,8 +643,16 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals(1, list.size());
-            assertEquals("img009::main::case1::2", list.get(0).getKey());
-            assertEquals(ai2CreatedAt, list.get(0).getValue().getValue().get("created_at").toString());
+            assertEquals("img009::main::2", list.get(0).getKey());
+            // ai1Again is not in ai_pending_comparisons in this scenario (simulating a
+            // lookback re-read of an already-matched row, same as
+            // reappearingMatchedAiProducesNoDuplicate), so it's treated as first-sighting
+            // for bump-assignment purposes even though matched_ai_keys already excludes it
+            // from matching — it gets the group's first-ever timestamp (its own original),
+            // and ai2New (the genuinely new payload) is bumped +1s past it rather than
+            // keeping its own original 09:00.
+            assertEquals("2026-04-01T08:00:01.000000Z",
+                    list.get(0).getValue().getValue().get("created_at").toString());
             assertEquals("2026-04-02T10:00:00.000000Z",
                     list.get(0).getValue().getKey().get("created_at").toString());
             return null;
@@ -651,11 +692,11 @@ public class FilterAndPairFnTest {
      */
     @Test
     public void nextIterationComesFromCounterNotKeySetSize() {
-        String ai1CreatedAt = "2026-04-01T08:00:00.000000Z";
-        String ai2CreatedAt = "2026-04-01T09:00:00.000000Z";
         String ai3CreatedAt = "2026-04-01T10:00:00.000000Z";
-        String ai1Key = aiDedupKey("img010", ai1CreatedAt);
-        String ai2Key = aiDedupKey("img010", ai2CreatedAt);
+        // Dummy identity keys for two hypothetical already-matched AI rows — not required to
+        // correspond to any real row appearing this run, only to populate matched_ai_keys.
+        String ai1Key = aiDedupKey(aiPayloadFor("img010", "a"));
+        String ai2Key = aiDedupKey(aiPayloadFor("img010", "b"));
 
         // matched_ai_keys has 2 entries, but next_ai_iteration says only 1 real match happened —
         // simulating an inflated key set from a merge, not a normal case's state.
@@ -665,7 +706,8 @@ public class FilterAndPairFnTest {
 
         TableRow updatedHuman = sourceRow("img010", HUMAN_METHOD, "key1",
                 "2026-04-02T10:00:00Z", "case1");
-        TableRow ai3New = sourceRow("img010", AI_METHOD, "key1", ai3CreatedAt);
+        TableRow ai3New = sourceRowWithPayload("img010", AI_METHOD, "key1", ai3CreatedAt,
+                null, aiPayloadFor("img010", "c"));
 
         PCollectionTuple routed = runPipeline("img010",
                 List.of(updatedHuman, ai3New), List.of(inflatedCaseState), List.of());
@@ -675,7 +717,7 @@ public class FilterAndPairFnTest {
             pairs.forEach(list::add);
             assertEquals("Only the genuinely new AI row should match", 1, list.size());
             assertEquals("Iteration should continue from the counter (1), not the key count (2)",
-                    "img010::main::case1::2", list.get(0).getKey());
+                    "img010::main::2", list.get(0).getKey());
             return null;
         });
 
