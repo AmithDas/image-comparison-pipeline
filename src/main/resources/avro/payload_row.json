@@ -8,6 +8,7 @@
     {"name": "payload_type", "type": "string"},
     {"name": "payload",      "type": "string"},
     {"name": "created_at",   "type": ["null", "string"], "default": null, "bqType": "TIMESTAMP"},
-    {"name": "case_id",      "type": ["null", "string"], "default": null}
+    {"name": "case_id",      "type": ["null", "string"], "default": null},
+    {"name": "comparison_version", "type": ["null", "long"], "default": null}
   ]
 }

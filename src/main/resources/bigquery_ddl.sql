@@ -65,10 +65,13 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.comparison_results` (
                                            -- and FlattenAndCompareFn — human payloads for the same
                                            -- image_id+segment are always merged across case_ids, so
                                            -- this is lineage, not a partition.
-  ai_iteration      INT64     NOT NULL,   -- 1-based per image+segment group, in the order each AI
-                                           -- payload was discovered/matched (see FilterAndPairFn; not
-                                           -- a guarantee of strict created_at ordering across pipeline
-                                           -- runs when AI payloads arrive out of order)
+  ai_iteration      INT64     NOT NULL,   -- comparison-version counter for this image+segment
+                                           -- group (see FilterAndPairFn.comparison_version) —
+                                           -- incremented each time a comparison actually fires
+                                           -- (human or AI content changed since the last one).
+                                           -- NOT a replay index: the group is always compared
+                                           -- against only its single latest AI payload, never a
+                                           -- backlog of unmatched history.
   ai_created_at     TIMESTAMP,
   human_created_at  TIMESTAMP,
   field_name        STRING    NOT NULL,   -- dot-notation path e.g. "terms.code"
@@ -77,7 +80,15 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.comparison_results` (
   human_value       STRING,               -- Barricade-encrypted; null if field absent in human payload
   ai_value          STRING,               -- Barricade-encrypted; null if field absent in AI payload
   is_match          BOOL      NOT NULL,   -- compared on plaintext before encryption
-  load_time         TIMESTAMP NOT NULL
+  load_time         TIMESTAMP NOT NULL,
+  is_current        BOOL      NOT NULL    -- TRUE for the live/current comparison for this
+                                           -- image+segment group; FALSE once a later comparison
+                                           -- has superseded it (see MarkSupersededComparisonsFn,
+                                           -- which sets existing rows to FALSE right before this
+                                           -- run's TRUE rows are written — never physically
+                                           -- deleted, so full history stays recoverable). Most
+                                           -- consumers should query comparison_results_current_view
+                                           -- (migration 006) instead of filtering this directly.
 )
 PARTITION BY DATE(load_time)
 CLUSTER BY image_id, field_name
@@ -112,29 +123,31 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.pending_comparisons` (
   first_seen_at     TIMESTAMP NOT NULL,   -- when first written to pending
   last_retried_at   TIMESTAMP,            -- updated on each pipeline run
   retry_count       INT64     NOT NULL,   -- incremented on each retry
-  matched_ai_keys   STRING,               -- semicolon-joined identity keys of AI payloads already
-                                           -- matched against this image+segment group (see
-                                           -- FilterAndPairFn dedup key: the AI payload string alone —
-                                           -- created_at is no longer part of the identity now that new
-                                           -- AI payloads get an assigned, monotonically-bumped
-                                           -- created_at rather than a passthrough of the source
-                                           -- timestamp); null/empty if none yet. Used ONLY to check
-                                           -- "have I matched this exact AI row before" — never used to
-                                           -- derive the next ai_iteration number, since its cardinality
-                                           -- isn't a safe proxy for a sequence count (e.g. a defensive
-                                           -- merge of two colliding pending rows unions this set, which
-                                           -- can grow it without a corresponding real match).
-  next_ai_iteration INT64     NOT NULL,   -- explicit, monotonically-incrementing counter: the next
-                                           -- ai_iteration number this image+segment group will assign.
-                                           -- Incremented by exactly the number of AI rows matched each
-                                           -- run; resolved via MAX (never derived from matched_ai_keys)
-                                           -- when two pending rows for the same group are merged.
-  merged_case_ids   STRING                -- semicolon-joined set of every case_id that has ever
+  matched_ai_keys   STRING,               -- DEPRECATED — unused, always null. Was the identity-key
+                                           -- set for full-AI-history-replay matching; replaced by
+                                           -- last_compared_signature below (the group now always
+                                           -- compares against only its single latest AI payload).
+                                           -- Left in the schema rather than dropped per this
+                                           -- codebase's additive-only migration convention.
+  next_ai_iteration INT64     NOT NULL,   -- DEPRECATED — unused, always 0. Was the replay-iteration
+                                           -- counter; replaced by comparison_version below.
+  merged_case_ids   STRING,               -- semicolon-joined set of every case_id that has ever
                                            -- contributed to this image+segment's consolidated human
                                            -- payload. Internal bookkeeping only — per-field/per-row
                                            -- attribution for comparison_results.case_id is resolved
                                            -- from metadata embedded in the payload JSON itself
                                            -- (_caseIdByField / _sourceCaseId), not from this column.
+  last_compared_signature STRING,         -- signature of (human payload, latest AI payload) as of
+                                           -- the last comparison actually performed for this group
+                                           -- (see FilterAndPairFn.dedupKey) — a new comparison only
+                                           -- fires when this changes, so a human update (a case
+                                           -- merging in, a field being corrected) or a genuinely new
+                                           -- AI payload both trigger a fresh comparison even against
+                                           -- an AI payload already compared before. Null until the
+                                           -- group's first-ever comparison.
+  comparison_version INT64    NOT NULL    -- observability counter: incremented each time a new
+                                           -- comparison actually fires for this group. Written into
+                                           -- comparison_results.ai_iteration — not a replay index.
 )
 PARTITION BY DATE(first_seen_at)
 OPTIONS (

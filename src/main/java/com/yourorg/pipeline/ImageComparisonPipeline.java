@@ -6,6 +6,7 @@ import com.google.cloud.bigquery.BigQueryOptions;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
+import com.yourorg.pipeline.transforms.MarkSupersededComparisonsFn;
 import com.yourorg.pipeline.util.SchemaRegistry;
 import com.yourorg.pipeline.util.SchemaUtil;
 import com.yourorg.pipeline.util.TimestampUtil;
@@ -364,8 +365,17 @@ public class ImageComparisonPipeline {
         PCollection<GenericRecord> aiAgedOut =
                 routed.get(FilterAndPairFn.AI_AGED_OUT).setCoder(aiPendingCoder);
 
+        // ── Mark the previous comparison for each group non-current before writing
+        //    its replacement — see MarkSupersededComparisonsFn for why this must run
+        //    here, directly ahead of FlattenAndCompare in the same branch.
+        PCollection<KV<String, KV<GenericRecord, GenericRecord>>> matchedAfterSupersedeMark =
+                matched.apply("MarkSupersededComparisons",
+                                ParDo.of(new MarkSupersededComparisonsFn(options.getOutputTable())))
+                       .setCoder(KvCoder.of(StringUtf8Coder.of(),
+                               KvCoder.of(payloadCoder, payloadCoder)));
+
         // ── Flatten & compare matched pairs ───────────────────────────────────
-        PCollection<TableRow> comparisonResults = matched
+        PCollection<TableRow> comparisonResults = matchedAfterSupersedeMark
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
                                 options.getFirestoreCollection(),
@@ -671,7 +681,10 @@ public class ImageComparisonPipeline {
                 .set("matched_ai_keys", str(r.get("matched_ai_keys")))
                 .set("next_ai_iteration", r.get("next_ai_iteration") != null
                         ? ((Number) r.get("next_ai_iteration")).longValue() : 0L)
-                .set("merged_case_ids", str(r.get("merged_case_ids")));
+                .set("merged_case_ids", str(r.get("merged_case_ids")))
+                .set("last_compared_signature", str(r.get("last_compared_signature")))
+                .set("comparison_version", r.get("comparison_version") != null
+                        ? ((Number) r.get("comparison_version")).longValue() : 0L);
     }
 
     private static TableRow fromAiPendingRecord(GenericRecord r) {

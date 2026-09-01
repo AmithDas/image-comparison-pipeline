@@ -25,9 +25,7 @@ import org.junit.Test;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.beam.sdk.options.ValueProvider;
@@ -49,18 +47,24 @@ public class FilterAndPairFnTest {
     }
 
     /**
-     * Distinct AI payload content for a given marker. AI row identity is now the payload
-     * string alone (see FilterAndPairFn.dedupKey) — real Barricade ciphertext differs per
-     * submission via a random IV, so tests with more than one distinct AI event in the same
-     * run must use distinguishable payload content, not just a different created_at.
+     * Distinct payload content for a given marker. Row identity (AI dedup key, and now the
+     * human side of the comparison signature) is the payload string alone — real Barricade
+     * ciphertext differs per submission via a random IV, so any test with more than one
+     * distinct human or AI event must use distinguishable payload content, not just a
+     * different created_at.
      */
-    private static String aiPayloadFor(String imageId, String marker) {
-        return "{\"image_name\":\"" + imageId + "\",\"ai_marker\":\"" + marker + "\"}";
+    private static String payloadWithMarker(String imageId, String marker) {
+        return "{\"image_name\":\"" + imageId + "\",\"marker\":\"" + marker + "\"}";
     }
 
-    /** The AI identity key FilterAndPairFn derives internally: the payload string alone. */
-    private static String aiDedupKey(String payload) {
+    /** The identity key FilterAndPairFn derives internally: the payload string alone. */
+    private static String dedupKey(String payload) {
         return payload;
+    }
+
+    /** The comparison signature FilterAndPairFn derives: dedupKey(human) + "|" + dedupKey(ai). */
+    private static String signature(String humanPayload, String aiPayload) {
+        return dedupKey(humanPayload) + "|" + dedupKey(aiPayload);
     }
 
     /** Creates a source TableRow (payload is plain JSON — FilterAndPairFn never parses it). */
@@ -88,39 +92,36 @@ public class FilterAndPairFnTest {
     /** Creates a case (human-side) pending TableRow (defaults to segment "main"). */
     private static TableRow casePendingRow(String imageId, String pendingType,
                                            String keyId, String createdAt, String firstSeenAt) {
-        return casePendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt, 0L, null, null);
-    }
-
-    private static TableRow casePendingRow(String imageId, String pendingType,
-                                           String keyId, String createdAt, String firstSeenAt,
-                                           Object retryCount, String caseId, String matchedAiKeys) {
-        // Default nextIteration to the key count — mirrors the (correct, in the absence of
-        // any merge artifact) common case where every matched key corresponds to exactly one
-        // real emission. Tests that need to demonstrate the two diverging use the explicit
-        // overload below instead.
-        long defaultNextIteration = matchedAiKeys == null || matchedAiKeys.isBlank()
-                ? 0L : matchedAiKeys.split(";").length;
         return casePendingRow(imageId, pendingType, keyId, createdAt, firstSeenAt,
-                retryCount, caseId, matchedAiKeys, defaultNextIteration);
+                0L, null, null, 0L);
     }
 
     private static TableRow casePendingRow(String imageId, String pendingType,
                                            String keyId, String createdAt, String firstSeenAt,
-                                           Object retryCount, String caseId, String matchedAiKeys,
-                                           long nextIteration) {
+                                           Object retryCount, String caseId,
+                                           String lastComparedSignature, long comparisonVersion) {
+        return casePendingRowWithPayload(imageId, pendingType, keyId, createdAt, firstSeenAt,
+                retryCount, caseId, lastComparedSignature, comparisonVersion, payloadFor(imageId));
+    }
+
+    private static TableRow casePendingRowWithPayload(String imageId, String pendingType,
+                                           String keyId, String createdAt, String firstSeenAt,
+                                           Object retryCount, String caseId,
+                                           String lastComparedSignature, long comparisonVersion,
+                                           String payload) {
         TableRow row = new TableRow()
                 .set("image_id",          imageId)
                 .set("segment",           "main")
                 .set("pending_type",      pendingType)
-                .set("payload",           payloadFor(imageId))
+                .set("payload",           payload)
                 .set("key_id",            keyId)
                 .set("created_at",        createdAt)
                 .set("first_seen_at",     firstSeenAt)
                 .set("last_retried_at",   firstSeenAt)
                 .set("retry_count",       retryCount)
-                .set("next_ai_iteration", nextIteration);
+                .set("comparison_version", comparisonVersion);
         if (caseId != null) row.set("case_id", caseId);
-        if (matchedAiKeys != null) row.set("matched_ai_keys", matchedAiKeys);
+        if (lastComparedSignature != null) row.set("last_compared_signature", lastComparedSignature);
         return row;
     }
 
@@ -232,79 +233,73 @@ public class FilterAndPairFnTest {
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /**
-     * Core scenario: 1 human + 2 AI iterations arrive in the same window, no case_id
-     * (single-case segment).
+     * 1 human + 2 distinct AI payloads arrive in the same window, no case_id (single-case
+     * segment). The group is always compared against only its single latest AI payload —
+     * never a backlog of unmatched history.
      *
      * Expected:
-     *  - MATCHED:      2 pairs — img001::main::::1 (AI@08:00) and img001::main::::2 (AI@09:00)
-     *  - CASE_PENDING:  1 record — human re-pended for future AI iterations
-     *  - AI_PENDING:    2 records — both AI rows are retained even though matched,
-     *                    so a case discovered later could still replay against them
+     *  - MATCHED:      1 pair — img001::main, against whichever AI payload is latest (bumped
+     *                    to created_at 08:00:01, +1s past the first-ever AI payload's 08:00)
+     *  - CASE_PENDING:  1 record — comparison_version=1, last_compared_signature persisted
+     *  - AI_PENDING:    2 records — both AI rows are retained even though only one was
+     *                    compared, so aging is tracked for both independently
      *  - *_AGED_OUT:    empty
      */
     @Test
-    public void oneHumanTwoAiIterationsEmitsTwoPairsAndRependHuman() {
+    public void oneHumanTwoAiPayloadsSameRunComparesOnlyAgainstLatest() {
+        String humanPayload = payloadFor("img001");
+        String ai1Payload   = payloadWithMarker("img001", "a");
+        String ai2Payload   = payloadWithMarker("img001", "b");
+
         TableRow human = sourceRow("img001", HUMAN_METHOD, "key1", "2026-04-01T10:00:00Z");
         TableRow ai1   = sourceRowWithPayload("img001", AI_METHOD, "key1", "2026-04-01T08:00:00Z",
-                null, aiPayloadFor("img001", "a")); // earlier → iter 1
+                null, ai1Payload); // earlier arrival
         TableRow ai2   = sourceRowWithPayload("img001", AI_METHOD, "key1", "2026-04-01T09:00:00Z",
-                null, aiPayloadFor("img001", "b")); // later   → iter 2
+                null, ai2Payload); // later arrival → this is "latest"
 
         PCollectionTuple routed = runPipeline("img001",
                 List.of(human, ai1, ai2), List.of(), List.of());
 
-        // ── MATCHED: exactly 2 pairs ──────────────────────────────────────────
         PAssert.that(matched(routed)).satisfies(pairs -> {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
 
-            assertEquals("Expected 2 matched pairs (one per AI iteration)", 2, list.size());
+            assertEquals("Exactly one comparison, against the latest AI payload only",
+                    1, list.size());
+            assertEquals("img001::main", list.get(0).getKey());
 
-            Set<String> keys = list.stream().map(KV::getKey).collect(Collectors.toSet());
-            assertTrue("Missing pair key img001::main::1", keys.contains("img001::main::1"));
-            assertTrue("Missing pair key img001::main::2", keys.contains("img001::main::2"));
-
-            // Both pairs reference the same human payload
-            for (KV<String, KV<GenericRecord, GenericRecord>> pair : list) {
-                GenericRecord humanRec = pair.getValue().getKey();
-                assertEquals("human", humanRec.get("payload_type").toString());
-            }
-
-            // AI iterations ordered by created_at. Iteration 1 (the group's first-ever AI
-            // payload) keeps its own original timestamp; iteration 2 is a genuinely new AI
-            // payload discovered in the same run, so it's bumped to exactly +1s past
-            // iteration 1's created_at (see FilterAndPairFn.AI_TIMESTAMP_BUMP_SECONDS),
-            // regardless of its own original (09:00) timestamp.
-            Map<String, String> pairKeyToAiCreatedAt = new HashMap<>();
-            for (KV<String, KV<GenericRecord, GenericRecord>> pair : list) {
-                pairKeyToAiCreatedAt.put(pair.getKey(),
-                        pair.getValue().getValue().get("created_at").toString());
-            }
-            assertEquals("Iteration 1 should keep its own original timestamp (08:00)",
-                    "2026-04-01T08:00:00.000000Z", pairKeyToAiCreatedAt.get("img001::main::1"));
-            assertEquals("Iteration 2 should be bumped +1s past iteration 1, not its own 09:00",
-                    "2026-04-01T08:00:01.000000Z", pairKeyToAiCreatedAt.get("img001::main::2"));
+            GenericRecord humanRec = list.get(0).getValue().getKey();
+            GenericRecord aiRec    = list.get(0).getValue().getValue();
+            assertEquals("human", humanRec.get("payload_type").toString());
+            assertEquals("Compared against ai2's content (the latest arrival)",
+                    ai2Payload, aiRec.get("payload").toString());
+            // ai2 is the group's second-ever AI payload discovered this run, so it's bumped
+            // +1s past ai1's own original timestamp (see FilterAndPairFn.AI_TIMESTAMP_BUMP_SECONDS).
+            assertEquals("2026-04-01T08:00:01.000000Z", aiRec.get("created_at").toString());
+            assertEquals(1L, humanRec.get("comparison_version"));
 
             return null;
         });
 
-        // ── CASE_PENDING: human kept alive for future AI iterations ────────────
         PAssert.that(casePending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
 
-            assertEquals("Human should be re-pended for future AI iterations", 1, list.size());
+            assertEquals("Human should be re-pended for future comparisons", 1, list.size());
             assertEquals("human", list.get(0).get("pending_type").toString());
             assertEquals("img001", list.get(0).get("image_id").toString());
+            assertEquals(1L, list.get(0).get("comparison_version"));
+            assertEquals(signature(humanPayload, ai2Payload),
+                    list.get(0).get("last_compared_signature").toString());
 
             return null;
         });
 
-        // ── AI_PENDING: both AI rows retained even though matched ──────────────
         PAssert.that(aiPending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
-            assertEquals("Both AI rows should still be retained for future cases", 2, list.size());
+            assertEquals("Both AI rows should still be retained for independent aging",
+                    2, list.size());
             return null;
         });
 
@@ -331,7 +326,7 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img002::main::1", list.get(0).getKey());
+            assertEquals("img002::main", list.get(0).getKey());
             return null;
         });
 
@@ -357,7 +352,7 @@ public class FilterAndPairFnTest {
 
     /**
      * AI arrives alone — no human in source or pending.
-     * Expected: 0 MATCHED, 1 AI_PENDING (the AI iteration), 0 CASE_PENDING.
+     * Expected: 0 MATCHED, 1 AI_PENDING (the AI row), 0 CASE_PENDING.
      */
     @Test
     public void aiOnlyEmitsNewPending() {
@@ -381,7 +376,7 @@ public class FilterAndPairFnTest {
     }
 
     /**
-     * AI has been pending for more than MAX_WAIT_DAYS with no case ever matching it.
+     * AI has been pending for more than MAX_WAIT_DAYS with no human ever matching it.
      * Expected: 0 MATCHED, 0 AI_PENDING, 1 AI_AGED_OUT — aged independently of any case.
      */
     @Test
@@ -412,9 +407,6 @@ public class FilterAndPairFnTest {
      * BQ's readTableRows() returns INTEGER columns as String, not Long.
      * On the second execution the AI pending row read back from BQ will have
      * retry_count = "1" (String).  This must not throw a ClassCastException.
-     *
-     * Expected: 1 MATCHED pair, human re-pended with retry_count 0 (unrelated to the
-     * AI row's own retry count).
      */
     @Test
     public void retryCountAsStringDoesNotThrow() {
@@ -431,7 +423,7 @@ public class FilterAndPairFnTest {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
             assertEquals("Expected 1 matched pair", 1, list.size());
-            assertEquals("img005::main::1", list.get(0).getKey());
+            assertEquals("img005::main", list.get(0).getKey());
             return null;
         });
 
@@ -459,32 +451,36 @@ public class FilterAndPairFnTest {
     }
 
     /**
-     * Two case_ids share one image+segment. Case-1's contribution already matched AI1 in
-     * a prior run (persisted matched_ai_keys already contains AI1's identity key); case-2
-     * shows up fresh this run, contributing a different case_id for the same image+segment.
+     * Two case_ids share one image+segment, arriving in different runs. Case-1's contribution
+     * already compared against AI1 in a prior run (persisted last_compared_signature reflects
+     * that). Case-2 shows up fresh this run, contributing distinct content under a different
+     * case_id, with no new AI arriving.
      *
      * Case_id is lineage, not a matching partition (see FilterAndPairFn class doc) — case-1's
-     * persisted contribution and case-2's fresh contribution merge into ONE consolidated
-     * group. Since the group's matched_ai_keys already covers AI1 and no new AI arrives,
-     * there must be no new match — the old per-case "case-2 replays independently" behavior
-     * no longer applies. Expected: 0 matched pairs, 1 re-pended group row (not 2 separate
+     * persisted contribution and case-2's fresh contribution fold into ONE consolidated group.
+     * Because the group's human-side content changed (case-2's distinct data), the comparison
+     * signature changes even though AI1 itself didn't — this is the core "always re-compare on
+     * a human update" behavior. Expected: 1 NEW matched pair (comparison_version advances to 2)
+     * against the still-unchanged AI1, and one consolidated CASE_PENDING row (not two separate
      * case rows) with case_id = case1 (the earlier-arriving, canonical contributor) and
      * merged_case_ids covering both.
      */
     @Test
     public void newCaseReplaysExistingAiHistory() {
         String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
-        String ai1Key = aiDedupKey(payloadFor("img006"));
+        String ai1Payload   = payloadFor("img006");
+        String case1Payload = payloadFor("img006");
+        String case2Payload = payloadWithMarker("img006", "case2-update");
 
         TableRow ai1Pending = aiPendingRow("img006", "key1", aiCreatedAt,
                 Instant.now().minusSeconds(3600).toString());
 
         TableRow case1Pending = casePendingRow("img006", "human", "key1",
                 "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
-                0L, "case1", ai1Key);
+                0L, "case1", signature(case1Payload, ai1Payload), 1L);
 
-        TableRow case2Fresh = sourceRow("img006", HUMAN_METHOD, "key1",
-                "2026-04-01T11:00:00Z", "case2");
+        TableRow case2Fresh = sourceRowWithPayload("img006", HUMAN_METHOD, "key1",
+                "2026-04-01T11:00:00Z", "case2", case2Payload);
 
         PCollectionTuple routed = runPipeline("img006",
                 List.of(case2Fresh), List.of(case1Pending), List.of(ai1Pending));
@@ -492,8 +488,10 @@ public class FilterAndPairFnTest {
         PAssert.that(matched(routed)).satisfies(pairs -> {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
-            assertEquals("Group already matched AI1 via case-1's carried-forward state — "
-                    + "no new match for case-2's arrival", 0, list.size());
+            assertEquals("Human content changed (case-2's distinct data) — a new comparison "
+                    + "fires even though AI1 itself is unchanged", 1, list.size());
+            assertEquals("img006::main", list.get(0).getKey());
+            assertEquals(2L, list.get(0).getValue().getKey().get("comparison_version"));
             return null;
         });
 
@@ -504,6 +502,7 @@ public class FilterAndPairFnTest {
             GenericRecord row = list.get(0);
             assertEquals("Canonical case_id is the earlier-arriving contributor",
                     "case1", row.get("case_id").toString());
+            assertEquals(2L, row.get("comparison_version"));
             Set<String> mergedCaseIds = Set.of(row.get("merged_case_ids").toString().split(";"));
             assertEquals(Set.of("case1", "case2"), mergedCaseIds);
             return null;
@@ -522,25 +521,25 @@ public class FilterAndPairFnTest {
     }
 
     /**
-     * Regression test for the AI lookback: an AI row a case already matched (its
-     * dedup key is already in matched_ai_keys) reappears as a fresh SOURCE row on a
-     * later run — e.g. re-selected by --aiLookbackHours even though it's no longer
-     * present in the AI pending pool for this scenario. It must NOT be matched again.
-     *
-     * This is exactly the scenario that would have silently duplicated comparison_results
-     * rows under the old matched_ai_count (a count, not an identity set) design, once an
-     * AI source read could re-select an already-matched row across separate runs.
+     * Regression test: an AI row already reflected in the group's last_compared_signature
+     * reappears as a fresh SOURCE row on a later run — e.g. re-selected by
+     * --aiLookbackHours even though it's no longer present in the AI pending pool for this
+     * scenario — with no human-side change either. Since neither side's content actually
+     * changed, the signature is unchanged and no new comparison (and no duplicate
+     * comparison_results rows) should be produced.
      */
     @Test
     public void reappearingMatchedAiProducesNoDuplicate() {
-        String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
-        String matchedKey  = aiDedupKey(payloadFor("img007"));
+        String aiCreatedAt   = "2026-04-01T08:00:00.000000Z";
+        String humanPayload  = payloadFor("img007");
+        String aiPayload     = payloadFor("img007");
 
         TableRow casePending = casePendingRow("img007", "human", "key1",
                 "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
-                0L, null, matchedKey);
+                0L, null, signature(humanPayload, aiPayload), 1L);
 
-        // Same AI payload reappears as a fresh source row (simulating a lookback re-read).
+        // Same AI payload reappears as a fresh source row (simulating a lookback re-read) —
+        // no human-side change this run either.
         TableRow aiAgain = sourceRow("img007", AI_METHOD, "key1", aiCreatedAt);
 
         PCollectionTuple routed = runPipeline("img007",
@@ -552,15 +551,11 @@ public class FilterAndPairFnTest {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals(1, list.size());
-            assertEquals("matched_ai_keys should be unchanged — no new match",
-                    matchedKey, list.get(0).get("matched_ai_keys").toString());
-            return null;
-        });
-
-        PAssert.that(aiPending(routed)).satisfies(records -> {
-            List<GenericRecord> list = new ArrayList<>();
-            records.forEach(list::add);
-            assertEquals("Reappeared AI row is retained, not re-matched", 1, list.size());
+            assertEquals("last_compared_signature should be unchanged — no new comparison",
+                    signature(humanPayload, aiPayload),
+                    list.get(0).get("last_compared_signature").toString());
+            assertEquals("comparison_version should not advance", 1L,
+                    list.get(0).get("comparison_version"));
             return null;
         });
 
@@ -577,18 +572,22 @@ public class FilterAndPairFnTest {
     }
 
     /**
-     * Same case_id receives a newer human payload after already matching AI1.
-     * The newer human created_at must not reset matched_ai_keys or replay AI1.
+     * Same case_id resubmits with a newer created_at but byte-identical payload content (e.g.
+     * a retry or a no-op resubmission), and the same AI payload also reappears unchanged.
+     * Since the comparison signature is content-based (not timestamp-based), this must NOT
+     * trigger a needless re-comparison — only a genuine content change should.
      */
     @Test
-    public void sameCaseHumanUpdateDoesNotReplayMatchedAi() {
-        String aiCreatedAt = "2026-04-01T08:00:00.000000Z";
-        String matchedKey  = aiDedupKey(payloadFor("img008"));
+    public void noOpResubmissionWithUnchangedContentDoesNotReplayComparison() {
+        String aiCreatedAt  = "2026-04-01T08:00:00.000000Z";
+        String humanPayload = payloadFor("img008");
+        String aiPayload    = payloadFor("img008");
 
         TableRow oldCaseState = casePendingRow("img008", "human", "key1",
                 "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
-                3L, "case1", matchedKey);
+                3L, "case1", signature(humanPayload, aiPayload), 1L);
 
+        // Newer created_at, but identical payload content.
         TableRow updatedHuman = sourceRow("img008", HUMAN_METHOD, "key1",
                 "2026-04-02T10:00:00Z", "case1");
         TableRow aiAgain = sourceRow("img008", AI_METHOD, "key1", aiCreatedAt);
@@ -605,7 +604,11 @@ public class FilterAndPairFnTest {
             GenericRecord row = list.get(0);
             assertEquals("case1", row.get("case_id").toString());
             assertEquals("2026-04-02T10:00:00.000000Z", row.get("created_at").toString());
-            assertEquals(matchedKey, row.get("matched_ai_keys").toString());
+            assertEquals("Signature unchanged — content is identical",
+                    signature(humanPayload, aiPayload),
+                    row.get("last_compared_signature").toString());
+            assertEquals("comparison_version must not advance on a no-op resubmission",
+                    1L, row.get("comparison_version"));
             return null;
         });
 
@@ -615,46 +618,37 @@ public class FilterAndPairFnTest {
     }
 
     /**
-     * Same case_id receives a newer human payload and a genuinely new AI payload.
-     * Only the new AI should match, and its ai_iteration should continue after
-     * the previously matched AI key.
+     * A genuinely new AI payload arrives for an already-compared group — even though the
+     * human side hasn't changed, a new comparison must fire against the new AI payload.
      */
     @Test
-    public void sameCaseHumanUpdateMatchesOnlyNewAiAtNextIteration() {
-        String ai1CreatedAt = "2026-04-01T08:00:00.000000Z";
-        String ai2CreatedAt = "2026-04-01T09:00:00.000000Z";
-        String ai1Key       = aiDedupKey(payloadFor("img009"));
-        String ai2Key       = aiDedupKey(aiPayloadFor("img009", "b"));
+    public void newAiPayloadTriggersFreshComparisonAgainstLatest() {
+        String ai1Payload  = payloadFor("img009");
+        String ai2Payload  = payloadWithMarker("img009", "b");
+        String humanPayload = payloadFor("img009");
 
         TableRow oldCaseState = casePendingRow("img009", "human", "key1",
                 "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
-                3L, "case1", ai1Key);
+                3L, "case1", signature(humanPayload, ai1Payload), 1L);
 
-        TableRow updatedHuman = sourceRow("img009", HUMAN_METHOD, "key1",
+        // Human content unchanged; ai1 reappears (lookback re-read), ai2 is genuinely new.
+        TableRow humanAgain = sourceRow("img009", HUMAN_METHOD, "key1",
                 "2026-04-02T10:00:00Z", "case1");
-        TableRow ai1Again = sourceRow("img009", AI_METHOD, "key1", ai1CreatedAt);
-        TableRow ai2New   = sourceRowWithPayload("img009", AI_METHOD, "key1", ai2CreatedAt,
-                null, aiPayloadFor("img009", "b"));
+        TableRow ai1Again = sourceRow("img009", AI_METHOD, "key1", "2026-04-01T08:00:00Z");
+        TableRow ai2New   = sourceRowWithPayload("img009", AI_METHOD, "key1",
+                "2026-04-01T09:00:00Z", null, ai2Payload);
 
         PCollectionTuple routed = runPipeline("img009",
-                List.of(updatedHuman, ai1Again, ai2New), List.of(oldCaseState), List.of());
+                List.of(humanAgain, ai1Again, ai2New), List.of(oldCaseState), List.of());
 
         PAssert.that(matched(routed)).satisfies(pairs -> {
             List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
             pairs.forEach(list::add);
-            assertEquals(1, list.size());
-            assertEquals("img009::main::2", list.get(0).getKey());
-            // ai1Again is not in ai_pending_comparisons in this scenario (simulating a
-            // lookback re-read of an already-matched row, same as
-            // reappearingMatchedAiProducesNoDuplicate), so it's treated as first-sighting
-            // for bump-assignment purposes even though matched_ai_keys already excludes it
-            // from matching — it gets the group's first-ever timestamp (its own original),
-            // and ai2New (the genuinely new payload) is bumped +1s past it rather than
-            // keeping its own original 09:00.
-            assertEquals("2026-04-01T08:00:01.000000Z",
-                    list.get(0).getValue().getValue().get("created_at").toString());
-            assertEquals("2026-04-02T10:00:00.000000Z",
-                    list.get(0).getValue().getKey().get("created_at").toString());
+            assertEquals("New AI payload triggers exactly one fresh comparison", 1, list.size());
+            assertEquals("img009::main", list.get(0).getKey());
+            assertEquals("Compared against the new AI payload (ai2), not the reappearing ai1",
+                    ai2Payload, list.get(0).getValue().getValue().get("payload").toString());
+            assertEquals(2L, list.get(0).getValue().getKey().get("comparison_version"));
             return null;
         });
 
@@ -662,70 +656,16 @@ public class FilterAndPairFnTest {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
             assertEquals(1, list.size());
-            String matched = list.get(0).get("matched_ai_keys").toString();
-            assertTrue(matched.contains(ai1Key));
-            assertTrue(matched.contains(ai2Key));
+            assertEquals(2L, list.get(0).get("comparison_version"));
+            assertEquals(signature(humanPayload, ai2Payload),
+                    list.get(0).get("last_compared_signature").toString());
             return null;
         });
 
         PAssert.that(aiPending(routed)).satisfies(records -> {
             List<GenericRecord> list = new ArrayList<>();
             records.forEach(list::add);
-            assertEquals("Both AI rows should be retained for future cases", 2, list.size());
-            return null;
-        });
-
-        PAssert.that(caseAgedOut(routed)).empty();
-        PAssert.that(aiAgedOut(routed)).empty();
-        pipeline.run().waitUntilFinish();
-    }
-
-    /**
-     * Regression test: the next ai_iteration must come from the explicit next_ai_iteration
-     * counter, never from matched_ai_keys.size(). Simulates a case whose matched_ai_keys was
-     * inflated to 2 entries by a defensive merge (mergeCaseMeta) without a second real match
-     * ever happening — next_ai_iteration correctly still says only 1 real match occurred.
-     *
-     * If iteration were derived from matched_ai_keys.size() instead, a genuinely new AI row
-     * would incorrectly be assigned iteration 3, skipping iteration 2 — this is exactly the
-     * "ai_iteration=2 with no ai_iteration=1" class of symptom the counter field prevents.
-     */
-    @Test
-    public void nextIterationComesFromCounterNotKeySetSize() {
-        String ai3CreatedAt = "2026-04-01T10:00:00.000000Z";
-        // Dummy identity keys for two hypothetical already-matched AI rows — not required to
-        // correspond to any real row appearing this run, only to populate matched_ai_keys.
-        String ai1Key = aiDedupKey(aiPayloadFor("img010", "a"));
-        String ai2Key = aiDedupKey(aiPayloadFor("img010", "b"));
-
-        // matched_ai_keys has 2 entries, but next_ai_iteration says only 1 real match happened —
-        // simulating an inflated key set from a merge, not a normal case's state.
-        TableRow inflatedCaseState = casePendingRow("img010", "human", "key1",
-                "2026-03-30T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
-                0L, "case1", ai1Key + ";" + ai2Key, /* nextIteration */ 1L);
-
-        TableRow updatedHuman = sourceRow("img010", HUMAN_METHOD, "key1",
-                "2026-04-02T10:00:00Z", "case1");
-        TableRow ai3New = sourceRowWithPayload("img010", AI_METHOD, "key1", ai3CreatedAt,
-                null, aiPayloadFor("img010", "c"));
-
-        PCollectionTuple routed = runPipeline("img010",
-                List.of(updatedHuman, ai3New), List.of(inflatedCaseState), List.of());
-
-        PAssert.that(matched(routed)).satisfies(pairs -> {
-            List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
-            pairs.forEach(list::add);
-            assertEquals("Only the genuinely new AI row should match", 1, list.size());
-            assertEquals("Iteration should continue from the counter (1), not the key count (2)",
-                    "img010::main::2", list.get(0).getKey());
-            return null;
-        });
-
-        PAssert.that(casePending(routed)).satisfies(records -> {
-            List<GenericRecord> list = new ArrayList<>();
-            records.forEach(list::add);
-            assertEquals(1, list.size());
-            assertEquals(2L, list.get(0).get("next_ai_iteration"));
+            assertEquals("Both AI rows should be retained for independent aging", 2, list.size());
             return null;
         });
 

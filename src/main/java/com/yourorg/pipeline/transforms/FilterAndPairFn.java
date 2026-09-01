@@ -30,6 +30,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -64,13 +65,24 @@ import java.util.TreeSet;
  * ({@link #AI_PENDING_TAG} / {@link #AI_PENDING} / {@link #AI_AGED_OUT}) that is
  * never pruned just because it matched.
  *
- * <h3>AI matching, per group</h3>
- * Each {@code imageId::segment} group persists the set of AI payload identity
- * keys it has already been compared against ({@code matched_ai_keys} — see
- * {@link #dedupKey}). Every run, the group is paired against whichever AI rows
- * from the shared pool aren't yet in that set. {@code ai_iteration} numbers are
- * assigned in the order each AI row was <em>discovered</em> for the group
- * (append-only, immutable once emitted).
+ * <h3>AI matching: always the latest, only on change</h3>
+ * A group is compared against the single <em>latest</em> AI payload only — never
+ * a backlog of unmatched history. Each run computes a signature of
+ * {@code (humanRec payload, latest AI payload)} (see {@link #dedupKey}) and
+ * compares it against the group's persisted {@code last_compared_signature}; a
+ * {@code MATCHED} pair is emitted only when that signature changed — i.e. when
+ * either side's content actually differs from what was last compared. This means
+ * a human update (a case merging in, a field being corrected) triggers a fresh
+ * comparison against the current AI payload even if that exact AI payload was
+ * already compared before. {@code comparison_version} is a simple counter
+ * (incremented each time a new comparison actually fires) carried on the
+ * {@code humanRec} record for {@link FlattenAndCompareFn} to write into
+ * {@code ai_iteration} — it's an observability counter, not a replay index.
+ * {@code matched_ai_keys}/{@code next_ai_iteration} are deprecated remnants of
+ * the old full-history-replay design and are no longer populated.
+ * {@code comparison_results} rows from a superseded comparison aren't deleted —
+ * see {@code MarkSupersededComparisonsFn}, which marks them
+ * {@code is_current = FALSE} so only the latest comparison per group is "live."
  *
  * <h3>Always-increasing AI created_at</h3>
  * A genuinely new AI payload for an image+segment (not a replay of one already
@@ -321,8 +333,8 @@ public class FilterAndPairFn
                 emitGroupPendingOrAgedOut(ctx, imageId, segment, canonicalCaseId,
                         str(r.get("key_id")), pType, str(r.get("payload")), cAt,
                         firstSeen, now, metaRetryCount(meta), daysWaited,
-                        meta != null ? str(meta.get("matched_ai_keys")) : null,
-                        metaNextIteration(meta), mergedCaseIds);
+                        meta != null ? str(meta.get("last_compared_signature")) : null,
+                        metaComparisonVersion(meta), mergedCaseIds);
             }
             return;
         }
@@ -337,35 +349,34 @@ public class FilterAndPairFn
         String        hCAt       = str(humanRec.get("created_at"));
 
         GenericRecord meta = groupPendingMeta.get(humanPType);
-        Set<String> matchedKeys = parseKeys(meta != null ? str(meta.get("matched_ai_keys")) : null);
-        long nextIteration = metaNextIteration(meta);
+        String persistedSignature = meta != null ? str(meta.get("last_compared_signature")) : null;
+        long comparisonVersion = metaComparisonVersion(meta);
         Instant firstSeen = meta != null ? parseInstant(str(meta.get("first_seen_at"))) : null;
         if (firstSeen == null) firstSeen = now;
         long daysWaited = ChronoUnit.DAYS.between(firstSeen, now);
 
-        List<GenericRecord> unmatched = new ArrayList<>();
-        for (GenericRecord ai : aiRows) {
-            if (!matchedKeys.contains(dedupKey(str(ai.get("payload"))))) unmatched.add(ai);
-        }
+        // Always compare against the single latest AI payload, never a backlog of unmatched
+        // ones — a comparison fires whenever EITHER side's content has changed since the last
+        // one: a new/updated human contribution (a case merging in, a field being corrected)
+        // or a genuinely new AI payload. See FilterAndPairFn class doc.
+        GenericRecord latestAi = aiRows.isEmpty() ? null : aiRows.get(aiRows.size() - 1);
+        String currentSignature = latestAi != null
+                ? dedupKey(str(humanRec.get("payload"))) + "|" + dedupKey(str(latestAi.get("payload")))
+                : null;
 
-        if (!unmatched.isEmpty()) {
-            long startIteration = nextIteration;
-            for (int i = 0; i < unmatched.size(); i++) {
-                long iteration = startIteration + i + 1;
-                ctx.output(MATCHED, KV.of(
-                        imageId + "::" + segment + "::" + iteration,
-                        KV.of(humanRec, unmatched.get(i))));
-                matchedKeys.add(dedupKey(str(unmatched.get(i).get("payload"))));
-            }
-            nextIteration += unmatched.size();
-            LOG.info("Matched imageId={} segment={} — {} new AI iteration(s), iterations {}-{}",
-                    imageId, segment, unmatched.size(), startIteration + 1, nextIteration);
+        if (latestAi != null && !Objects.equals(currentSignature, persistedSignature)) {
+            comparisonVersion += 1;
+            humanRec.put("comparison_version", comparisonVersion);
+            ctx.output(MATCHED, KV.of(imageId + "::" + segment, KV.of(humanRec, latestAi)));
+            LOG.info("Compared imageId={} segment={} — signature changed, comparison_version={}",
+                    imageId, segment, comparisonVersion);
         }
 
         emitGroupPendingOrAgedOut(ctx, imageId, segment, canonicalCaseId,
                 str(humanRec.get("key_id")), humanPType, str(humanRec.get("payload")), hCAt,
-                firstSeen, now, metaRetryCount(meta), daysWaited, joinKeys(matchedKeys),
-                nextIteration, mergedCaseIds);
+                firstSeen, now, metaRetryCount(meta), daysWaited,
+                currentSignature != null ? currentSignature : persistedSignature,
+                comparisonVersion, mergedCaseIds);
     }
 
     // ── Case bucketing (accumulation only) ─────────────────────────────────────
@@ -375,10 +386,16 @@ public class FilterAndPairFn
     }
 
     private static GenericRecord mergeGroupMeta(GenericRecord left, GenericRecord right) {
-        Set<String> matchedKeys = parseKeys(str(left.get("matched_ai_keys")));
-        matchedKeys.addAll(parseKeys(str(right.get("matched_ai_keys"))));
+        // matched_ai_keys/next_ai_iteration are deprecated (replay-based matching removed —
+        // see FilterAndPairFn class doc); left as-is (unpopulated going forward) rather than
+        // dropped, per this codebase's additive-only migration convention.
 
-        long nextIteration = Math.max(metaNextIteration(left), metaNextIteration(right));
+        // Two colliding persisted pending rows for the same group only happens as a
+        // migration-transition edge case (leftover per-case rows from before case_id became
+        // lineage) — prefer whichever side actually has a signature recorded.
+        String lastComparedSignature = str(left.get("last_compared_signature")) != null
+                ? str(left.get("last_compared_signature")) : str(right.get("last_compared_signature"));
+        long comparisonVersion = Math.max(metaComparisonVersion(left), metaComparisonVersion(right));
 
         String leftFirstSeen  = str(left.get("first_seen_at"));
         String rightFirstSeen = str(right.get("first_seen_at"));
@@ -397,8 +414,8 @@ public class FilterAndPairFn
         left.put("retry_count", Math.max(
                 parseLong(left.get("retry_count")),
                 parseLong(right.get("retry_count"))));
-        left.put("matched_ai_keys", joinKeys(matchedKeys));
-        left.put("next_ai_iteration", nextIteration);
+        left.put("last_compared_signature", lastComparedSignature);
+        left.put("comparison_version", comparisonVersion);
 
         Set<String> merged = parseKeys(str(left.get("merged_case_ids")));
         merged.addAll(parseKeys(str(right.get("merged_case_ids"))));
@@ -801,11 +818,11 @@ public class FilterAndPairFn
                                             String payload, String createdAt,
                                             Instant firstSeen, Instant now,
                                             long retryCount, long daysWaited,
-                                            String matchedAiKeys, long nextIteration,
+                                            String lastComparedSignature, long comparisonVersion,
                                             String mergedCaseIds) {
         GenericRecord row = newCasePendingRow(imageId, segment, canonicalCaseId, keyId, pendingType,
-                payload, createdAt, firstSeen, now, retryCount, matchedAiKeys, nextIteration,
-                mergedCaseIds);
+                payload, createdAt, firstSeen, now, retryCount, lastComparedSignature,
+                comparisonVersion, mergedCaseIds);
         if (daysWaited >= MAX_WAIT_DAYS) {
             ctx.output(CASE_AGED_OUT, row);
         } else {
@@ -825,8 +842,8 @@ public class FilterAndPairFn
         return count != null ? ((Number) count).longValue() + 1 : 0L;
     }
 
-    private static long metaNextIteration(GenericRecord meta) {
-        return meta != null ? parseLong(meta.get("next_ai_iteration")) : 0L;
+    private static long metaComparisonVersion(GenericRecord meta) {
+        return meta != null ? parseLong(meta.get("comparison_version")) : 0L;
     }
 
     // ── Record construction ──────────────────────────────────────────────────
@@ -861,8 +878,8 @@ public class FilterAndPairFn
     private GenericRecord newCasePendingRow(String imageId, String segment, String caseKey,
                                              String keyId, String pendingType, String payload,
                                              String createdAt, Instant firstSeen, Instant now,
-                                             long retryCount, String matchedAiKeys,
-                                             long nextIteration, String mergedCaseIds) {
+                                             long retryCount, String lastComparedSignature,
+                                             long comparisonVersion, String mergedCaseIds) {
         GenericRecord r = new GenericData.Record(pendingSchema);
         r.put("image_id",          imageId);
         r.put("key_id",            keyId);
@@ -874,8 +891,13 @@ public class FilterAndPairFn
         r.put("first_seen_at",     TimestampUtil.formatInstant(firstSeen));
         r.put("last_retried_at",   TimestampUtil.formatInstant(now));
         r.put("retry_count",       retryCount);
-        r.put("matched_ai_keys",   matchedAiKeys);
-        r.put("next_ai_iteration", nextIteration);
+        // matched_ai_keys/next_ai_iteration are deprecated (replay-based matching removed, see
+        // class doc) — still written since next_ai_iteration is a non-nullable Avro/BQ field,
+        // but always these fixed values going forward rather than anything meaningful.
+        r.put("matched_ai_keys",   (String) null);
+        r.put("next_ai_iteration", 0L);
+        r.put("last_compared_signature", lastComparedSignature);
+        r.put("comparison_version",      comparisonVersion);
         r.put("merged_case_ids",   mergedCaseIds);
         return r;
     }
@@ -905,8 +927,8 @@ public class FilterAndPairFn
         r.put("first_seen_at",   TimestampUtil.normalizeTimestamp(str(row.get("first_seen_at"))));
         r.put("last_retried_at", TimestampUtil.normalizeTimestamp(str(row.get("last_retried_at"))));
         r.put("retry_count",        parseLong(row.get("retry_count")));
-        r.put("matched_ai_keys",    row.get("matched_ai_keys"));
-        r.put("next_ai_iteration",  parseLong(row.get("next_ai_iteration")));
+        r.put("last_compared_signature", row.get("last_compared_signature"));
+        r.put("comparison_version",      parseLong(row.get("comparison_version")));
         r.put("merged_case_ids",    row.get("merged_case_ids"));
         return r;
     }

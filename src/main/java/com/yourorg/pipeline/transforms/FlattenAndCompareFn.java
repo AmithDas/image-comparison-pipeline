@@ -36,13 +36,19 @@ import java.util.stream.Stream;
  * per field value, including a {@code segment} column for downstream filtering.
  *
  * <h3>Pair key format</h3>
- * {@code "imageId::segment::iteration"} — set by {@link FilterAndPairFn}. There is
- * one comparison stream per {@code imageId::segment} group; {@code case_id} is no
- * longer part of the key since human payloads for every case sharing an
+ * {@code "imageId::segment"} — set by {@link FilterAndPairFn}. There is at most one
+ * comparison per {@code imageId::segment} group per run — always against the
+ * group's single latest AI payload, only when the human-or-AI content actually
+ * changed since the last comparison (no more per-iteration replay). {@code case_id}
+ * is not part of the key since human payloads for every case sharing an
  * image+segment are merged into one consolidated record before comparison (see
  * {@link FilterAndPairFn#mergeAcrossCases}). The {@code case_id} written to each
  * output row is instead resolved per field from provenance metadata embedded in
- * the merged payload JSON — see {@link #resolveCaseId}.
+ * the merged payload JSON — see {@link #resolveCaseId}. {@code ai_iteration} in
+ * each output row is a comparison-version counter (see
+ * {@code human.get("comparison_version")}), not a replay index — a superseded
+ * comparison's rows aren't deleted, they're marked {@code is_current = FALSE} by
+ * {@code MarkSupersededComparisonsFn} before this class's rows are written.
  *
  * <h3>Array comparison</h3>
  * <ul>
@@ -167,28 +173,27 @@ public class FlattenAndCompareFn
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
-        // Pair key format: "imageId::segment::iteration" — one comparison stream per group,
-        // case_id is resolved per row below instead of carried in the key.
+        // Pair key format: "imageId::segment" — one comparison per group per run (always
+        // against the latest AI payload, only when the signature changed — see
+        // FilterAndPairFn). The comparison-version counter rides on the human record instead
+        // (see FilterAndPairFn.stampCaseIdByField-adjacent humanRec.put("comparison_version", ...)).
         String pairKey = ctx.element().getKey();
-        String[] parts = pairKey.split("::", 3);
+        String[] parts = pairKey.split("::", 2);
 
-        if (parts.length != 3) {
+        if (parts.length != 2) {
             LOG.warn("Unexpected pairKey format: '{}' — skipping", pairKey);
             return;
         }
 
         String imageId = parts[0];
         String segment = parts[1];
-        int    iteration;
-        try {
-            iteration = Integer.parseInt(parts[2]);
-        } catch (NumberFormatException e) {
-            LOG.warn("Could not parse iteration from pairKey '{}' — skipping", pairKey);
-            return;
-        }
 
         GenericRecord human = ctx.element().getValue().getKey();
         GenericRecord ai    = ctx.element().getValue().getValue();
+
+        Object comparisonVersionObj = human.get("comparison_version");
+        int iteration = comparisonVersionObj != null
+                ? ((Number) comparisonVersionObj).intValue() : 1;
 
         String humanKeyId = str(human.get("key_id"));
         String aiKeyId    = str(ai.get("key_id"));
@@ -658,7 +663,8 @@ public class FlattenAndCompareFn
                 .set("human_value",      encryptedHumanVal)
                 .set("ai_value",         encryptedAiVal)
                 .set("is_match",         isMatch)
-                .set("load_time",        loadTime));
+                .set("load_time",        loadTime)
+                .set("is_current",       true));
     }
 
     private static Map<String, List<String>> groupByKey(List<FieldValue> entries) {

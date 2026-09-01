@@ -15,6 +15,8 @@
     {"name": "retry_count",         "type": "long",             "default": 0},
     {"name": "matched_ai_keys",     "type": ["null", "string"], "default": null},
     {"name": "next_ai_iteration",   "type": "long",             "default": 0},
-    {"name": "merged_case_ids",     "type": ["null", "string"], "default": null}
+    {"name": "merged_case_ids",     "type": ["null", "string"], "default": null},
+    {"name": "last_compared_signature", "type": ["null", "string"], "default": null},
+    {"name": "comparison_version",      "type": "long",              "default": 0}
   ]
 }
