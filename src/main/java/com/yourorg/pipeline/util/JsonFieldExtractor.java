@@ -349,8 +349,13 @@ public final class JsonFieldExtractor {
      * the key always has a defined, consistent value on both sides.
      * Each component value has all whitespace stripped, and the final key is
      * lower-cased, so keys match regardless of spacing or case.
+     *
+     * <p>Public so {@code FilterAndPairFn}'s cross-case array merge (a different package)
+     * can dedupe concatenated items by the same composite identity used here for comparison
+     * matching (see {@code FlattenAndCompareFn.ARRAY_MATCH_KEYS}), instead of a second
+     * key-parsing implementation.
      */
-    private static String extractKeyValue(JsonElement el, String keySpec, String arrayPath) {
+    public static String extractKeyValue(JsonElement el, String keySpec, String arrayPath) {
         String[] components = keySpec.split("-");
         StringBuilder composedKey = new StringBuilder();
 

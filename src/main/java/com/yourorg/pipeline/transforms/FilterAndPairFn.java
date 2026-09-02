@@ -7,6 +7,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.yourorg.pipeline.config.SegmentConfig;
 import com.yourorg.pipeline.util.BarricadeEncryptionUtil;
+import com.yourorg.pipeline.util.JsonFieldExtractor;
 import com.yourorg.pipeline.util.PayloadParser;
 import com.yourorg.pipeline.util.TimestampUtil;
 import org.apache.avro.Schema;
@@ -80,9 +81,9 @@ import java.util.TreeSet;
  * {@code ai_iteration} — it's an observability counter, not a replay index.
  * {@code matched_ai_keys}/{@code next_ai_iteration} are deprecated remnants of
  * the old full-history-replay design and are no longer populated.
- * {@code comparison_results} rows from a superseded comparison aren't deleted —
- * see {@code MarkSupersededComparisonsFn}, which marks them
- * {@code is_current = FALSE} so only the latest comparison per group is "live."
+ * {@code comparison_results} stays plain append-only — a superseded comparison's
+ * rows are neither deleted nor hidden; the table can hold more than one
+ * comparison per group over its history.
  *
  * <h3>Always-increasing AI created_at</h3>
  * A genuinely new AI payload for an image+segment (not a replay of one already
@@ -650,13 +651,18 @@ public class FilterAndPairFn
                 if (mergeArrayFields.contains(path) && ev.isJsonArray() && iv.isJsonArray()) {
                     String existingArrayCase = attributionOf(existingByField, key);
                     String incomingArrayCase = attributionOf(incomingByField, key);
-                    JsonArray combined = new JsonArray();
-                    for (JsonElement el : ev.getAsJsonArray()) {
-                        combined.add(stampSourceCaseId(el, existingArrayCase));
-                    }
-                    for (JsonElement el : iv.getAsJsonArray()) {
-                        combined.add(stampSourceCaseId(el, incomingArrayCase));
-                    }
+                    // Pair items by the same composite key FlattenAndCompareFn uses for
+                    // comparison (ARRAY_MATCH_KEYS): a key present on only one side is kept
+                    // as-is; a key on both sides with identical content is deduped to one copy;
+                    // a key on both sides with DIFFERENT content is a genuine item-level
+                    // collision, resolved by the same latest-created_at-wins rule as a scalar
+                    // collision (WARN logged) — not silently dropped. Falls back to plain
+                    // concatenation (no pairing at all) for an array path with no configured
+                    // match key.
+                    String keySpec = FlattenAndCompareFn.ARRAY_MATCH_KEYS.get(path);
+                    JsonArray combined = mergeArrayItems(ev.getAsJsonArray(), existingArrayCase,
+                            iv.getAsJsonArray(), incomingArrayCase, keySpec, path,
+                            existingWinsTies, imageId, segment);
                     merged.add(key, combined);
                     // Array-level attribution lives per-item (_sourceCaseId), not here.
 
@@ -720,6 +726,78 @@ public class FilterAndPairFn
             obj.addProperty(SOURCE_CASE_ID_KEY, caseId);
         }
         return obj;
+    }
+
+    /**
+     * Merges two arrays for a {@code mergeArrayFields} field, pairing items by the same
+     * {@code ARRAY_MATCH_KEYS} composite key {@link FlattenAndCompareFn} uses for comparison.
+     * <ul>
+     *   <li>An item whose key appears on only one side is kept as-is.</li>
+     *   <li>Both sides have an item with the same key, identical content — deduped to one
+     *       copy, attributed to the latest side (no warning; nothing was actually lost).</li>
+     *   <li>Both sides have an item with the same key, <em>different</em> content — a genuine
+     *       item-level collision, not silently dropped: resolved by the same
+     *       latest-{@code created_at}-wins rule a scalar collision uses, WARN logged.</li>
+     * </ul>
+     * When {@code keySpec} is {@code null} (no configured match key for this array path) or an
+     * item's key can't be computed, no pairing is attempted for it — falls back to plain
+     * concatenation, same as before composite keys existed.
+     */
+    private static JsonArray mergeArrayItems(JsonArray existingArr, String existingArrayCase,
+                                              JsonArray incomingArr, String incomingArrayCase,
+                                              String keySpec, String arrayPath,
+                                              boolean existingWinsTies,
+                                              String imageId, String segment) {
+        JsonArray combined = new JsonArray();
+
+        if (keySpec == null) {
+            for (JsonElement el : existingArr) combined.add(stampSourceCaseId(el, existingArrayCase));
+            for (JsonElement el : incomingArr) combined.add(stampSourceCaseId(el, incomingArrayCase));
+            return combined;
+        }
+
+        Map<String, JsonElement> existingByKey = new LinkedHashMap<>();
+        for (JsonElement el : existingArr) {
+            String itemKey = JsonFieldExtractor.extractKeyValue(el, keySpec, arrayPath);
+            if (itemKey != null) existingByKey.put(itemKey, el);
+            else combined.add(stampSourceCaseId(el, existingArrayCase)); // unkeyable — no pairing possible
+        }
+        Map<String, JsonElement> incomingByKey = new LinkedHashMap<>();
+        for (JsonElement el : incomingArr) {
+            String itemKey = JsonFieldExtractor.extractKeyValue(el, keySpec, arrayPath);
+            if (itemKey != null) incomingByKey.put(itemKey, el);
+            else combined.add(stampSourceCaseId(el, incomingArrayCase));
+        }
+
+        Set<String> allItemKeys = new LinkedHashSet<>();
+        allItemKeys.addAll(existingByKey.keySet());
+        allItemKeys.addAll(incomingByKey.keySet());
+
+        for (String itemKey : allItemKeys) {
+            JsonElement e1 = existingByKey.get(itemKey);
+            JsonElement e2 = incomingByKey.get(itemKey);
+
+            if (e1 != null && e2 == null) {
+                combined.add(stampSourceCaseId(e1, existingArrayCase));
+
+            } else if (e1 == null) {
+                combined.add(stampSourceCaseId(e2, incomingArrayCase));
+
+            } else if (e1.equals(e2)) {
+                boolean keepExisting = existingWinsTies;
+                combined.add(stampSourceCaseId(keepExisting ? e1 : e2,
+                        keepExisting ? existingArrayCase : incomingArrayCase));
+
+            } else {
+                boolean keepExisting = existingWinsTies;
+                combined.add(stampSourceCaseId(keepExisting ? e1 : e2,
+                        keepExisting ? existingArrayCase : incomingArrayCase));
+                LOG.warn("imageId={} segment={} field={} itemKey={} — cross-case array item "
+                                + "collision, keeping {} item", imageId, segment, arrayPath, itemKey,
+                        keepExisting ? "later" : "earlier");
+            }
+        }
+        return combined;
     }
 
     private JsonObject decryptToJson(String keyId, String payload, SegmentConfig seg) {

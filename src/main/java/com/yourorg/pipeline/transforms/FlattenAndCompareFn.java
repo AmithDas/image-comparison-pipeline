@@ -47,8 +47,9 @@ import java.util.stream.Stream;
  * the merged payload JSON — see {@link #resolveCaseId}. {@code ai_iteration} in
  * each output row is a comparison-version counter (see
  * {@code human.get("comparison_version")}), not a replay index — a superseded
- * comparison's rows aren't deleted, they're marked {@code is_current = FALSE} by
- * {@code MarkSupersededComparisonsFn} before this class's rows are written.
+ * comparison's rows are left in place, not deleted or hidden;
+ * {@code comparison_results} is plain append-only and can hold more than one
+ * comparison per group over time.
  *
  * <h3>Array comparison</h3>
  * <ul>
@@ -76,16 +77,59 @@ public class FlattenAndCompareFn
     // ── Array match keys ──────────────────────────────────────────────────────
 
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.ofEntries(
-            Map.entry("documentDetails",                          "docType"),
-            Map.entry("docProofs",                                "document"),
-            Map.entry("tradelines",                               "accountnumber-customernumber-dateopened"),
-            Map.entry("tradelines.tradelineRequest.disputeCodes", "code"),
-            Map.entry("credit",                                   "customerNumber"),
-            Map.entry("credit.dob.disputeCodes",                  "code"),
-            Map.entry("credit.ssn.disputeCodes",                  "code"),
-            Map.entry("nonReported",                              "date-member"),
-            Map.entry("nonReported.disputeCodes",                 "code")
-            // Map.entry("address",                               "addresstype")
+            Map.entry("tradelines",                                                   "accountNumber-customerNumber-dateOpened"),
+            Map.entry("tradelines.tradelineRequested.disputeCodes",                    "code"),
+            Map.entry("addresses",                                                     "streetNumber-postalCode"),
+            Map.entry("addresses.addressRequested.disputeCodes",                       "code"),
+            Map.entry("collections",                                                   "accountNumber-customerNumber-dateAssigned"),
+            Map.entry("collections.collectionRequested.disputeCodes",                  "code"),
+            Map.entry("bankruptcies",                                                  "caseNumber-courtCustomerOrder-dateFiled"),
+            Map.entry("bankruptcies.bankruptcyRequested.disputeCodes",                 "code"),
+            Map.entry("creditReportHeader",                                            "customerNumber"),
+            Map.entry("creditReportHeader.dateOfBirthRequested.disputeCodes",          "code"),
+            Map.entry("creditReportHeader.currentNameRequested.disputeCodes",          "code"),
+            Map.entry("creditReportHeader.socialSecurityNumberRequested.disputeCodes", "code"),
+            Map.entry("fileInquiries",                                                 "customerNumber-dateOfInquiry-endUserDescriptionOrAcisCaseNumber"),
+            Map.entry("fileInquiries.fileInquiryRequested.disputeCodes",               "code"),
+            Map.entry("employments",                                                   "employmentType-employer-occupation"),
+            Map.entry("employments.employmentRequested.disputeCodes",                  "code"),
+            Map.entry("alsoKnownAs",                                                   "firstName-lastName-middleName"),
+            Map.entry("alsoKnownAs.alsoKnownAsRequested.disputeCodes",                 "code"),
+            Map.entry("otherNames",                                                    "firstName-lastName-middleName"),
+            Map.entry("otherNames.otherNameRequested.disputeCodes",                    "code"),
+            Map.entry("otherIdentifications",                                          "typeCode-identificationNumber"),
+            Map.entry("otherIdentifications.otherIdentificationRequested.disputeCodes","code"),
+            Map.entry("nonreportedAddresses",                                          "streetNumber-zipCode"),
+            Map.entry("nonreportedAddresses.disputeCodes",                             "code"),
+            Map.entry("nonreportedAddresses.consumerCommunications",                   "code"),
+            Map.entry("nonreportedDatesOfBirth",                                       "nonreportedDateOfBirth"),
+            Map.entry("nonreportedDatesOfBirth.disputeCodes",                          "code"),
+            Map.entry("nonreportedDatesOfBirth.consumerCommunications",                "code"),
+            Map.entry("nonreportedEmployments",                                        "employer-occupation"),
+            Map.entry("nonreportedEmployments.disputeCodes",                           "code"),
+            Map.entry("nonreportedEmployments.consumerCommunications",                 "code"),
+            Map.entry("nonreportedInquiries",                                          "date-memberName"),
+            Map.entry("nonreportedInquiries.disputeCodes",                             "code"),
+            Map.entry("nonreportedInquiries.consumerCommunications",                   "code"),
+            Map.entry("nonreportedNames",                                              "firstName-lastName-middleName"),
+            Map.entry("nonreportedNames.disputeCodes",                                 "code"),
+            Map.entry("nonreportedNames.consumerCommunications",                       "code"),
+            Map.entry("nonreportedPublicRecords",                                      "filedDate-caseNumber"),
+            Map.entry("nonreportedPublicRecords.disputeCodes",                         "code"),
+            Map.entry("nonreportedPublicRecords.consumerCommunications",               "code"),
+            Map.entry("nonreportedSsns",                                               "nonreportedSsn"),
+            Map.entry("nonreportedSsns.disputeCodes",                                  "code"),
+            Map.entry("nonreportedSsns.consumerCommunications",                        "code"),
+            Map.entry("nonreportedPhoneNumbers",                                       "nonreportedPhoneNumber"),
+            Map.entry("nonreportedPhoneNumbers.disputeCodes",                          "code"),
+            Map.entry("nonreportedPhoneNumbers.consumerCommunications",                "code"),
+            Map.entry("nonreportedTrades",                                             "accountNumber-customerName-openedDate"),
+            Map.entry("nonreportedTrades.disputeCodes",                                "code"),
+            Map.entry("nonreportedTrades.consumerCommunications",                      "code"),
+            Map.entry("nonreportedCollections",                                        "clientName-accountNumber"),
+            Map.entry("nonreportedCollections.disputeCodes",                           "code"),
+            Map.entry("nonreportedCollections.consumerCommunications",                 "code"),
+            Map.entry("documentProofs",                                                "authenticationType-document")
     );
 
     // ── Soft-match arrays ─────────────────────────────────────────────────────
@@ -105,11 +149,29 @@ public class FlattenAndCompareFn
     //   human orphan: acc-cust-date-null-007
     //
     // Each key must also appear in ARRAY_MATCH_KEYS.
-    static final Map<String, String> SOFT_MATCH_ARRAYS = Map.of(
-            "tradelines.tradelineRequest.disputeCodes", "tradelines",
-            "credit.dob.disputeCodes",                  "credit",
-            "credit.ssn.disputeCodes",                  "credit",
-            "nonReported.disputeCodes",                 "nonReported"
+    static final Map<String, String> SOFT_MATCH_ARRAYS = Map.ofEntries(
+            Map.entry("tradelines.tradelineRequested.disputeCodes",                    "tradelines"),
+            Map.entry("collections.collectionRequested.disputeCodes",                  "collections"),
+            Map.entry("addresses.addressRequested.disputeCodes",                       "addresses"),
+            Map.entry("bankruptcies.bankruptcyRequested.disputeCodes",                 "bankruptcies"),
+            Map.entry("creditReportHeader.dateOfBirthRequested.disputeCodes",          "creditReportHeader"),
+            Map.entry("creditReportHeader.currentNameRequested.disputeCodes",          "creditReportHeader"),
+            Map.entry("creditReportHeader.socialSecurityNumberRequested.disputeCodes", "creditReportHeader"),
+            Map.entry("fileInquiries.fileInquiryRequested.disputeCodes",               "fileInquiries"),
+            Map.entry("employments.employmentRequested.disputeCodes",                  "employments"),
+            Map.entry("alsoKnownAs.alsoKnownAsRequested.disputeCodes",                 "alsoKnownAs"),
+            Map.entry("otherNames.otherNameRequested.disputeCodes",                    "otherNames"),
+            Map.entry("otherIdentifications.otherIdentificationRequested.disputeCodes","otherIdentifications"),
+            Map.entry("nonreportedAddresses.disputeCodes",                             "nonreportedAddresses"),
+            Map.entry("nonreportedDatesOfBirth.disputeCodes",                          "nonreportedDatesOfBirth"),
+            Map.entry("nonreportedEmployments.disputeCodes",                           "nonreportedEmployments"),
+            Map.entry("nonreportedInquiries.disputeCodes",                             "nonreportedInquiries"),
+            Map.entry("nonreportedNames.disputeCodes",                                 "nonreportedNames"),
+            Map.entry("nonreportedPublicRecords.disputeCodes",                         "nonreportedPublicRecords"),
+            Map.entry("nonreportedSsns.disputeCodes",                                  "nonreportedSsns"),
+            Map.entry("nonreportedPhoneNumbers.disputeCodes",                          "nonreportedPhoneNumbers"),
+            Map.entry("nonreportedTrades.disputeCodes",                                "nonreportedTrades"),
+            Map.entry("nonreportedCollections.disputeCodes",                           "nonreportedCollections")
     );
 
     // ── Constructor ───────────────────────────────────────────────────────────
@@ -663,8 +725,7 @@ public class FlattenAndCompareFn
                 .set("human_value",      encryptedHumanVal)
                 .set("ai_value",         encryptedAiVal)
                 .set("is_match",         isMatch)
-                .set("load_time",        loadTime)
-                .set("is_current",       true));
+                .set("load_time",        loadTime));
     }
 
     private static Map<String, List<String>> groupByKey(List<FieldValue> entries) {

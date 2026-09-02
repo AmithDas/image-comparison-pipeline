@@ -80,15 +80,12 @@ CREATE TABLE IF NOT EXISTS `your_project.your_dataset.comparison_results` (
   human_value       STRING,               -- Barricade-encrypted; null if field absent in human payload
   ai_value          STRING,               -- Barricade-encrypted; null if field absent in AI payload
   is_match          BOOL      NOT NULL,   -- compared on plaintext before encryption
-  load_time         TIMESTAMP NOT NULL,
-  is_current        BOOL      NOT NULL    -- TRUE for the live/current comparison for this
-                                           -- image+segment group; FALSE once a later comparison
-                                           -- has superseded it (see MarkSupersededComparisonsFn,
-                                           -- which sets existing rows to FALSE right before this
-                                           -- run's TRUE rows are written — never physically
-                                           -- deleted, so full history stays recoverable). Most
-                                           -- consumers should query comparison_results_current_view
-                                           -- (migration 006) instead of filtering this directly.
+  load_time         TIMESTAMP NOT NULL    -- append-only: a new comparison for a group (see
+                                           -- ai_iteration/comparison_version above) is inserted
+                                           -- alongside any prior ones for the same image+segment,
+                                           -- not deduplicated or hidden — expect duplicates across
+                                           -- comparison_version for a group with more than one
+                                           -- comparison in its history.
 )
 PARTITION BY DATE(load_time)
 CLUSTER BY image_id, field_name

@@ -105,6 +105,54 @@ public class FilterAndPairFnMergeTest {
                 merged.has("_caseIdByField") && merged.getAsJsonObject("_caseIdByField").has("documentProofs"));
     }
 
+    /**
+     * Two items sharing the same composite key (ARRAY_MATCH_KEYS: "authenticationType-document"
+     * for documentProofs) but with genuinely different content is a real item-level collision —
+     * resolved by latest created_at, not silently dropped in favor of whichever was added first.
+     */
+    @Test
+    public void sameCompositeKeyDifferentContentResolvesByLatestNotFirstAdded() {
+        JsonObject existing = stamped(
+                "{\"documentProofs\":[{\"authenticationType\":\"Authentication\",\"document\":\"passport\","
+                        + "\"disputeCode\":\"013\"}]}", "CASE-1");
+        JsonObject incoming = stamped(
+                "{\"documentProofs\":[{\"authenticationType\":\"Authentication\",\"document\":\"passport\","
+                        + "\"disputeCode\":\"001\"}]}", "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of("documentProofs"), "", "img", "main");
+
+        var proofs = merged.getAsJsonArray("documentProofs");
+        assertEquals("Same key, different content collapses to ONE item, not two", 1, proofs.size());
+        assertEquals("Later case's item wins, not whichever was added first", "001",
+                proofs.get(0).getAsJsonObject().get("disputeCode").getAsString());
+        assertEquals("CASE-2", proofs.get(0).getAsJsonObject().get("_sourceCaseId").getAsString());
+    }
+
+    /** Two items sharing the same composite key with IDENTICAL content dedupe with no data loss. */
+    @Test
+    public void sameCompositeKeyIdenticalContentDedupesToOneCopy() {
+        JsonObject existing = stamped(
+                "{\"documentProofs\":[{\"authenticationType\":\"Authentication\",\"document\":\"passport\","
+                        + "\"disputeCode\":\"013\"}]}", "CASE-1");
+        JsonObject incoming = stamped(
+                "{\"documentProofs\":[{\"authenticationType\":\"Authentication\",\"document\":\"passport\","
+                        + "\"disputeCode\":\"013\"}]}", "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of("documentProofs"), "", "img", "main");
+
+        var proofs = merged.getAsJsonArray("documentProofs");
+        assertEquals(1, proofs.size());
+        assertEquals("013", proofs.get(0).getAsJsonObject().get("disputeCode").getAsString());
+        assertEquals("Identical content still attributes to the latest case", "CASE-2",
+                proofs.get(0).getAsJsonObject().get("_sourceCaseId").getAsString());
+    }
+
     /** A scalar collision is resolved by latest created_at, with provenance recorded. */
     @Test
     public void scalarCollisionKeepsLatestAndRecordsProvenance() {

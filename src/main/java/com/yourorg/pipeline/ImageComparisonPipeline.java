@@ -6,7 +6,6 @@ import com.google.cloud.bigquery.BigQueryOptions;
 import com.yourorg.pipeline.transforms.DecryptAndKeyFn;
 import com.yourorg.pipeline.transforms.FilterAndPairFn;
 import com.yourorg.pipeline.transforms.FlattenAndCompareFn;
-import com.yourorg.pipeline.transforms.MarkSupersededComparisonsFn;
 import com.yourorg.pipeline.util.SchemaRegistry;
 import com.yourorg.pipeline.util.SchemaUtil;
 import com.yourorg.pipeline.util.TimestampUtil;
@@ -365,17 +364,12 @@ public class ImageComparisonPipeline {
         PCollection<GenericRecord> aiAgedOut =
                 routed.get(FilterAndPairFn.AI_AGED_OUT).setCoder(aiPendingCoder);
 
-        // ── Mark the previous comparison for each group non-current before writing
-        //    its replacement — see MarkSupersededComparisonsFn for why this must run
-        //    here, directly ahead of FlattenAndCompare in the same branch.
-        PCollection<KV<String, KV<GenericRecord, GenericRecord>>> matchedAfterSupersedeMark =
-                matched.apply("MarkSupersededComparisons",
-                                ParDo.of(new MarkSupersededComparisonsFn(options.getOutputTable())))
-                       .setCoder(KvCoder.of(StringUtf8Coder.of(),
-                               KvCoder.of(payloadCoder, payloadCoder)));
-
         // ── Flatten & compare matched pairs ───────────────────────────────────
-        PCollection<TableRow> comparisonResults = matchedAfterSupersedeMark
+        // comparison_results stays plain append-only — a new comparison for a group
+        // (triggered whenever its signature changes, see FilterAndPairFn) is simply
+        // inserted alongside any prior ones; duplicates across comparison_version are
+        // expected and left in the table, not marked/hidden.
+        PCollection<TableRow> comparisonResults = matched
                 .apply("FlattenAndCompare",
                         ParDo.of(new FlattenAndCompareFn(
                                 options.getFirestoreCollection(),

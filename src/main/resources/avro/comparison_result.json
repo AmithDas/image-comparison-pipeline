@@ -16,7 +16,6 @@
     {"name": "human_value",      "type": ["null", "string"], "default": null},
     {"name": "ai_value",         "type": ["null", "string"], "default": null},
     {"name": "is_match",         "type": "boolean"},
-    {"name": "load_time",        "type": "string",                             "bqType": "TIMESTAMP"},
-    {"name": "is_current",       "type": "boolean"}
+    {"name": "load_time",        "type": "string",                             "bqType": "TIMESTAMP"}
   ]
 }
