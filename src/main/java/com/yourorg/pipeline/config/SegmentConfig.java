@@ -102,6 +102,22 @@ public class SegmentConfig implements Serializable {
      */
     public Map<String, List<String>> atomicObjectFields;
 
+    /**
+     * For a {@code mergeArrayFields} array path, the name of a field whose presence marks an
+     * item as "disputed" and should win a same-key item-level collision outright — regardless
+     * of which case is latest. Example: {@code addresses} items are keyed by {@code addressType}
+     * ({@code Current}, {@code Former1}, ...); a non-disputed submission of a slot has no
+     * {@code addressRequested} field, while a disputed one does. When two cases' versions of the
+     * same slot differ, the version WITH {@code addressRequested} wins over the version without
+     * it, even if the non-disputed one is the more recent submission — a case actively disputing
+     * an address should not be silently overwritten by another case that merely re-submitted
+     * that slot unchanged. Falls back to the normal latest-{@code created_at}-wins rule when
+     * both sides have the priority field, both lack it, or no priority field is configured for
+     * that array path at all.
+     * Example: {@code {"addresses": "addressRequested"}}.
+     */
+    public Map<String, String> arrayItemPriorityField;
+
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
         this(null, null, null, null, null);

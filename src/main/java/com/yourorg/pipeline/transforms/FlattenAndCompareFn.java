@@ -75,11 +75,18 @@ public class FlattenAndCompareFn
     private static final Logger LOG = LoggerFactory.getLogger(FlattenAndCompareFn.class);
 
     // ── Array match keys ──────────────────────────────────────────────────────
+    // "addresses" is keyed by addressType (Current, Former1, Former2, ...), not by content
+    // (e.g. streetNumber-postalCode) — every case submits the same fixed set of address
+    // slots, and a disputed slot's street/postal can itself be the thing under correction, so
+    // content can't reliably identify "the same slot" across cases. See also
+    // FilterAndPairFn.mergeArrayItems / SegmentConfig.arrayItemPriorityField, which uses this
+    // same key for the cross-case merge and gives a disputed slot (addressRequested present)
+    // priority over an undisputed resubmission of the same slot.
 
     static final Map<String, String> ARRAY_MATCH_KEYS = Map.ofEntries(
             Map.entry("tradelines",                                                   "accountNumber-customerNumber-dateOpened"),
             Map.entry("tradelines.tradelineRequested.disputeCodes",                    "code"),
-            Map.entry("addresses",                                                     "streetNumber-postalCode"),
+            Map.entry("addresses",                                                     "addressType"),
             Map.entry("addresses.addressRequested.disputeCodes",                       "code"),
             Map.entry("collections",                                                   "accountNumber-customerNumber-dateAssigned"),
             Map.entry("collections.collectionRequested.disputeCodes",                  "code"),

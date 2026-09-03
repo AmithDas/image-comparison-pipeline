@@ -64,6 +64,10 @@
             "currentNameRequested",
             "socialSecurityNumberRequested"
           ]
+        },
+        "_comment_priority": "addresses items are keyed by addressType (see ARRAY_MATCH_KEYS in FlattenAndCompareFn, changed from a content-based key since a disputed address's street/postal can itself be the thing being corrected). When two cases' versions of the same address slot differ, the version carrying addressRequested (i.e. actively disputed) wins outright, even over a more recent but undisputed resubmission of that same slot.",
+        "arrayItemPriorityField": {
+          "addresses": "addressRequested"
         }
       },
       {

@@ -594,10 +594,12 @@ public class FilterAndPairFn
                 atomicObjectFields.put(e.getKey(), new HashSet<>(e.getValue()));
             }
         }
+        Map<String, String> arrayItemPriorityField = (seg != null && seg.arrayItemPriorityField != null)
+                ? seg.arrayItemPriorityField : Collections.emptyMap();
 
         JsonObject merged = mergeJsonObjects(existingJson, existingCreatedAt,
                 incomingJson, incomingCreatedAt, mergeArrayFields, atomicObjectFields,
-                "", imageId, segment);
+                arrayItemPriorityField, "", imageId, segment);
 
         String reEncrypted = BarricadeEncryptionUtil.encrypt(keyId, merged.toString());
         String earliestCreatedAt = minCreatedAt(existingCreatedAt, incomingCreatedAt);
@@ -648,6 +650,7 @@ public class FilterAndPairFn
                                         JsonObject incomingJson, String incomingCreatedAt,
                                         Set<String> mergeArrayFields,
                                         Map<String, Set<String>> atomicObjectFields,
+                                        Map<String, String> arrayItemPriorityField,
                                         String pathPrefix,
                                         String imageId, String segment) {
         existingJson = existingJson.deepCopy();
@@ -705,8 +708,9 @@ public class FilterAndPairFn
                     // concatenation (no pairing at all) for an array path with no configured
                     // match key.
                     String keySpec = FlattenAndCompareFn.ARRAY_MATCH_KEYS.get(path);
+                    String priorityField = arrayItemPriorityField.get(path);
                     JsonArray combined = mergeArrayItems(ev.getAsJsonArray(), existingArrayCase,
-                            iv.getAsJsonArray(), incomingArrayCase, keySpec, path,
+                            iv.getAsJsonArray(), incomingArrayCase, keySpec, priorityField, path,
                             existingWinsTies, imageId, segment);
                     merged.add(key, combined);
                     // Array-level attribution lives per-item (_sourceCaseId), not here.
@@ -730,7 +734,8 @@ public class FilterAndPairFn
                     JsonObject nestedMerged = mergeJsonObjects(
                             ev.getAsJsonObject(), existingCreatedAt,
                             iv.getAsJsonObject(), incomingCreatedAt,
-                            mergeArrayFields, atomicObjectFields, path, imageId, segment);
+                            mergeArrayFields, atomicObjectFields, arrayItemPriorityField,
+                            path, imageId, segment);
                     merged.add(key, nestedMerged);
                     // Attribution now lives inside the nested object's own _caseIdByField.
 
@@ -845,8 +850,14 @@ public class FilterAndPairFn
      *   <li>Both sides have an item with the same key, identical content — deduped to one
      *       copy, attributed to the latest side (no warning; nothing was actually lost).</li>
      *   <li>Both sides have an item with the same key, <em>different</em> content — a genuine
-     *       item-level collision, not silently dropped: resolved by the same
-     *       latest-{@code created_at}-wins rule a scalar collision uses, WARN logged.</li>
+     *       item-level collision. If {@code priorityField} is configured for this array path
+     *       (see {@code SegmentConfig.arrayItemPriorityField}) and exactly one side's item has
+     *       that field present, that side wins outright, regardless of which case is latest —
+     *       e.g. an {@code addresses} slot actively under dispute ({@code addressRequested}
+     *       present) must not be silently overwritten by another case's unchanged resubmission
+     *       of the same slot. Otherwise (no priority field configured, or both/neither side has
+     *       it) falls back to the same latest-{@code created_at}-wins rule a scalar collision
+     *       uses. Either way, WARN logged.</li>
      * </ul>
      * When {@code keySpec} is {@code null} (no configured match key for this array path) or an
      * item's key can't be computed, no pairing is attempted for it — falls back to plain
@@ -854,7 +865,7 @@ public class FilterAndPairFn
      */
     private static JsonArray mergeArrayItems(JsonArray existingArr, String existingArrayCase,
                                               JsonArray incomingArr, String incomingArrayCase,
-                                              String keySpec, String arrayPath,
+                                              String keySpec, String priorityField, String arrayPath,
                                               boolean existingWinsTies,
                                               String imageId, String segment) {
         JsonArray combined = new JsonArray();
@@ -898,12 +909,28 @@ public class FilterAndPairFn
                         keepExisting ? existingArrayCase : incomingArrayCase));
 
             } else {
-                boolean keepExisting = existingWinsTies;
+                boolean e1HasPriority = priorityField != null
+                        && e1.isJsonObject() && e1.getAsJsonObject().has(priorityField);
+                boolean e2HasPriority = priorityField != null
+                        && e2.isJsonObject() && e2.getAsJsonObject().has(priorityField);
+
+                boolean keepExisting;
+                String  reason;
+                if (e1HasPriority != e2HasPriority) {
+                    // Exactly one side has the priority marker (e.g. addressRequested) — it
+                    // wins outright, regardless of which case is latest.
+                    keepExisting = e1HasPriority;
+                    reason = "has '" + priorityField + "'";
+                } else {
+                    keepExisting = existingWinsTies;
+                    reason = keepExisting ? "later" : "earlier";
+                }
+
                 combined.add(stampSourceCaseId(keepExisting ? e1 : e2,
                         keepExisting ? existingArrayCase : incomingArrayCase));
                 LOG.warn("imageId={} segment={} field={} itemKey={} — cross-case array item "
-                                + "collision, keeping {} item", imageId, segment, arrayPath, itemKey,
-                        keepExisting ? "later" : "earlier");
+                                + "collision, keeping {} item ({})", imageId, segment, arrayPath, itemKey,
+                        keepExisting ? "existing" : "incoming", reason);
             }
         }
         return combined;
