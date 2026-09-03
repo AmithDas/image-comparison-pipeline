@@ -118,6 +118,20 @@ public class SegmentConfig implements Serializable {
      */
     public Map<String, String> arrayItemPriorityField;
 
+    /**
+     * For a {@code mergeArrayFields} array path, overrides the item-pairing key used during
+     * cross-case MERGE only — independent of {@code FlattenAndCompareFn.ARRAY_MATCH_KEYS},
+     * which drives AI-vs-human comparison pairing for the same array. Falls back to
+     * {@code ARRAY_MATCH_KEYS} when a path has no entry here.
+     * <p>Example: {@code addresses} is compared against AI by content
+     * ({@code streetNumber-postalCode}), but merged across cases by {@code addressType}
+     * (Current, Former1, Former2, ...) — every case submits the same fixed set of address
+     * slots, and a disputed slot's street/postal can itself be the thing under correction, so
+     * content can't reliably identify "the same slot" across cases for merge purposes.
+     * Example: {@code {"addresses": "addressType"}}.
+     */
+    public Map<String, String> mergeItemKeyField;
+
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
         this(null, null, null, null, null);

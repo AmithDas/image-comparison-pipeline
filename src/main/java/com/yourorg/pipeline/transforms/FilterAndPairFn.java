@@ -596,10 +596,12 @@ public class FilterAndPairFn
         }
         Map<String, String> arrayItemPriorityField = (seg != null && seg.arrayItemPriorityField != null)
                 ? seg.arrayItemPriorityField : Collections.emptyMap();
+        Map<String, String> mergeItemKeyField = (seg != null && seg.mergeItemKeyField != null)
+                ? seg.mergeItemKeyField : Collections.emptyMap();
 
         JsonObject merged = mergeJsonObjects(existingJson, existingCreatedAt,
                 incomingJson, incomingCreatedAt, mergeArrayFields, atomicObjectFields,
-                arrayItemPriorityField, "", imageId, segment);
+                arrayItemPriorityField, mergeItemKeyField, "", imageId, segment);
 
         String reEncrypted = BarricadeEncryptionUtil.encrypt(keyId, merged.toString());
         String earliestCreatedAt = minCreatedAt(existingCreatedAt, incomingCreatedAt);
@@ -651,6 +653,7 @@ public class FilterAndPairFn
                                         Set<String> mergeArrayFields,
                                         Map<String, Set<String>> atomicObjectFields,
                                         Map<String, String> arrayItemPriorityField,
+                                        Map<String, String> mergeItemKeyField,
                                         String pathPrefix,
                                         String imageId, String segment) {
         existingJson = existingJson.deepCopy();
@@ -699,15 +702,19 @@ public class FilterAndPairFn
                 if (mergeArrayFields.contains(path) && ev.isJsonArray() && iv.isJsonArray()) {
                     String existingArrayCase = attributionOf(existingByField, key);
                     String incomingArrayCase = attributionOf(incomingByField, key);
-                    // Pair items by the same composite key FlattenAndCompareFn uses for
-                    // comparison (ARRAY_MATCH_KEYS): a key present on only one side is kept
-                    // as-is; a key on both sides with identical content is deduped to one copy;
-                    // a key on both sides with DIFFERENT content is a genuine item-level
-                    // collision, resolved by the same latest-created_at-wins rule as a scalar
-                    // collision (WARN logged) — not silently dropped. Falls back to plain
-                    // concatenation (no pairing at all) for an array path with no configured
-                    // match key.
-                    String keySpec = FlattenAndCompareFn.ARRAY_MATCH_KEYS.get(path);
+                    // Pair items by SegmentConfig.mergeItemKeyField when configured for this
+                    // path, otherwise fall back to the same composite key FlattenAndCompareFn
+                    // uses for AI-vs-human comparison (ARRAY_MATCH_KEYS) — the two can differ
+                    // (e.g. addresses compares by content but merges by addressType). A key
+                    // present on only one side is kept as-is; a key on both sides with
+                    // identical content is deduped to one copy; a key on both sides with
+                    // DIFFERENT content is a genuine item-level collision, resolved by the same
+                    // latest-created_at-wins rule as a scalar collision (WARN logged) — not
+                    // silently dropped. Falls back to plain concatenation (no pairing at all)
+                    // for an array path with no configured match key either way.
+                    String keySpec = mergeItemKeyField.containsKey(path)
+                            ? mergeItemKeyField.get(path)
+                            : FlattenAndCompareFn.ARRAY_MATCH_KEYS.get(path);
                     String priorityField = arrayItemPriorityField.get(path);
                     JsonArray combined = mergeArrayItems(ev.getAsJsonArray(), existingArrayCase,
                             iv.getAsJsonArray(), incomingArrayCase, keySpec, priorityField, path,
@@ -721,12 +728,20 @@ public class FilterAndPairFn
                     // except for a configured set of "slot" sub-objects, each resolved
                     // independently (latest wins if present, else carried forward from the
                     // other side). See mergeAtomicWithSlots.
+                    String winnerCase = attributionOf(existingWinsTies ? existingByField : incomingByField, key);
                     JsonObject atomicMerged = mergeAtomicWithSlots(
                             ev.getAsJsonObject(), existingByField,
                             iv.getAsJsonObject(), incomingByField,
                             atomicObjectFields.get(path), existingWinsTies, key);
                     merged.add(key, atomicMerged);
-                    // Attribution lives inside the nested object's own _caseIdByField.
+                    // Non-slot fields need no per-field attribution — they all uniformly come
+                    // from the latest case, so a single entry here lets resolveCaseId's walk-up
+                    // fallback cover every one of them without duplicating winnerCase onto each
+                    // field individually. Only a slot carried forward from the OTHER (older)
+                    // case needs its own explicit override — see mergeAtomicWithSlots.
+                    if (winnerCase != null && !winnerCase.isEmpty()) {
+                        caseIdByField.addProperty(key, winnerCase);
+                    }
 
                 } else if (ev.isJsonObject() && iv.isJsonObject()) {
                     // Recurse rather than comparing wholesale — a difference in one nested
@@ -735,7 +750,7 @@ public class FilterAndPairFn
                             ev.getAsJsonObject(), existingCreatedAt,
                             iv.getAsJsonObject(), incomingCreatedAt,
                             mergeArrayFields, atomicObjectFields, arrayItemPriorityField,
-                            path, imageId, segment);
+                            mergeItemKeyField, path, imageId, segment);
                     merged.add(key, nestedMerged);
                     // Attribution now lives inside the nested object's own _caseIdByField.
 
@@ -802,10 +817,16 @@ public class FilterAndPairFn
      *       latest ({@code existingWinsTies}) — not blended field-by-field. A field the
      *       non-winning side had but the winning side doesn't is dropped, not carried
      *       forward: "taken from the latest case" means the latest case's own field set
-     *       defines what survives.</li>
+     *       defines what survives. These fields carry no per-field attribution of their
+     *       own — the caller records one entry for the whole object instead, and
+     *       resolveCaseId's path walk-up applies it to every one of them.</li>
      *   <li>Each {@code slotKey} is resolved independently: the latest side's version wins
      *       if it has that slot; otherwise the OTHER side's version is carried forward
-     *       (appended), not lost, since the latest side simply never touched that slot.</li>
+     *       (appended), not lost, since the latest side simply never touched that slot. A
+     *       winner-sourced slot needs no attribution of its own either (same walk-up
+     *       fallback as the non-slot fields); only a slot carried forward from the OLDER
+     *       side needs an explicit override recorded here, since it must NOT inherit the
+     *       object-level winnerCase default.</li>
      * </ul>
      * Each slot's own contents are copied wholesale too (not merged internally) — it's
      * treated as one atomic value, same spirit as the object it lives in.
@@ -816,7 +837,6 @@ public class FilterAndPairFn
                                                      String parentKey) {
         JsonObject winnerObj = existingWinsTies ? existingObj : incomingObj;
         JsonObject loserObj  = existingWinsTies ? incomingObj : existingObj;
-        String winnerCase = attributionOf(existingWinsTies ? existingByFieldParent : incomingByFieldParent, parentKey);
         String loserCase  = attributionOf(existingWinsTies ? incomingByFieldParent : existingByFieldParent, parentKey);
 
         JsonObject merged = new JsonObject();
@@ -825,13 +845,11 @@ public class FilterAndPairFn
         for (String key : winnerObj.keySet()) {
             if (CASE_ID_BY_FIELD_KEY.equals(key) || slotKeys.contains(key)) continue;
             merged.add(key, winnerObj.get(key));
-            if (winnerCase != null && !winnerCase.isEmpty()) caseIdByField.addProperty(key, winnerCase);
         }
 
         for (String slotKey : slotKeys) {
             if (winnerObj.has(slotKey)) {
                 merged.add(slotKey, winnerObj.get(slotKey));
-                if (winnerCase != null && !winnerCase.isEmpty()) caseIdByField.addProperty(slotKey, winnerCase);
             } else if (loserObj.has(slotKey)) {
                 merged.add(slotKey, loserObj.get(slotKey));
                 if (loserCase != null && !loserCase.isEmpty()) caseIdByField.addProperty(slotKey, loserCase);
