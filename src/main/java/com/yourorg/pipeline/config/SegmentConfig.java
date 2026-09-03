@@ -120,9 +120,7 @@ public class SegmentConfig implements Serializable {
      * that slot unchanged. Falls back to the normal latest-{@code created_at}-wins rule when
      * both sides have the priority field, both lack it, or no priority field is configured for
      * that array path at all.
-     * <p>Still configurable via the DAG JSON (unlike its siblings above/below) — see
-     * {@code image_comparison_config.json}.
-     * Example: {@code {"addresses": "addressRequested"}}.
+     * <p><b>Not configurable via the DAG JSON</b> — see {@link #mergeArrayFields}.
      */
     public Map<String, String> arrayItemPriorityField;
 
@@ -141,9 +139,9 @@ public class SegmentConfig implements Serializable {
     public Map<String, String> mergeItemKeyField;
 
     // ── Hardcoded merge-field defaults, by segment name ─────────────────────────
-    // These three maps are the single source of truth for mergeArrayFields,
-    // atomicObjectFields, and mergeItemKeyField — deliberately NOT exposed in the DAG JSON.
-    // See the javadoc on mergeArrayFields above for why.
+    // These four maps are the single source of truth for mergeArrayFields,
+    // atomicObjectFields, arrayItemPriorityField, and mergeItemKeyField — deliberately NOT
+    // exposed in the DAG JSON. See the javadoc on mergeArrayFields above for why.
 
     private static final Map<String, List<String>> DEFAULT_MERGE_ARRAY_FIELDS = Map.of(
             "main", List.of(
@@ -182,17 +180,23 @@ public class SegmentConfig implements Serializable {
             "main", Map.of("addresses", "addressType")
     );
 
+    private static final Map<String, Map<String, String>> DEFAULT_ARRAY_ITEM_PRIORITY_FIELD = Map.of(
+            "main", Map.of("addresses", "addressRequested")
+    );
+
     /**
-     * Populates {@link #mergeArrayFields}, {@link #atomicObjectFields}, and
-     * {@link #mergeItemKeyField} from the hardcoded defaults above, by {@link #name}. Called
-     * automatically by {@link #parse}. A segment with no entry in a given default map simply
-     * gets nothing for that field (e.g. {@code authanddocreview} has no
-     * {@code atomicObjectFields}/{@code mergeItemKeyField}) — not an error.
+     * Populates {@link #mergeArrayFields}, {@link #atomicObjectFields},
+     * {@link #arrayItemPriorityField}, and {@link #mergeItemKeyField} from the hardcoded
+     * defaults above, by {@link #name}. Called automatically by {@link #parse}. A segment with
+     * no entry in a given default map simply gets nothing for that field (e.g.
+     * {@code authanddocreview} has no {@code atomicObjectFields}/{@code mergeItemKeyField}/
+     * {@code arrayItemPriorityField}) — not an error.
      */
     private void applyMergeFieldDefaults() {
-        this.mergeArrayFields    = DEFAULT_MERGE_ARRAY_FIELDS.get(name);
-        this.atomicObjectFields  = DEFAULT_ATOMIC_OBJECT_FIELDS.get(name);
-        this.mergeItemKeyField   = DEFAULT_MERGE_ITEM_KEY_FIELD.get(name);
+        this.mergeArrayFields         = DEFAULT_MERGE_ARRAY_FIELDS.get(name);
+        this.atomicObjectFields       = DEFAULT_ATOMIC_OBJECT_FIELDS.get(name);
+        this.mergeItemKeyField        = DEFAULT_MERGE_ITEM_KEY_FIELD.get(name);
+        this.arrayItemPriorityField   = DEFAULT_ARRAY_ITEM_PRIORITY_FIELD.get(name);
     }
 
     // Gson requires a no-arg constructor for deserialization.

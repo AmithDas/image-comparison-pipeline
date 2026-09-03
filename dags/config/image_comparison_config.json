@@ -28,17 +28,13 @@
     "human_filter_field": "",
     "human_filter_value": "",
 
-    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. For combined segments (multiple human payloads per image), list humanSubTypes with discriminatorField per sub-type. mergeArrayFields/atomicObjectFields/mergeItemKeyField are NOT configured here — they're hardcoded in SegmentConfig.java (applyMergeFieldDefaults), by segment name, alongside FlattenAndCompareFn.ARRAY_MATCH_KEYS/SOFT_MATCH_ARRAYS which they're tightly coupled to; only arrayItemPriorityField (e.g. addresses -> addressRequested) is still configured here.",
+    "_comment_segments": "Each segment maps a pair of method values to a segment name written into the 'segment' column of every output row. For combined segments (multiple human payloads per image), list humanSubTypes with discriminatorField per sub-type. mergeArrayFields/atomicObjectFields/mergeItemKeyField/arrayItemPriorityField are NOT configured here — they're hardcoded in SegmentConfig.java (applyMergeFieldDefaults), by segment name, alongside FlattenAndCompareFn.ARRAY_MATCH_KEYS/SOFT_MATCH_ARRAYS which they're tightly coupled to.",
     "segments": [
       {
-        "_comment": "Standard single-payload segment. case_id-bearing — human payloads for the same image+segment are merged across cases (see FilterAndPairFn.mergeAcrossCases and SegmentConfig.applyMergeFieldDefaults for the 'main' entry's mergeArrayFields/atomicObjectFields/mergeItemKeyField).",
+        "_comment": "Standard single-payload segment. case_id-bearing — human payloads for the same image+segment are merged across cases (see FilterAndPairFn.mergeAcrossCases and SegmentConfig.applyMergeFieldDefaults for the 'main' entry's mergeArrayFields/atomicObjectFields/mergeItemKeyField/arrayItemPriorityField).",
         "name":        "main",
         "aiMethod":    "aimetadata",
-        "humanMethod": "controller.SubmitDispute",
-        "_comment_priority": "addresses items are keyed by addressType for merge purposes (SegmentConfig.mergeItemKeyField). When two cases' versions of the same address slot differ, the version carrying addressRequested (i.e. actively disputed) wins outright, even over a more recent but undisputed resubmission of that same slot.",
-        "arrayItemPriorityField": {
-          "addresses": "addressRequested"
-        }
+        "humanMethod": "controller.SubmitDispute"
       },
       {
         "_comment": "Combined authentication + docreview segment. Authentication and docreview human payloads arrive under different method values and are merged before AI comparison. The documentProofs array is tagged per sub-type, filtered, then concatenated into the merged record (mergeArrayFields for this segment is hardcoded in SegmentConfig.java).",
