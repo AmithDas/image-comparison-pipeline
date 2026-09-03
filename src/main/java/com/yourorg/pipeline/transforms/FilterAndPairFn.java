@@ -27,6 +27,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -507,7 +508,9 @@ public class FilterAndPairFn
         }
         if (json.has(CASE_ID_BY_FIELD_KEY)) return record; // already stamped
 
-        stampObjectRecursively(json, caseKey);
+        Set<String> atomicPaths = (seg != null && seg.atomicObjectFields != null)
+                ? seg.atomicObjectFields.keySet() : Collections.emptySet();
+        stampObjectRecursively(json, caseKey, "", atomicPaths);
 
         record.put("payload", BarricadeEncryptionUtil.encrypt(keyId, json.toString()));
         return record;
@@ -515,6 +518,19 @@ public class FilterAndPairFn
 
     /** Package-visible for direct unit testing (see {@link #mergeJsonObjects}). */
     static void stampObjectRecursively(JsonObject obj, String caseKey) {
+        stampObjectRecursively(obj, caseKey, "", Collections.emptySet());
+    }
+
+    /**
+     * @param pathPrefix  dot-notation path to {@code obj} (empty at the root).
+     * @param atomicPaths paths (see {@code SegmentConfig.atomicObjectFields}) that must NOT
+     *                    be recursed into — stamped as a leaf (the key itself still gets
+     *                    tagged in its parent's map) but its own contents are left alone,
+     *                    since {@link #mergeAtomicWithSlots} — not the normal recursive
+     *                    merge — is what handles those paths later.
+     */
+    static void stampObjectRecursively(JsonObject obj, String caseKey, String pathPrefix,
+                                        Set<String> atomicPaths) {
         JsonObject caseIdByField = new JsonObject();
         for (String key : obj.keySet()) {
             caseIdByField.addProperty(key, caseKey);
@@ -523,9 +539,11 @@ public class FilterAndPairFn
 
         for (String key : obj.keySet()) {
             if (CASE_ID_BY_FIELD_KEY.equals(key)) continue;
+            String path = pathPrefix.isEmpty() ? key : pathPrefix + "." + key;
+            if (atomicPaths.contains(path)) continue;
             JsonElement child = obj.get(key);
             if (child.isJsonObject()) {
-                stampObjectRecursively(child.getAsJsonObject(), caseKey);
+                stampObjectRecursively(child.getAsJsonObject(), caseKey, path, atomicPaths);
             }
         }
     }
@@ -570,9 +588,16 @@ public class FilterAndPairFn
 
         Set<String> mergeArrayFields = (seg != null && seg.mergeArrayFields != null)
                 ? new HashSet<>(seg.mergeArrayFields) : new HashSet<>();
+        Map<String, Set<String>> atomicObjectFields = new HashMap<>();
+        if (seg != null && seg.atomicObjectFields != null) {
+            for (Map.Entry<String, List<String>> e : seg.atomicObjectFields.entrySet()) {
+                atomicObjectFields.put(e.getKey(), new HashSet<>(e.getValue()));
+            }
+        }
 
         JsonObject merged = mergeJsonObjects(existingJson, existingCreatedAt,
-                incomingJson, incomingCreatedAt, mergeArrayFields, "", imageId, segment);
+                incomingJson, incomingCreatedAt, mergeArrayFields, atomicObjectFields,
+                "", imageId, segment);
 
         String reEncrypted = BarricadeEncryptionUtil.encrypt(keyId, merged.toString());
         String earliestCreatedAt = minCreatedAt(existingCreatedAt, incomingCreatedAt);
@@ -611,11 +636,18 @@ public class FilterAndPairFn
      * data) rather than passed in as a flat case_id — both sides can be arbitrarily
      * multi-case (already-merged) records, not just fresh single-case rows.
      *
+     * <h3>Exception — {@code atomicObjectFields}</h3>
+     * A path configured in {@code SegmentConfig.atomicObjectFields} (e.g.
+     * {@code creditReportHeader}) skips the normal per-field recursion — see
+     * {@link #mergeAtomicWithSlots} — because it represents one holistic record, not a set
+     * of independently-collidable fields.
+     *
      * <p>Package-visible for direct unit testing.
      */
     static JsonObject mergeJsonObjects(JsonObject existingJson, String existingCreatedAt,
                                         JsonObject incomingJson, String incomingCreatedAt,
                                         Set<String> mergeArrayFields,
+                                        Map<String, Set<String>> atomicObjectFields,
                                         String pathPrefix,
                                         String imageId, String segment) {
         existingJson = existingJson.deepCopy();
@@ -679,13 +711,26 @@ public class FilterAndPairFn
                     merged.add(key, combined);
                     // Array-level attribution lives per-item (_sourceCaseId), not here.
 
+                } else if (atomicObjectFields.containsKey(path) && ev.isJsonObject() && iv.isJsonObject()) {
+                    // This path represents one holistic record (e.g. creditReportHeader), not
+                    // independently-collidable fields — the latest side's fields win wholesale
+                    // except for a configured set of "slot" sub-objects, each resolved
+                    // independently (latest wins if present, else carried forward from the
+                    // other side). See mergeAtomicWithSlots.
+                    JsonObject atomicMerged = mergeAtomicWithSlots(
+                            ev.getAsJsonObject(), existingByField,
+                            iv.getAsJsonObject(), incomingByField,
+                            atomicObjectFields.get(path), existingWinsTies, key);
+                    merged.add(key, atomicMerged);
+                    // Attribution lives inside the nested object's own _caseIdByField.
+
                 } else if (ev.isJsonObject() && iv.isJsonObject()) {
                     // Recurse rather than comparing wholesale — a difference in one nested
                     // field must not discard unrelated sibling fields at this level.
                     JsonObject nestedMerged = mergeJsonObjects(
                             ev.getAsJsonObject(), existingCreatedAt,
                             iv.getAsJsonObject(), incomingCreatedAt,
-                            mergeArrayFields, path, imageId, segment);
+                            mergeArrayFields, atomicObjectFields, path, imageId, segment);
                     merged.add(key, nestedMerged);
                     // Attribution now lives inside the nested object's own _caseIdByField.
 
@@ -739,6 +784,57 @@ public class FilterAndPairFn
             obj.addProperty(SOURCE_CASE_ID_KEY, caseId);
         }
         return obj;
+    }
+
+    /**
+     * Merges a nested object configured in {@code SegmentConfig.atomicObjectFields} (e.g.
+     * {@code creditReportHeader}) — one holistic record, not a set of independently-collidable
+     * fields, except for a configured set of self-contained "slot" sub-objects (e.g.
+     * {@code dateOfBirthRequested}, {@code currentNameRequested},
+     * {@code socialSecurityNumberRequested} — each its own dispute-request record).
+     * <ul>
+     *   <li>Every field NOT in {@code slotKeys} is taken wholesale from whichever side is
+     *       latest ({@code existingWinsTies}) — not blended field-by-field. A field the
+     *       non-winning side had but the winning side doesn't is dropped, not carried
+     *       forward: "taken from the latest case" means the latest case's own field set
+     *       defines what survives.</li>
+     *   <li>Each {@code slotKey} is resolved independently: the latest side's version wins
+     *       if it has that slot; otherwise the OTHER side's version is carried forward
+     *       (appended), not lost, since the latest side simply never touched that slot.</li>
+     * </ul>
+     * Each slot's own contents are copied wholesale too (not merged internally) — it's
+     * treated as one atomic value, same spirit as the object it lives in.
+     */
+    private static JsonObject mergeAtomicWithSlots(JsonObject existingObj, JsonObject existingByFieldParent,
+                                                     JsonObject incomingObj, JsonObject incomingByFieldParent,
+                                                     Set<String> slotKeys, boolean existingWinsTies,
+                                                     String parentKey) {
+        JsonObject winnerObj = existingWinsTies ? existingObj : incomingObj;
+        JsonObject loserObj  = existingWinsTies ? incomingObj : existingObj;
+        String winnerCase = attributionOf(existingWinsTies ? existingByFieldParent : incomingByFieldParent, parentKey);
+        String loserCase  = attributionOf(existingWinsTies ? incomingByFieldParent : existingByFieldParent, parentKey);
+
+        JsonObject merged = new JsonObject();
+        JsonObject caseIdByField = new JsonObject();
+
+        for (String key : winnerObj.keySet()) {
+            if (CASE_ID_BY_FIELD_KEY.equals(key) || slotKeys.contains(key)) continue;
+            merged.add(key, winnerObj.get(key));
+            if (winnerCase != null && !winnerCase.isEmpty()) caseIdByField.addProperty(key, winnerCase);
+        }
+
+        for (String slotKey : slotKeys) {
+            if (winnerObj.has(slotKey)) {
+                merged.add(slotKey, winnerObj.get(slotKey));
+                if (winnerCase != null && !winnerCase.isEmpty()) caseIdByField.addProperty(slotKey, winnerCase);
+            } else if (loserObj.has(slotKey)) {
+                merged.add(slotKey, loserObj.get(slotKey));
+                if (loserCase != null && !loserCase.isEmpty()) caseIdByField.addProperty(slotKey, loserCase);
+            }
+        }
+
+        if (caseIdByField.size() > 0) merged.add(CASE_ID_BY_FIELD_KEY, caseIdByField);
+        return merged;
     }
 
     /**

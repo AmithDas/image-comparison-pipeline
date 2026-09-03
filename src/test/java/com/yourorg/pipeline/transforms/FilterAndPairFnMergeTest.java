@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.junit.Test;
 
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
@@ -54,7 +55,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of(), "", "img", "main");
+                Set.of(), Map.of(), "", "img", "main");
 
         assertEquals("1", merged.get("a").getAsString());
         assertEquals("2", merged.get("b").getAsString());
@@ -76,7 +77,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of(), "", "img", "main");
+                Set.of(), Map.of(), "", "img", "main");
 
         assertEquals("1", merged.get("a").getAsString());
         assertEquals("2", merged.get("b").getAsString());
@@ -93,7 +94,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of("documentProofs"), "", "img", "main");
+                Set.of("documentProofs"), Map.of(), "", "img", "main");
 
         var proofs = merged.getAsJsonArray("documentProofs");
         assertEquals(2, proofs.size());
@@ -122,7 +123,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of("documentProofs"), "", "img", "main");
+                Set.of("documentProofs"), Map.of(), "", "img", "main");
 
         var proofs = merged.getAsJsonArray("documentProofs");
         assertEquals("Same key, different content collapses to ONE item, not two", 1, proofs.size());
@@ -144,7 +145,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of("documentProofs"), "", "img", "main");
+                Set.of("documentProofs"), Map.of(), "", "img", "main");
 
         var proofs = merged.getAsJsonArray("documentProofs");
         assertEquals(1, proofs.size());
@@ -162,7 +163,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of(), "", "img", "main");
+                Set.of(), Map.of(), "", "img", "main");
 
         assertEquals("Later case's value wins on scalar collision", "Johnny",
                 merged.get("firstName").getAsString());
@@ -184,7 +185,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of(), "", "img", "main");
+                Set.of(), Map.of(), "", "img", "main");
 
         assertEquals("verified", merged.get("status").getAsString());
         assertEquals("Same tie-break direction as an actual collision — latest wins",
@@ -202,7 +203,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 alreadyMerged, "2026-01-01T00:00:00.000000Z",
                 caseThree, "2026-01-03T00:00:00.000000Z",
-                Set.of(), "", "img", "main");
+                Set.of(), Map.of(), "", "img", "main");
 
         assertEquals("John", merged.get("firstName").getAsString());
         assertEquals("Q", merged.get("middleName").getAsString());
@@ -226,7 +227,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 alreadyMerged, "2026-01-01T00:00:00.000000Z",
                 caseTwo, "2026-01-02T00:00:00.000000Z",
-                Set.of("documentProofs"), "", "img", "main");
+                Set.of("documentProofs"), Map.of(), "", "img", "main");
 
         var proofs = merged.getAsJsonArray("documentProofs");
         assertEquals(2, proofs.size());
@@ -246,7 +247,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of(), "", "img", "main");
+                Set.of(), Map.of(), "", "img", "main");
 
         JsonObject address = merged.getAsJsonObject("address");
         assertEquals("Undisputed sibling field must survive the merge", "NY",
@@ -271,7 +272,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of("credit.disputeCodes"), "", "img", "main");
+                Set.of("credit.disputeCodes"), Map.of(), "", "img", "main");
 
         var codes = merged.getAsJsonObject("credit").getAsJsonArray("disputeCodes");
         assertEquals(2, codes.size());
@@ -298,7 +299,7 @@ public class FilterAndPairFnMergeTest {
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
                 incoming, "2026-01-02T00:00:00.000000Z",
-                Set.of("credit.disputeCodes"), "", "img", "main");
+                Set.of("credit.disputeCodes"), Map.of(), "", "img", "main");
 
         // Configured nested path concatenates.
         assertEquals(2, merged.getAsJsonObject("credit").getAsJsonArray("disputeCodes").size());
@@ -307,5 +308,87 @@ public class FilterAndPairFnMergeTest {
         var topLevel = merged.getAsJsonArray("disputeCodes");
         assertEquals(1, topLevel.size());
         assertEquals("Y", topLevel.get(0).getAsJsonObject().get("code").getAsString());
+    }
+
+    // ── atomicObjectFields (e.g. creditReportHeader) ─────────────────────────
+
+    private static final Map<String, Set<String>> CREDIT_REPORT_HEADER_ATOMIC = Map.of(
+            "creditReportHeader", Set.of(
+                    "dateOfBirthRequested", "currentNameRequested", "socialSecurityNumberRequested"));
+
+    /**
+     * Non-slot fields of an atomicObjectFields path are taken WHOLESALE from the latest case
+     * — not blended field-by-field. A field only the earlier case had (and the latest case
+     * doesn't) is dropped, not carried forward: "taken from the latest case" means the latest
+     * case's own field set defines what survives, unlike the normal per-field recursive merge.
+     */
+    @Test
+    public void atomicObjectFieldNonSlotFieldsComeWhollyFromLatestCase() {
+        JsonObject existing = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"OLD123\",\"age\":50,"
+                        + "\"onlyInEarlier\":\"shouldBeDropped\"}}", "CASE-1");
+        JsonObject incoming = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"NEW456\",\"age\":51}}", "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, "", "img", "main");
+
+        JsonObject header = merged.getAsJsonObject("creditReportHeader");
+        assertEquals("NEW456", header.get("customerNumber").getAsString());
+        assertEquals(51, header.get("age").getAsInt());
+        assertFalse("A field only the earlier (non-latest) case had must be dropped, not merged",
+                header.has("onlyInEarlier"));
+        JsonObject byField = header.getAsJsonObject("_caseIdByField");
+        assertEquals("CASE-2", byField.get("customerNumber").getAsString());
+        assertEquals("CASE-2", byField.get("age").getAsString());
+    }
+
+    /** A slot present in the LATEST case wins outright — its own version, not blended with the earlier one. */
+    @Test
+    public void atomicObjectFieldSlotPresentInLatestCaseWinsOutright() {
+        JsonObject existing = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"OLD\"}]}}}", "CASE-1");
+        JsonObject incoming = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"NEW\"}]}}}", "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, "", "img", "main");
+
+        JsonObject header = merged.getAsJsonObject("creditReportHeader");
+        String code = header.getAsJsonObject("currentNameRequested")
+                .getAsJsonArray("disputeCodes").get(0).getAsJsonObject().get("code").getAsString();
+        assertEquals("NEW", code);
+        assertEquals("CASE-2",
+                header.getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+    }
+
+    /** A slot only an EARLIER (non-latest) case has is carried forward, not lost. */
+    @Test
+    public void atomicObjectFieldSlotOnlyInEarlierCaseIsCarriedForward() {
+        JsonObject existing = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"socialSecurityNumberRequested\":{\"disputeCodes\":[{\"code\":\"913\"}]}}}",
+                "CASE-1");
+        JsonObject incoming = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\"}}", "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, "", "img", "main");
+
+        JsonObject header = merged.getAsJsonObject("creditReportHeader");
+        assertEquals("CASE-2", header.getAsJsonObject("_caseIdByField").get("customerNumber").getAsString());
+        String code = header.getAsJsonObject("socialSecurityNumberRequested")
+                .getAsJsonArray("disputeCodes").get(0).getAsJsonObject().get("code").getAsString();
+        assertEquals("913", code);
+        assertEquals("Slot carried forward from the earlier case must still be attributed to it",
+                "CASE-1", header.getAsJsonObject("_caseIdByField").get("socialSecurityNumberRequested").getAsString());
     }
 }

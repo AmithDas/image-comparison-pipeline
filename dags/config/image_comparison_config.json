@@ -56,7 +56,15 @@
           "nonreportedPhoneNumbers",
           "nonreportedTrades",
           "nonreportedCollections"
-        ]
+        ],
+        "_comment_atomic": "creditReportHeader is one holistic record, not a set of independently-collidable fields — its non-slot fields are taken wholesale from the latest case rather than blended field-by-field. The three listed sub-objects are each their own self-contained dispute-request record (with internalComments/images/status/maintenance/disputeCodes of their own) and are resolved as independent named slots: the latest case's version wins if it has that slot, otherwise an earlier case's version is carried forward instead of lost.",
+        "atomicObjectFields": {
+          "creditReportHeader": [
+            "dateOfBirthRequested",
+            "currentNameRequested",
+            "socialSecurityNumberRequested"
+          ]
+        }
       },
       {
         "_comment": "Combined authentication + docreview segment. Authentication and docreview human payloads arrive under different method values and are merged before AI comparison. The documentProofs array is tagged per sub-type, filtered, then concatenated into the merged record.",

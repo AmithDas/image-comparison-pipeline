@@ -83,6 +83,25 @@ public class SegmentConfig implements Serializable {
      */
     public List<String> mergeArrayFields;
 
+    /**
+     * Nested objects (by dot-notation path) that should NOT be merged field-by-field
+     * during cross-case merge, because they represent one holistic record rather than a
+     * set of independently-collidable fields (e.g. {@code creditReportHeader} — a single
+     * credit report header, not a collection of line items). For a configured path:
+     * <ul>
+     *   <li>Every field NOT listed as one of its "slot" keys is taken wholesale from
+     *       whichever case is latest — not blended field-by-field.</li>
+     *   <li>Each listed "slot" key (e.g. {@code dateOfBirthRequested},
+     *       {@code currentNameRequested}, {@code socialSecurityNumberRequested} — each a
+     *       self-contained dispute-request record) is resolved independently: the latest
+     *       case's version wins if present; otherwise an earlier case's version is
+     *       carried forward rather than lost.</li>
+     * </ul>
+     * Example: {@code {"creditReportHeader": ["dateOfBirthRequested",
+     * "currentNameRequested", "socialSecurityNumberRequested"]}}.
+     */
+    public Map<String, List<String>> atomicObjectFields;
+
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
         this(null, null, null, null, null);
