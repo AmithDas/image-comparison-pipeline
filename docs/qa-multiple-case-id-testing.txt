@@ -294,6 +294,33 @@ Setup notes:
       since this segment should never touch the new cross-case merge code
       path at all.
 
+--- Test 11: lookback re-selection does NOT create duplicate comparisons -----
+  Background: --humanLookbackDays and --aiLookbackHours cause the source
+  queries to re-select the same row on every run for as long as it's inside
+  the lookback window (up to 180 days for human, by default). A prior
+  version of this code mistakenly signed the human side's re-encrypted
+  ciphertext instead of its decrypted content, so a pure lookback re-read
+  with zero actual change looked like a genuine edit every run and kept
+  appending duplicate comparison_results rows. This was fixed by hashing
+  the decrypted payload (humanContentSignature / SHA-256) instead — this
+  test is the regression check for that fix.
+  Steps:
+    1. Submit case A. Run the pipeline. Note comparison_version (should be
+       1 if this is the group's first-ever comparison).
+    2. Run the pipeline AGAIN at least twice more, with NO new human
+       submission and NO new AI payload — just letting the lookback window
+       re-select the same already-processed rows from source each time.
+  Expected:
+    - comparison_version does NOT increment on runs 2 and 3.
+    - NO new rows are added to comparison_results for this image+segment.
+    - pending_comparisons.last_compared_signature is identical across all
+      three runs.
+    - If you see comparison_version climbing (e.g. to 2, 3, 4...) purely
+      from re-runs with no actual new data, that's the bug described above
+      — confirm the deployed jar actually includes the
+      humanContentSignature fix (check FilterAndPairFn.java for that
+      method) before treating it as a new issue.
+
 
 --------------------------------------------------------------------------------
 6. USEFUL BIGQUERY QUERIES

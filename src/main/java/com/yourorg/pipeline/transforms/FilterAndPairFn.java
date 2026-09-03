@@ -21,6 +21,9 @@ import org.apache.beam.sdk.values.TupleTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -360,9 +363,19 @@ public class FilterAndPairFn
         // ones — a comparison fires whenever EITHER side's content has changed since the last
         // one: a new/updated human contribution (a case merging in, a field being corrected)
         // or a genuinely new AI payload. See FilterAndPairFn class doc.
+        //
+        // The human side of the signature MUST be based on decrypted content, not the
+        // ciphertext — humanRec.payload gets re-encrypted (fresh random IV) every time this
+        // group is touched, including a no-op re-read of the same row caused purely by
+        // --humanLookbackDays re-selecting it from source with zero actual content change.
+        // Signing the ciphertext made every such re-read look like a genuine change, firing a
+        // spurious comparison and appending duplicate rows every run for as long as the
+        // lookback window kept re-selecting it. The AI side doesn't have this problem — AI
+        // payloads are never re-encrypted after ingestion, so their ciphertext is already a
+        // stable identity (see dedupKey's own doc).
         GenericRecord latestAi = aiRows.isEmpty() ? null : aiRows.get(aiRows.size() - 1);
         String currentSignature = latestAi != null
-                ? dedupKey(str(humanRec.get("payload"))) + "|" + dedupKey(str(latestAi.get("payload")))
+                ? humanContentSignature(humanRec, seg) + "|" + dedupKey(str(latestAi.get("payload")))
                 : null;
 
         if (latestAi != null && !Objects.equals(currentSignature, persistedSignature)) {
@@ -821,6 +834,39 @@ public class FilterAndPairFn
         if (a == null) return b;
         if (b == null) return a;
         return a.compareTo(b) <= 0 ? a : b;
+    }
+
+    /**
+     * Stable content-identity signature for the human side of a comparison, used to decide
+     * whether a new comparison is needed (see the {@code currentSignature} computation above).
+     * Deliberately based on the <em>decrypted</em> payload, not {@code humanRec.get("payload")}
+     * (the ciphertext) — Barricade re-encryption uses a random IV, so the same logical content
+     * produces a different ciphertext every time this record is touched, including a pure
+     * lookback re-read with no actual change. Hashed (SHA-256), not returned as raw JSON, so no
+     * decrypted PII ever lands in the plaintext {@code last_compared_signature} column.
+     */
+    private String humanContentSignature(GenericRecord humanRec, SegmentConfig seg) {
+        String keyId = str(humanRec.get("key_id"));
+        JsonObject json = decryptToJson(keyId, str(humanRec.get("payload")), seg);
+        if (json == null) {
+            // Could not decrypt/parse — fall back to ciphertext identity. Less stable across
+            // lookback re-reads, but only reachable if the payload is malformed to begin with.
+            return dedupKey(str(humanRec.get("payload")));
+        }
+        return sha256Hex(json.toString());
+    }
+
+    private static String sha256Hex(String s) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(s.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is a mandatory JCE algorithm on every standard JVM — not reachable in practice.
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
     }
 
     // ── Human completeness / resolution ──────────────────────────────────────
