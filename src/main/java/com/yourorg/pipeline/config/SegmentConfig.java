@@ -75,11 +75,18 @@ public class SegmentConfig implements Serializable {
     public List<SegmentTypeMapping> segmentTypeMappings;
 
     /**
-     * Array fields that are concatenated across all human sub-types during the merge,
-     * rather than the default behaviour of only copying each sub-type's
-     * {@code discriminatorField}.  Useful when the same array (e.g. {@code documentProofs})
-     * appears in more than one sub-type payload and all items must be preserved.
-     * Example: {@code ["documentProofs"]}.
+     * Array fields that are concatenated across all human sub-types during the merge (via
+     * {@code HumanMerger}), and across cases during cross-case merge (via
+     * {@code FilterAndPairFn.mergeAcrossCases}), rather than one side's array wholesale-
+     * replacing the other's. Useful when the same array (e.g. {@code documentProofs})
+     * appears in more than one sub-type/case payload and all items must be preserved.
+     * <p><b>Not configurable via the DAG JSON</b> — populated in code by
+     * {@link #applyMergeFieldDefaults}, by segment name, the same way
+     * {@code FlattenAndCompareFn.ARRAY_MATCH_KEYS} is a Java constant rather than a config
+     * knob. These field lists are tightly coupled to the real payload schema and to
+     * {@code ARRAY_MATCH_KEYS}/{@code SOFT_MATCH_ARRAYS}, so keeping them in code (reviewed
+     * and tested like any other logic change) avoids the DAG config and the Java merge code
+     * silently drifting out of sync with each other.
      */
     public List<String> mergeArrayFields;
 
@@ -97,8 +104,7 @@ public class SegmentConfig implements Serializable {
      *       case's version wins if present; otherwise an earlier case's version is
      *       carried forward rather than lost.</li>
      * </ul>
-     * Example: {@code {"creditReportHeader": ["dateOfBirthRequested",
-     * "currentNameRequested", "socialSecurityNumberRequested"]}}.
+     * <p><b>Not configurable via the DAG JSON</b> — see {@link #mergeArrayFields}.
      */
     public Map<String, List<String>> atomicObjectFields;
 
@@ -114,6 +120,8 @@ public class SegmentConfig implements Serializable {
      * that slot unchanged. Falls back to the normal latest-{@code created_at}-wins rule when
      * both sides have the priority field, both lack it, or no priority field is configured for
      * that array path at all.
+     * <p>Still configurable via the DAG JSON (unlike its siblings above/below) — see
+     * {@code image_comparison_config.json}.
      * Example: {@code {"addresses": "addressRequested"}}.
      */
     public Map<String, String> arrayItemPriorityField;
@@ -128,9 +136,64 @@ public class SegmentConfig implements Serializable {
      * (Current, Former1, Former2, ...) — every case submits the same fixed set of address
      * slots, and a disputed slot's street/postal can itself be the thing under correction, so
      * content can't reliably identify "the same slot" across cases for merge purposes.
-     * Example: {@code {"addresses": "addressType"}}.
+     * <p><b>Not configurable via the DAG JSON</b> — see {@link #mergeArrayFields}.
      */
     public Map<String, String> mergeItemKeyField;
+
+    // ── Hardcoded merge-field defaults, by segment name ─────────────────────────
+    // These three maps are the single source of truth for mergeArrayFields,
+    // atomicObjectFields, and mergeItemKeyField — deliberately NOT exposed in the DAG JSON.
+    // See the javadoc on mergeArrayFields above for why.
+
+    private static final Map<String, List<String>> DEFAULT_MERGE_ARRAY_FIELDS = Map.of(
+            "main", List.of(
+                    "tradelines",
+                    "addresses",
+                    "collections",
+                    "bankruptcies",
+                    "fileInquiries",
+                    "employments",
+                    "alsoKnownAs",
+                    "otherNames",
+                    "otherIdentifications",
+                    "documentProofs",
+                    "nonreportedAddresses",
+                    "nonreportedDatesOfBirth",
+                    "nonreportedEmployments",
+                    "nonreportedInquiries",
+                    "nonreportedNames",
+                    "nonreportedPublicRecords",
+                    "nonreportedSsns",
+                    "nonreportedPhoneNumbers",
+                    "nonreportedTrades",
+                    "nonreportedCollections"),
+            "authanddocreview", List.of("documentProofs")
+    );
+
+    private static final Map<String, Map<String, List<String>>> DEFAULT_ATOMIC_OBJECT_FIELDS = Map.of(
+            "main", Map.of(
+                    "creditReportHeader", List.of(
+                            "dateOfBirthRequested",
+                            "currentNameRequested",
+                            "socialSecurityNumberRequested"))
+    );
+
+    private static final Map<String, Map<String, String>> DEFAULT_MERGE_ITEM_KEY_FIELD = Map.of(
+            "main", Map.of("addresses", "addressType")
+    );
+
+    /**
+     * Populates {@link #mergeArrayFields}, {@link #atomicObjectFields}, and
+     * {@link #mergeItemKeyField} from the hardcoded defaults above, by {@link #name}. Called
+     * automatically by {@link #parse}. A segment with no entry in a given default map simply
+     * gets nothing for that field (e.g. {@code authanddocreview} has no
+     * {@code atomicObjectFields}/{@code mergeItemKeyField}) — not an error.
+     */
+    private void applyMergeFieldDefaults() {
+        this.mergeArrayFields    = DEFAULT_MERGE_ARRAY_FIELDS.get(name);
+        this.atomicObjectFields  = DEFAULT_ATOMIC_OBJECT_FIELDS.get(name);
+        this.mergeItemKeyField   = DEFAULT_MERGE_ITEM_KEY_FIELD.get(name);
+    }
 
     // Gson requires a no-arg constructor for deserialization.
     public SegmentConfig() {
@@ -267,6 +330,9 @@ public class SegmentConfig implements Serializable {
                     "--segmentConfigs parsed to an empty list — at least one segment is required");
         }
         validate(configs);
+        for (SegmentConfig c : configs) {
+            c.applyMergeFieldDefaults();
+        }
         return configs;
     }
 
