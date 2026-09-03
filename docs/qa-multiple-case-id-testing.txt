@@ -1,0 +1,377 @@
+================================================================================
+QA GUIDE: Multiple Case ID Support — What Changed and How to Test It
+================================================================================
+Audience: QA
+Scope:    FilterAndPairFn.java, FlattenAndCompareFn.java, pending_comparisons,
+          comparison_results, dags/config/image_comparison_config.json
+Related:  docs/case-id-changes.md describes an EARLIER, SUPERSEDED design
+          (per-case isolation with full AI-history replay). Everything in
+          THIS document describes the CURRENT, shipped behavior. If the two
+          documents disagree, this one is correct.
+
+
+--------------------------------------------------------------------------------
+1. THE PROBLEM THIS CHANGE SOLVES
+--------------------------------------------------------------------------------
+
+AI produces a complete payload for an image in one shot. Humans do not — the
+same image can receive multiple separate human submissions ("cases"), each
+one covering only part of the full picture (e.g. one case disputes a
+tradeline, a second case disputes a different tradeline or a collection).
+
+Before this change, each case_id was compared against the AI payload in
+total isolation. That produced FALSE mismatches: a field that a different
+case had already supplied looked "missing" to any case that didn't supply it
+itself, because nothing ever combined what the cases collectively knew.
+
+This change merges every case's human payload for the same image_id+segment
+into one consolidated record BEFORE comparing against AI, so a field
+supplied by any case is recognized as present — not just fields supplied by
+whichever case happens to be compared.
+
+case_id is now LINEAGE, not a partition. It no longer isolates cases from
+each other; it tracks which case actually contributed which piece of data.
+
+
+--------------------------------------------------------------------------------
+2. KEY BEHAVIOR CHANGES, IN PLAIN TERMS
+--------------------------------------------------------------------------------
+
+2.1 Human payloads for the same image_id+segment are always merged
+    across case_id, field by field — never compared in isolation per case.
+
+2.2 A field present in only one case's payload survives untouched in the
+    merged record, attributed to that case.
+
+2.3 A field present in TWO cases with the SAME value: kept once, attributed
+    to the LATER-arriving case (by created_at).
+
+2.4 A field present in TWO cases with DIFFERENT values (a genuine
+    collision): the LATER-arriving case's value wins. A WARN is logged.
+    The earlier value is NOT preserved anywhere — this is a real, accepted
+    data-loss tradeoff. If you need the overwritten value, it is still
+    recoverable from the raw `human_payloads` source table for that case_id.
+
+2.5 Nested objects are merged recursively, not treated as one atomic value.
+    A difference in ONE nested field does not discard the rest of that
+    nested object.
+
+2.6 Array fields (tradelines, addresses, collections, bankruptcies,
+    fileInquiries, employments, alsoKnownAs, otherNames,
+    otherIdentifications, documentProofs, and the nonreported* family) are
+    concatenated across cases IF AND ONLY IF the field is listed in that
+    segment's `mergeArrayFields` config
+    (dags/config/image_comparison_config.json). If a field is NOT listed
+    there, two cases' arrays are treated like a scalar collision — the
+    later case's whole array wins, the earlier case's array is lost.
+
+2.7 Array items are paired across cases by the same composite key used for
+    AI/human comparison matching (ARRAY_MATCH_KEYS in FlattenAndCompareFn):
+      - Same key, identical item content -> deduped to one copy.
+      - Same key, DIFFERENT item content -> genuine collision, later item
+        wins, WARN logged (same rule as 2.4, applied per array item).
+      - Different keys -> both items kept.
+
+2.8 Every field's `case_id` in comparison_results is resolved PER ROW —
+    not one case_id per comparison. Precedence:
+      1. The array item's own source case (for a merged array item).
+      2. The specific field's attribution within its section, if that
+         section had more than one contributor.
+      3. The group's canonical case_id (the earliest-arriving case) — used
+         only for fields no case ever explicitly provided (e.g. AI-only
+         fields with no human counterpart at all).
+
+2.9 A comparison is re-run whenever EITHER side's content actually changes
+    since the last comparison — a new/updated case merging in, OR a
+    genuinely new AI payload. It is NOT re-run just because a pipeline run
+    happened with nothing new. There is no "wait until every case has
+    submitted" gate — there's no way to know in advance how many cases a
+    given image will receive, so every arrival triggers an up-to-date
+    comparison against everything known so far.
+
+2.10 Comparison is always against the SINGLE LATEST AI payload — not a
+    backlog of every AI payload ever seen for that image. The old
+    multi-iteration "replay" model is gone.
+
+2.11 comparison_results is plain append-only. A superseded comparison's
+    rows are NOT deleted and NOT hidden — old and new comparisons for the
+    same image_id+segment coexist in the table, distinguished by
+    `ai_iteration` (see section 4). There is no `is_current` flag and no
+    "clean" view for this — that was considered and explicitly rejected in
+    favor of keeping the table simple and fully auditable. If you need only
+    the latest comparison, filter by MAX(ai_iteration) per image_id+segment
+    yourself (sample query in section 5).
+
+
+--------------------------------------------------------------------------------
+3. WHAT DID *NOT* CHANGE
+--------------------------------------------------------------------------------
+
+- Segments using `humanSubTypes` (e.g. an authentication + docreview combo)
+  are UNAFFECTED. Those segments never carry a real case_id in practice, so
+  the cross-case merge path never triggers for them; HumanMerger's existing
+  cross-sub-type merge behaves exactly as before.
+- AI payload aging (`ai_pending_comparisons`, 7-day MAX_WAIT_DAYS) is
+  unchanged and independent of this feature.
+- Encryption, key handling, and the general shape of comparison_results
+  rows (field_name, array_key, segment_type, human_value, ai_value,
+  is_match) are unchanged.
+
+
+--------------------------------------------------------------------------------
+4. SCHEMA CHANGES QA SHOULD KNOW ABOUT
+--------------------------------------------------------------------------------
+
+pending_comparisons (src/main/resources/avro/pending_row.json):
+  - case_id            : now the CANONICAL (earliest-arriving) case for the
+                          group, not a partition key. Can be null.
+  - merged_case_ids     : NEW. Semicolon-joined list of every case_id that
+                          has ever contributed to this group. Bookkeeping
+                          only — do not rely on this for per-field
+                          attribution, use comparison_results.case_id
+                          instead (see 2.8).
+  - last_compared_signature : NEW. Internal — used to decide whether a new
+                          comparison is needed. Not meaningful to inspect
+                          directly.
+  - comparison_version  : NEW. Increments each time a new comparison
+                          actually fires for this group.
+  - matched_ai_keys, next_ai_iteration : DEPRECATED. Always null/0 now.
+                          Left in the schema only because this codebase
+                          never drops columns. Ignore them.
+
+comparison_results (src/main/resources/avro/comparison_result.json):
+  - No new columns. `ai_iteration` now means "which comparison_version this
+    row belongs to" — an observability counter, NOT a replay index. A group
+    can have multiple ai_iteration values in the table over time (2.11).
+  - case_id is resolved per row now (2.8), not one value per whole
+    comparison.
+
+dags/config/image_comparison_config.json:
+  - The `main` segment now has a `mergeArrayFields` list (see 2.6). If QA
+    is testing against a different/real deployed config, confirm that
+    config also has this list — otherwise array fields there will silently
+    fall back to scalar-collision (whole-array-replace) behavior.
+
+
+--------------------------------------------------------------------------------
+5. HOW TO TEST
+--------------------------------------------------------------------------------
+
+Setup notes:
+  - "Same batch" means two cases' human payloads both appear in the same
+    pipeline run's source read. "Different batches" means one case is
+    submitted, the pipeline runs, THEN the second case is submitted before
+    the next run.
+  - All scenarios below assume the `main` segment (or whichever segment in
+    your test config is case_id-bearing and has `mergeArrayFields` set).
+
+--- Test 1: Disjoint fields, two cases, same batch --------------------------
+  Steps:
+    1. Submit human payload for case A with field X only.
+    2. Submit human payload for case B (same image_id, same segment) with
+       field Y only, same batch.
+    3. Submit an AI payload with both X and Y.
+    4. Run the pipeline.
+  Expected:
+    - ONE comparison_results row set (one comparison_version), not two.
+    - Row for field X: is_match reflects A's value vs AI, case_id = A.
+    - Row for field Y: is_match reflects B's value vs AI, case_id = B.
+    - Neither field shows a false "missing" mismatch.
+
+--- Test 2: Disjoint fields, two cases, different batches -------------------
+  Steps:
+    1. Submit case A alone. Run the pipeline. Confirm a comparison happened
+       (field X compared, field Y missing as expected — case A hasn't
+       submitted Y and neither has anyone else yet).
+    2. Submit case B (field Y) with no new AI payload. Run the pipeline
+       again.
+  Expected:
+    - A SECOND comparison fires (comparison_version increments), even
+      though no new AI payload arrived — case B's arrival is what triggers
+      it (section 2.9).
+    - The new comparison_results rows show BOTH X and Y as present/matched,
+      attributed to A and B respectively.
+    - The FIRST run's rows are still in the table (append-only, section
+      2.11) at the earlier ai_iteration/comparison_version — this is
+      expected, not a bug. Use the MAX(ai_iteration) query below to see
+      only the current state.
+    - pending_comparisons.merged_case_ids for this group now lists both A
+      and B.
+
+--- Test 3: Scalar field collision (different values) -----------------------
+  Steps:
+    1. Submit case A with field Z = "foo".
+    2. Submit case B (later created_at) with field Z = "bar", same or later
+       batch.
+  Expected:
+    - Merged payload has Z = "bar" (later case wins).
+    - comparison_results row for Z has case_id = B.
+    - A WARN log line appears: "cross-case scalar collision, keeping later
+      value" for field Z.
+    - Case A's "foo" value does not appear anywhere in comparison_results
+      or pending_comparisons — this is expected, accepted behavior (2.4),
+      not a bug. It's still recoverable from human_payloads if needed.
+
+--- Test 4: Scalar field collision (identical values) ------------------------
+  Steps:
+    1. Submit case A and case B with the SAME value for field Z (e.g. both
+       submit an identical creditReportHeader).
+  Expected:
+    - Merged payload keeps Z unchanged.
+    - comparison_results row for Z is attributed to whichever case is
+      LATER by created_at — even though the value never changed. This is
+      expected (2.3): identical-value attribution follows the same
+      latest-wins rule as a real collision, for consistency.
+
+--- Test 5: Array field WITH mergeArrayFields configured ---------------------
+  Steps:
+    1. Submit case A with tradelines = [tradeline #1].
+    2. Submit case B with tradelines = [tradeline #2] (different
+       accountNumber/customerNumber/dateOpened — a genuinely different
+       item).
+    3. AI payload has both tradeline #1 and #2.
+  Expected:
+    - Merged payload's tradelines array has BOTH items.
+    - Each tradeline's flattened fields show case_id = A or B respectively
+      (via _sourceCaseId, resolved per array item).
+    - No tradeline shows as a false "missing" mismatch.
+
+--- Test 6: Array field WITHOUT mergeArrayFields configured ------------------
+  Steps:
+    1. Pick a segment/field NOT listed in mergeArrayFields.
+    2. Submit case A with that array containing item #1.
+    3. Submit case B (later) with the same array containing a DIFFERENT
+       item #2.
+  Expected:
+    - Merged payload's array = case B's array ONLY (whole-array
+      replacement, same as a scalar collision). Case A's item #1 is gone.
+    - This is expected given the field isn't configured for cross-case
+      concatenation (2.6) — if this is wrong for the field under test,
+      the fix is a config change (add it to mergeArrayFields), not a code
+      bug.
+
+--- Test 7: Array item collision (same composite key, different content) ----
+  Steps:
+    1. Submit case A with a tradeline for account X, disputeCode "013".
+    2. Submit case B (later) with a tradeline for the SAME account X
+       (same composite key), disputeCode "001".
+  Expected:
+    - Merged array has ONE item for account X (not two), with
+      disputeCode = "001" (later case wins, same rule as Test 3).
+    - case_id for that item's rows = B.
+    - A WARN log line appears: "cross-case array item collision, keeping
+      later item".
+
+--- Test 8: No-op re-run (nothing changed) ------------------------------------
+  Steps:
+    1. Run the pipeline once for an image with an existing case and no
+       pending changes.
+    2. Run the pipeline again immediately, with no new human or AI data.
+  Expected:
+    - NO new comparison_results rows are written.
+    - comparison_version / ai_iteration does not increment.
+    - This confirms the pipeline isn't needlessly re-comparing/re-writing
+      every run.
+
+--- Test 9: Simultaneous new AI payloads get distinct timestamps -------------
+  Steps:
+    1. Submit two NEW AI payloads for the same image in the same batch,
+       with identical or out-of-order source created_at values.
+  Expected:
+    - Both are persisted to ai_pending_comparisons with created_at values
+      exactly 1 second apart (whichever was processed first gets the
+      earlier of the two), never identical. This is unrelated to case
+      merging but is part of the same body of work — verify it isn't
+      broken.
+
+--- Test 10: authanddocreview-style segment is unaffected --------------------
+  Steps:
+    1. Run the existing authentication + docreview flow exactly as before
+       this change (no case_id involved).
+  Expected:
+    - Byte-for-byte the same behavior as before this change. This is a
+      regression check — if anything differs here, that's a real bug,
+      since this segment should never touch the new cross-case merge code
+      path at all.
+
+
+--------------------------------------------------------------------------------
+6. USEFUL BIGQUERY QUERIES
+--------------------------------------------------------------------------------
+
+-- Find images with more than one case currently active (post-merge model):
+SELECT image_id, segment, merged_case_ids
+FROM `<project>.<dataset>.pending_comparisons`
+WHERE segment = 'main'
+  AND merged_case_ids IS NOT NULL
+  AND ARRAY_LENGTH(SPLIT(merged_case_ids, ';')) > 1;
+
+-- See only the CURRENT (latest) comparison per image+segment, ignoring
+-- older superseded rows (comparison_results is append-only, section 2.11):
+WITH latest AS (
+  SELECT image_id, segment, MAX(ai_iteration) AS max_iteration
+  FROM `<project>.<dataset>.comparison_results`
+  GROUP BY image_id, segment
+)
+SELECT r.*
+FROM `<project>.<dataset>.comparison_results` r
+JOIN latest l
+  ON r.image_id = l.image_id AND r.segment = l.segment
+  AND r.ai_iteration = l.max_iteration;
+
+-- Per-field case attribution for one image, all history:
+SELECT ai_iteration, case_id, field_name, array_key, is_match
+FROM `<project>.<dataset>.comparison_results`
+WHERE image_id = '<image_id>' AND segment = 'main'
+ORDER BY ai_iteration, field_name;
+
+
+--------------------------------------------------------------------------------
+7. THINGS THAT LOOK LIKE BUGS BUT ARE EXPECTED — CHECK HERE FIRST
+--------------------------------------------------------------------------------
+
+- "comparison_results has multiple row sets for the same image, with
+  different ai_iteration values" -> Expected (2.11). Filter by
+  MAX(ai_iteration) to see the current state.
+
+- "A field's value from an earlier case disappeared after a later case
+  submitted the same field with a different value" -> Expected (2.4/2.7).
+  Check the logs for a "cross-case scalar/array item collision" WARN
+  confirming this was a deliberate resolution, not silent data loss.
+
+- "A field with identical values on both cases is attributed to a case
+  that didn't 'win' anything" -> Expected (2.3/2.4). Attribution follows
+  latest-arriving-case even when nothing about the value actually changed.
+
+- "An array field's item from an earlier case vanished entirely, not just
+  overwritten" -> Check whether that field is in `mergeArrayFields` for
+  the segment under test (2.6). If not, this is expected — the fix is a
+  config change, not a code fix.
+
+- "Some AI fields always show as mismatched/missing regardless of which
+  case or how many cases submitted" -> Likely a genuine structural gap
+  between the AI schema and the human intake schema (fields the AI
+  computes/reports that humans never submit, e.g. AI-internal identifiers
+  or masked/censored values) — unrelated to case merging. Confirm by
+  checking whether the field exists anywhere in the human payload schema
+  at all, for any case.
+
+- "The pipeline didn't produce a new comparison even though a case
+  resubmitted" -> Check whether the resubmission actually changed the
+  payload content. If it's byte-identical to what's already merged, no new
+  comparison is expected (section 2.9 / Test 8).
+
+
+--------------------------------------------------------------------------------
+8. WHO TO ASK
+--------------------------------------------------------------------------------
+
+FilterAndPairFn.java  — merge logic, signature-based re-comparison trigger,
+                         AI timestamp bumping.
+FlattenAndCompareFn.java — per-row case_id resolution, ARRAY_MATCH_KEYS /
+                         SOFT_MATCH_ARRAYS (composite keys used both for
+                         comparison pairing and for cross-case array-item
+                         dedup).
+dags/config/image_comparison_config.json — mergeArrayFields per segment.
+
+================================================================================
