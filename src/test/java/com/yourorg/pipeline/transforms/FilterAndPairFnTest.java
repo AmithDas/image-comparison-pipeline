@@ -734,4 +734,119 @@ public class FilterAndPairFnTest {
 
         pipeline.run().waitUntilFinish();
     }
+
+    /**
+     * A group has been pending for longer than MAX_WAIT_DAYS (first_seen_at is old), but a
+     * genuine content change arrives this run and a comparison successfully fires. The group
+     * must land in CASE_PENDING with its freshly-updated signature/version — never
+     * CASE_AGED_OUT — since a group that just matched is no longer "waiting." Aging it out on
+     * the same pass it matches would drop last_compared_signature/comparison_version from
+     * pending_comparisons, making the (now-compared, unchanged) content look "brand new" on a
+     * later run and re-trigger a spurious duplicate comparison once humanLookbackDays/
+     * aiLookbackHours re-surface it — a real production bug this test guards against.
+     */
+    @Test
+    public void matchingGroupIsNeverAgedOutEvenWhenFirstSeenExceedsMaxWaitDays() {
+        String ai1Payload    = payloadFor("img012");
+        String oldHuman      = payloadFor("img012");
+        String newHuman      = payloadWithMarker("img012", "updated");
+        String longWaitFirstSeen = Instant.now()
+                .minus(FilterAndPairFn.MAX_WAIT_DAYS + 1, ChronoUnit.DAYS)
+                .toString();
+
+        TableRow oldCaseState = casePendingRow("img012", "human", "key1",
+                "2026-03-01T10:00:00Z", longWaitFirstSeen,
+                0L, "case1", signature(oldHuman, ai1Payload), 1L);
+
+        TableRow humanUpdate = sourceRowWithPayload("img012", HUMAN_METHOD, "key1",
+                "2026-04-01T10:00:00Z", "case1", newHuman);
+        TableRow ai1Again = sourceRow("img012", AI_METHOD, "key1", "2026-03-01T08:00:00Z");
+
+        PCollectionTuple routed = runPipeline("img012",
+                List.of(humanUpdate, ai1Again), List.of(oldCaseState), List.of());
+
+        PAssert.that(matched(routed)).satisfies(pairs -> {
+            List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
+            pairs.forEach(list::add);
+            assertEquals("Human content changed — a comparison fires despite the long wait",
+                    1, list.size());
+            assertEquals(2L, list.get(0).getValue().getKey().get("comparison_version"));
+            return null;
+        });
+
+        PAssert.that(casePending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("A group that just matched must go to CASE_PENDING, not age out",
+                    1, list.size());
+            assertEquals(2L, list.get(0).get("comparison_version"));
+            assertEquals(signature(newHuman, ai1Payload),
+                    list.get(0).get("last_compared_signature").toString());
+            return null;
+        });
+
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
+        pipeline.run().waitUntilFinish();
+    }
+
+    /**
+     * Regression test for a bug in mergeGroupMeta: when TWO colliding persisted pending rows
+     * exist for the same group (its own doc calls this a real migration-transition edge case,
+     * not purely theoretical) — one stale (older comparison_version, an outdated signature) and
+     * one correct (higher comparison_version, the up-to-date signature) — comparison_version
+     * was picked as the MAX across both rows, but last_compared_signature was picked from
+     * "whichever row has a non-null signature," independently and not necessarily from the same
+     * row. That can pair the correct (higher) version with the STALE row's signature — an
+     * internally inconsistent combination that can never match a freshly-computed signature
+     * again, so every future run sees "changed" and re-triggers a spurious duplicate comparison
+     * forever. The fix picks comparison_version and last_compared_signature from the SAME
+     * (higher-version) row as a pair.
+     *
+     * <p>Nothing about the group's actual content changes this run (no fresh source rows at
+     * all — everything comes from the two colliding pending rows plus the unchanged AI pending
+     * row), so a correct implementation must NOT re-trigger a comparison at all.
+     */
+    @Test
+    public void collidingPendingRowsPairVersionAndSignatureFromTheSameRow() {
+        String humanPayload = payloadFor("img013");
+        String aiPayload    = payloadFor("img013");
+        String correctSignature = signature(humanPayload, aiPayload);
+        String staleSignature   = correctSignature + "-STALE";
+
+        TableRow stalePending = casePendingRow("img013", "human", "key1",
+                "2026-02-01T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
+                0L, "case1", staleSignature, 1L);
+        TableRow correctPending = casePendingRowWithPayload("img013", "human", "key1",
+                "2026-03-01T10:00:00Z", Instant.now().minusSeconds(3600).toString(),
+                0L, "case1", correctSignature, 2L, humanPayload);
+
+        TableRow ai1Pending = aiPendingRow("img013", "key1", "2026-02-01T08:00:00Z",
+                Instant.now().minusSeconds(3600).toString());
+
+        PCollectionTuple routed = runPipeline("img013",
+                List.of(), List.of(stalePending, correctPending), List.of(ai1Pending));
+
+        PAssert.that(matched(routed)).satisfies(pairs -> {
+            List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
+            pairs.forEach(list::add);
+            assertEquals("Nothing actually changed — the higher-version row's signature "
+                            + "already reflects current content, so no new comparison should fire",
+                    0, list.size());
+            return null;
+        });
+
+        PAssert.that(casePending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals(1, list.size());
+            assertEquals("comparison_version must come from the higher-version row",
+                    2L, list.get(0).get("comparison_version"));
+            assertEquals("last_compared_signature must come from THAT SAME row, not the stale one",
+                    correctSignature, list.get(0).get("last_compared_signature").toString());
+            return null;
+        });
+
+        pipeline.run().waitUntilFinish();
+    }
 }
