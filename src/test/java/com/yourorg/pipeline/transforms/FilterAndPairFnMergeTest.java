@@ -154,6 +154,57 @@ public class FilterAndPairFnMergeTest {
                 proofs.get(0).getAsJsonObject().get("_sourceCaseId").getAsString());
     }
 
+    /**
+     * A persisted pending array item already has _sourceCaseId, while the same source row
+     * reselected by lookback does not. Provenance metadata must not make identical business
+     * content look different, or every batch run appends another comparison.
+     */
+    @Test
+    public void sameCompositeKeyIgnoresSourceCaseIdWhenDeduping() {
+        JsonObject alreadyMerged = obj(
+                "{\"documentProofs\":[{\"authenticationType\":\"Authentication\","
+                        + "\"document\":\"passport\",\"disputeCode\":\"013\","
+                        + "\"_sourceCaseId\":\"CASE-1\"}]}");
+        JsonObject sameFreshRow = stamped(
+                "{\"documentProofs\":[{\"authenticationType\":\"Authentication\","
+                        + "\"document\":\"passport\",\"disputeCode\":\"013\"}]}", "CASE-1");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                alreadyMerged, "2026-01-01T00:00:00.000000Z",
+                sameFreshRow, "2026-01-01T00:00:00.000000Z",
+                Set.of("documentProofs"), Map.of(), Map.of(), Map.of(), "", "img", "main");
+
+        var proofs = merged.getAsJsonArray("documentProofs");
+        assertEquals("Same business item must not be duplicated just because pending has provenance",
+                1, proofs.size());
+        assertEquals("CASE-1", proofs.get(0).getAsJsonObject().get("_sourceCaseId").getAsString());
+    }
+
+    /**
+     * Unkeyed/positional merge arrays (no ARRAY_MATCH_KEYS entry) are deliberately NOT
+     * deduped by content — every item from both sides is kept, matching this path's original
+     * always-concatenate semantics. No currently-configured mergeArrayFields array actually
+     * takes this path (all 20 have a keyed match spec), but the behavior itself is intentional:
+     * for a genuinely positional array, two items with identical field values could still be
+     * two distinct real submissions, so collapsing them would risk data loss.
+     */
+    @Test
+    public void unkeyedArrayConcatenatesWithoutDedupingByContent() {
+        JsonObject alreadyMerged = obj(
+                "{\"attachments\":[{\"name\":\"a.pdf\",\"_sourceCaseId\":\"CASE-1\"}]}");
+        JsonObject sameFreshRow = stamped("{\"attachments\":[{\"name\":\"a.pdf\"}]}", "CASE-1");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                alreadyMerged, "2026-01-01T00:00:00.000000Z",
+                sameFreshRow, "2026-01-01T00:00:00.000000Z",
+                Set.of("attachments"), Map.of(), Map.of(), Map.of(), "", "img", "main");
+
+        var attachments = merged.getAsJsonArray("attachments");
+        assertEquals("Unkeyed arrays concatenate everything, even exact business-content "
+                        + "replays — no dedup without a configured match key",
+                2, attachments.size());
+    }
+
     /** A scalar collision is resolved by latest created_at, with provenance recorded. */
     @Test
     public void scalarCollisionKeepsLatestAndRecordsProvenance() {

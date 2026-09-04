@@ -1013,6 +1013,14 @@ public class FilterAndPairFn
         JsonArray combined = new JsonArray();
 
         if (keySpec == null) {
+            // Unkeyed/positional array — no way to identify "the same slot" across cases, so
+            // every item from both sides is kept as-is, matching this path's original
+            // always-concatenate semantics. (Deliberately NOT deduped by content the way the
+            // keyed branch below is — no array currently configured in mergeArrayFields lacks
+            // an ARRAY_MATCH_KEYS entry, so this path is dormant today; if a future array ever
+            // relies on it, content-based dedup here would risk collapsing two genuinely
+            // distinct items that happen to share identical field values — a real design
+            // tradeoff that deserves its own deliberate decision, not a side effect of this fix.)
             for (JsonElement el : existingArr) combined.add(stampSourceCaseId(el, existingArrayCase));
             for (JsonElement el : incomingArr) combined.add(stampSourceCaseId(el, incomingArrayCase));
             return combined;
@@ -1045,7 +1053,7 @@ public class FilterAndPairFn
             } else if (e1 == null) {
                 combined.add(stampSourceCaseId(e2, incomingArrayCase));
 
-            } else if (e1.equals(e2)) {
+            } else if (businessItemsEqual(e1, e2)) {
                 boolean keepExisting = existingWinsTies;
                 combined.add(stampSourceCaseId(keepExisting ? e1 : e2,
                         keepExisting ? existingArrayCase : incomingArrayCase));
@@ -1076,6 +1084,38 @@ public class FilterAndPairFn
             }
         }
         return combined;
+    }
+
+    /**
+     * Whether two array items are the same business content, ignoring the {@code _sourceCaseId}
+     * bookkeeping stamp — plain {@code .equals()} would treat an already-stamped item (e.g. from
+     * a group's persisted, previously-merged state) as "different" from a genuinely-identical
+     * but not-yet-stamped item (e.g. that same case's row re-read fresh via humanLookbackDays),
+     * purely because one carries the stamp and the other doesn't yet.
+     */
+    private static boolean businessItemsEqual(JsonElement left, JsonElement right) {
+        return stripSourceCaseId(left).equals(stripSourceCaseId(right));
+    }
+
+    private static JsonElement stripSourceCaseId(JsonElement item) {
+        if (item == null || !item.isJsonObject()) return item;
+        JsonObject copy = item.getAsJsonObject().deepCopy();
+        stripSourceCaseIdRecursively(copy);
+        return copy;
+    }
+
+    private static void stripSourceCaseIdRecursively(JsonObject obj) {
+        obj.remove(SOURCE_CASE_ID_KEY);
+        for (String key : new ArrayList<>(obj.keySet())) {
+            JsonElement child = obj.get(key);
+            if (child != null && child.isJsonObject()) {
+                stripSourceCaseIdRecursively(child.getAsJsonObject());
+            } else if (child != null && child.isJsonArray()) {
+                for (JsonElement nested : child.getAsJsonArray()) {
+                    if (nested.isJsonObject()) stripSourceCaseIdRecursively(nested.getAsJsonObject());
+                }
+            }
+        }
     }
 
     private JsonObject decryptToJson(String keyId, String payload, SegmentConfig seg) {

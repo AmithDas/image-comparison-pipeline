@@ -395,13 +395,30 @@ public class FlattenAndCompareFn
      *       a single contributor overall (the common case).</li>
      * </ol>
      */
-    private static String resolveCaseId(String field, String matchKey,
-                                         Map<String, String> caseIdByMatchKey,
-                                         Map<String, String> caseIdByPath,
-                                         String canonicalCaseId) {
+    static String resolveCaseId(String field, String matchKey,
+                                 Map<String, String> caseIdByMatchKey,
+                                 Map<String, String> caseIdByPath,
+                                 String canonicalCaseId) {
+        // A field nested inside a keyed sub-array one level deeper than where _sourceCaseId is
+        // stamped (e.g. addresses.addressRequested.disputeCodes.code, whose matchKey composites
+        // the parent address item's own key with the disputeCodes item's own key — see
+        // JsonFieldExtractor.flattenArray) has a matchKey MORE SPECIFIC than any entry
+        // caseIdByMatchKey actually has, since _sourceCaseId is only ever stamped on the
+        // OUTERMOST array item, not re-stamped on nested keyed sub-arrays. An exact-only lookup
+        // therefore always misses for such fields, silently falling through to the path-walk
+        // (which doesn't cover array-item provenance at all — see extractAndStripSourceCaseId)
+        // and then to canonicalCaseId, misattributing every such field to the group's canonical
+        // case regardless of which item it actually came from. Stripping trailing "-"-joined
+        // components and retrying finds the correct, less-specific (parent item's own) key.
         if (matchKey != null) {
-            String fromArrayItem = caseIdByMatchKey.get(matchKey);
-            if (fromArrayItem != null) return fromArrayItem;
+            String mk = matchKey;
+            while (true) {
+                String fromArrayItem = caseIdByMatchKey.get(mk);
+                if (fromArrayItem != null) return fromArrayItem;
+                int dash = mk.lastIndexOf('-');
+                if (dash < 0) break;
+                mk = mk.substring(0, dash);
+            }
         }
         String path = field;
         while (true) {
