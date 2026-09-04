@@ -104,6 +104,9 @@ public class SegmentConfig implements Serializable {
      *       case's version wins if present; otherwise an earlier case's version is
      *       carried forward rather than lost.</li>
      * </ul>
+     * An empty slot list is valid and means "fully atomic, no exceptions" — every field is
+     * taken wholesale from the latest case (e.g. {@code resultOfInvestigation},
+     * {@code requestor}: self-contained records with no slot-like sub-objects of their own).
      * <p><b>Not configurable via the DAG JSON</b> — see {@link #mergeArrayFields}.
      */
     public Map<String, List<String>> atomicObjectFields;
@@ -173,7 +176,11 @@ public class SegmentConfig implements Serializable {
                     "creditReportHeader", List.of(
                             "dateOfBirthRequested",
                             "currentNameRequested",
-                            "socialSecurityNumberRequested"))
+                            "socialSecurityNumberRequested"),
+                    // Self-contained records with no slot-like sub-objects of their own —
+                    // fully atomic, taken wholesale from the latest case.
+                    "resultOfInvestigation", List.of(),
+                    "requestor", List.of())
     );
 
     private static final Map<String, Map<String, String>> DEFAULT_MERGE_ITEM_KEY_FIELD = Map.of(

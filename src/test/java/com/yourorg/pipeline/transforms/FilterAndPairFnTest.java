@@ -673,4 +673,65 @@ public class FilterAndPairFnTest {
         PAssert.that(aiAgedOut(routed)).empty();
         pipeline.run().waitUntilFinish();
     }
+
+    /**
+     * Regression test for a bug where the persisted pending row (the group's whole consolidated
+     * state, case1+case2 merged) was folded under its own canonicalCaseId's humanByCase bucket
+     * — colliding with, and silently losing to (via foldPendingHuman's putIfAbsent), a genuine
+     * FRESH re-read of that same case's row whenever both were visible in the same run (e.g.
+     * case1's row re-surfacing via humanLookbackDays long after the group was first merged).
+     * The fix folds the persisted row under a dedicated PENDING_GROUP_KEY bucket instead, so it
+     * can never collide with a real case's bucket, while canonicalCaseId/merged_case_ids are
+     * separately seeded from the persisted row's own case_id column so case identity isn't lost
+     * either.
+     *
+     * <p>This test covers the case-identity bookkeeping (decrypt-independent, so verifiable
+     * here). The deeper risk this bug caused — case2's actual field-level contributions being
+     * silently dropped from the payload used for signature comparison and re-triggering a
+     * spurious comparison — depends on the real cross-case JSON merge, which needs live
+     * Barricade decryption {@code FilterAndPairFnTest} can't exercise (same limitation as
+     * {@code humanContentSignature}'s own decrypt path); verify that against a real/QA
+     * environment.
+     */
+    @Test
+    public void caseReappearingFreshDoesNotLoseOtherCasesFromPendingGroupState() {
+        String aiCreatedAt   = "2026-04-01T08:00:00.000000Z";
+        String ai1Payload    = payloadFor("img011");
+        String mergedPayload = payloadWithMarker("img011", "case1+case2-merged");
+        String case1RawPayload = payloadWithMarker("img011", "case1-raw-resurfaced");
+
+        TableRow ai1Pending = aiPendingRow("img011", "key1", aiCreatedAt,
+                Instant.now().minusSeconds(3600).toString());
+
+        // Persisted group state: already reflects BOTH case1 and case2's contributions.
+        TableRow mergedGroupPending = casePendingRow("img011", "human", "key1",
+                "2026-03-01T10:00:00Z", Instant.now().minusSeconds(7200).toString(),
+                0L, "case1", signature(mergedPayload, ai1Payload), 1L);
+        mergedGroupPending.set("merged_case_ids", "case1;case2");
+
+        // case1's OWN row re-surfaces fresh this run (e.g. humanLookbackDays re-selecting it) —
+        // simulating the exact collision scenario: a fresh row for the SAME case_id the
+        // persisted group state's own case_id column names.
+        TableRow case1Fresh = sourceRowWithPayload("img011", HUMAN_METHOD, "key1",
+                "2026-03-01T10:00:00Z", "case1", case1RawPayload);
+
+        PCollectionTuple routed = runPipeline("img011",
+                List.of(case1Fresh), List.of(mergedGroupPending), List.of(ai1Pending));
+
+        PAssert.that(casePending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("One consolidated group row", 1, list.size());
+            GenericRecord row = list.get(0);
+            assertEquals("canonicalCaseId must still be case1, not lost or reset",
+                    "case1", row.get("case_id").toString());
+            Set<String> mergedCaseIds = Set.of(row.get("merged_case_ids").toString().split(";"));
+            assertEquals("case2's contribution must not be forgotten just because case1's "
+                            + "own row resurfaced fresh this run",
+                    Set.of("case1", "case2"), mergedCaseIds);
+            return null;
+        });
+
+        pipeline.run().waitUntilFinish();
+    }
 }

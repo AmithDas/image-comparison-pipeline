@@ -398,6 +398,37 @@ public class FilterAndPairFnMergeTest {
                 "CASE-1", header.getAsJsonObject("_caseIdByField").get("socialSecurityNumberRequested").getAsString());
     }
 
+    /**
+     * An atomicObjectFields path with an EMPTY slot list (e.g. resultOfInvestigation,
+     * requestor — self-contained records with no slot-like sub-objects of their own) degrades
+     * cleanly: the whole object is taken wholesale from the latest case, one attribution entry
+     * at the parent level, and no {@code _caseIdByField} at all inside the object itself since
+     * there are no slots to carry forward.
+     */
+    @Test
+    public void atomicObjectFieldWithNoSlotsIsTakenWhollyFromLatestCase() {
+        Map<String, Set<String>> resultOfInvestigationAtomic =
+                Map.of("resultOfInvestigation", Set.of());
+        JsonObject existing = stamped(
+                "{\"resultOfInvestigation\":{\"mailingAddress\":{\"city\":\"OLDTOWN\"},"
+                        + "\"type\":\"ResultsOnly\"}}", "CASE-1");
+        JsonObject incoming = stamped(
+                "{\"resultOfInvestigation\":{\"mailingAddress\":{\"city\":\"NEWTOWN\"},"
+                        + "\"type\":\"ResultsOnly\"}}", "CASE-2");
+
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-01T00:00:00.000000Z",
+                incoming, "2026-01-02T00:00:00.000000Z",
+                Set.of(), resultOfInvestigationAtomic, Map.of(), Map.of(), "", "img", "main");
+
+        JsonObject result = merged.getAsJsonObject("resultOfInvestigation");
+        assertEquals("NEWTOWN", result.getAsJsonObject("mailingAddress").get("city").getAsString());
+        assertEquals("CASE-2",
+                merged.getAsJsonObject("_caseIdByField").get("resultOfInvestigation").getAsString());
+        assertFalse("A zero-slot atomic object must carry no _caseIdByField of its own",
+                result.has("_caseIdByField"));
+    }
+
     // ── arrayItemPriorityField (e.g. addresses keyed by addressType) ─────────
 
     private static final Map<String, String> ADDRESS_PRIORITY = Map.of("addresses", "addressRequested");
