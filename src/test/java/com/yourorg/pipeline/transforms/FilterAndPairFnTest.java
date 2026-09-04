@@ -849,4 +849,50 @@ public class FilterAndPairFnTest {
 
         pipeline.run().waitUntilFinish();
     }
+
+    /**
+     * Regression test for the AI-side counterpart of the mergeGroupMeta bug: two colliding
+     * persisted AI-pending rows for the SAME payload (dedupKey) used to be handled by a plain
+     * {@code Map.put}, which silently discarded whichever row's first_seen_at/retry_count lost
+     * the overwrite race, and by adding one {@code aiRows} entry per PHYSICAL row rather than
+     * per distinct payload — so the "always re-pend every AI row" loop would re-emit both
+     * duplicate rows forever, never collapsing them. mergeAiPendingMeta reconciles them: keeps
+     * the EARLIER first_seen_at (when this payload was first genuinely discovered) and the
+     * larger retry_count, and aiRows is now built from the deduped map so only one row survives
+     * per distinct payload.
+     */
+    @Test
+    public void collidingAiPendingRowsAreReconciledNotDuplicated() {
+        String aiPayload = payloadFor("img014");
+        // Both well within MAX_WAIT_DAYS so the row doesn't age out regardless of which
+        // first_seen_at wins — the point here is testing reconciliation, not aging.
+        String olderFirstSeen = Instant.now().minusSeconds(259200).toString(); // 3 days ago
+        String newerFirstSeen = Instant.now().minusSeconds(86400).toString();  // 1 day ago
+
+        TableRow aiRowA = aiPendingRowWithPayload("img014", "key1",
+                "2026-01-01T08:00:00Z", olderFirstSeen, 2L, aiPayload);
+        TableRow aiRowB = aiPendingRowWithPayload("img014", "key1",
+                "2026-01-02T08:00:00Z", newerFirstSeen, 5L, aiPayload);
+
+        PCollectionTuple routed = runPipeline("img014",
+                List.of(), List.of(), List.of(aiRowA, aiRowB));
+
+        PAssert.that(aiPending(routed)).satisfies(records -> {
+            List<GenericRecord> list = new ArrayList<>();
+            records.forEach(list::add);
+            assertEquals("Two colliding rows for the same payload must collapse to one, "
+                            + "not be re-emitted as two duplicates",
+                    1, list.size());
+            GenericRecord row = list.get(0);
+            assertEquals("retry_count must come from the higher of the two colliding rows",
+                    6L, row.get("retry_count"));
+            return null;
+        });
+
+        PAssert.that(matched(routed)).empty();
+        PAssert.that(casePending(routed)).empty();
+        PAssert.that(caseAgedOut(routed)).empty();
+        PAssert.that(aiAgedOut(routed)).empty();
+        pipeline.run().waitUntilFinish();
+    }
 }

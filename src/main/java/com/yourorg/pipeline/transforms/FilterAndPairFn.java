@@ -221,14 +221,23 @@ public class FilterAndPairFn
         }
 
         // ── Fold in the AI replay pool, seeding the running max created_at ──────
+        // Colliding rows (more than one physical AI_PENDING_TAG row for the same payload) are
+        // reconciled via mergeAiPendingMeta — the AI-side counterpart to mergeGroupMeta below.
+        // A plain overwrite (or blindly adding one aiRows entry per physical row) would silently
+        // lose whichever row's first_seen_at/retry_count didn't survive (incorrect aging), and
+        // would re-emit every physical duplicate forever in the "always re-pend" loop below,
+        // never collapsing them — the same class of bug mergeGroupMeta guards against for the
+        // human pending row.
         Map<String, GenericRecord> aiPendingMeta = new HashMap<>();
-        Instant maxAiCreatedAt = null;
         for (TableRow pr : result.getAll(AI_PENDING_TAG)) {
-            GenericRecord p         = toAiPendingRecord(pr);
-            String        createdAt = str(p.get("created_at"));
+            GenericRecord p = toAiPendingRecord(pr);
+            aiPendingMeta.merge(dedupKey(str(p.get("payload"))), p, FilterAndPairFn::mergeAiPendingMeta);
+        }
+        Instant maxAiCreatedAt = null;
+        for (GenericRecord p : aiPendingMeta.values()) {
+            String createdAt = str(p.get("created_at"));
             aiRows.add(newPayloadRow(imageId, str(p.get("key_id")), "ai",
                     str(p.get("payload")), createdAt));
-            aiPendingMeta.put(dedupKey(str(p.get("payload"))), p);
             Instant parsed = parseInstant(createdAt);
             if (parsed != null && (maxAiCreatedAt == null || parsed.isAfter(maxAiCreatedAt))) {
                 maxAiCreatedAt = parsed;
@@ -501,6 +510,47 @@ public class FilterAndPairFn
         Set<String> merged = parseKeys(str(left.get("merged_case_ids")));
         merged.addAll(parseKeys(str(right.get("merged_case_ids"))));
         left.put("merged_case_ids", joinKeys(merged));
+        return left;
+    }
+
+    /**
+     * Reconciles two colliding persisted AI-pending rows for the same payload (same
+     * {@link #dedupKey}) — the AI-side counterpart to {@link #mergeGroupMeta}. A plain
+     * overwrite would silently lose whichever row's {@code first_seen_at}/{@code retry_count}
+     * didn't survive, incorrectly resetting or extending that payload's aging clock depending
+     * on read order; folding every physical row into {@code aiRows} one-for-one (rather than
+     * once per distinct payload after this reconciliation) would also re-emit a duplicate row
+     * forever in the "always re-pend every AI row" loop, never collapsing it.
+     */
+    private static GenericRecord mergeAiPendingMeta(GenericRecord left, GenericRecord right) {
+        String leftFirstSeen  = str(left.get("first_seen_at"));
+        String rightFirstSeen = str(right.get("first_seen_at"));
+        if (rightFirstSeen != null
+                && (leftFirstSeen == null || rightFirstSeen.compareTo(leftFirstSeen) < 0)) {
+            left.put("first_seen_at", rightFirstSeen);
+        }
+
+        String leftRetried  = str(left.get("last_retried_at"));
+        String rightRetried = str(right.get("last_retried_at"));
+        if (rightRetried != null
+                && (leftRetried == null || rightRetried.compareTo(leftRetried) > 0)) {
+            left.put("last_retried_at", rightRetried);
+        }
+
+        left.put("retry_count", Math.max(
+                parseLong(left.get("retry_count")),
+                parseLong(right.get("retry_count"))));
+
+        // created_at is the assigned, monotonically-bumped identity timestamp for this payload
+        // (see AI_TIMESTAMP_BUMP_SECONDS) — keep whichever is earlier, consistent with
+        // first_seen_at reflecting when this payload was originally discovered.
+        String leftCreatedAt  = str(left.get("created_at"));
+        String rightCreatedAt = str(right.get("created_at"));
+        if (rightCreatedAt != null
+                && (leftCreatedAt == null || rightCreatedAt.compareTo(leftCreatedAt) < 0)) {
+            left.put("created_at", rightCreatedAt);
+        }
+
         return left;
     }
 
