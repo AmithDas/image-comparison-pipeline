@@ -1158,7 +1158,39 @@ public class FilterAndPairFn
             // lookback re-reads, but only reachable if the payload is malformed to begin with.
             return dedupKey(str(humanRec.get("payload")));
         }
-        return sha256Hex(json.toString());
+        // Strip provenance bookkeeping (_caseIdByField, _sourceCaseId) before hashing — a
+        // multi-case group's payload is re-merged from scratch every run (the persisted state
+        // combined with fresh re-reads of the same underlying case rows), and that re-merge can
+        // assign DIFFERENT attribution for an identical-content tie (e.g. existingWinsTies
+        // depends on which side happens to land in the "existing" vs "incoming" role, which can
+        // vary with BigQuery's unordered row-read order across runs) even when every actual
+        // submitted field value is unchanged. Since these keys are pure bookkeeping — never
+        // real submitted data — they must never be able to affect "did the content change";
+        // otherwise a purely cosmetic attribution reshuffle looks like a genuine edit and
+        // triggers a spurious comparison, forever, every run, for any group whose re-merge
+        // attribution never happens to stabilize. Stripping them here makes the signature
+        // immune to attribution non-determinism by construction, rather than relying on the
+        // merge itself being perfectly deterministic.
+        JsonObject stripped = json.deepCopy();
+        stripProvenanceRecursively(stripped);
+        return sha256Hex(stripped.toString());
+    }
+
+    /** Package-visible for direct unit testing. */
+    static void stripProvenanceRecursively(JsonObject obj) {
+        obj.remove(CASE_ID_BY_FIELD_KEY);
+        obj.remove(SOURCE_CASE_ID_KEY);
+        for (String key : new ArrayList<>(obj.keySet())) {
+            JsonElement child = obj.get(key);
+            if (child == null) continue;
+            if (child.isJsonObject()) {
+                stripProvenanceRecursively(child.getAsJsonObject());
+            } else if (child.isJsonArray()) {
+                for (JsonElement nested : child.getAsJsonArray()) {
+                    if (nested.isJsonObject()) stripProvenanceRecursively(nested.getAsJsonObject());
+                }
+            }
+        }
     }
 
     private static String sha256Hex(String s) {

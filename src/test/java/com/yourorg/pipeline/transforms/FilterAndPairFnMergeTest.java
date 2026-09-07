@@ -551,4 +551,44 @@ public class FilterAndPairFnMergeTest {
 
         assertEquals(2, merged.getAsJsonArray("addresses").size());
     }
+
+    // ── stripProvenanceRecursively (humanContentSignature's stability fix) ────
+
+    /**
+     * Regression test for a production incident: a multi-case group's payload is re-merged
+     * from scratch every run (persisted state combined with fresh re-reads of the same
+     * underlying case rows), and that re-merge can assign DIFFERENT _caseIdByField/
+     * _sourceCaseId attribution for an identical-content tie between runs (e.g.
+     * existingWinsTies depends on which side lands in the "existing" vs "incoming" role, which
+     * can vary with BigQuery's unordered row-read order) even when every actual submitted field
+     * value is unchanged. Observed in production as a group whose comparison_version/
+     * ai_iteration climbed on every single run for days — every extractable field value was
+     * verified identical between consecutive iterations, yet the signature kept changing.
+     * stripProvenanceRecursively must remove _caseIdByField/_sourceCaseId at every nesting
+     * level so two payloads differing ONLY in this bookkeeping hash identically.
+     */
+    @Test
+    public void stripProvenanceRecursivelyRemovesAttributionAtEveryNestingLevel() {
+        JsonObject withAttributionA = obj(
+                "{\"firstName\":\"John\","
+                        + "\"_caseIdByField\":{\"firstName\":\"CASE-1\"},"
+                        + "\"address\":{\"city\":\"Austin\",\"_caseIdByField\":{\"city\":\"CASE-1\"}},"
+                        + "\"documentProofs\":[{\"document\":\"passport\",\"_sourceCaseId\":\"CASE-1\"}]}");
+        JsonObject withAttributionB = obj(
+                "{\"firstName\":\"John\","
+                        + "\"_caseIdByField\":{\"firstName\":\"CASE-2\"},"
+                        + "\"address\":{\"city\":\"Austin\",\"_caseIdByField\":{\"city\":\"CASE-2\"}},"
+                        + "\"documentProofs\":[{\"document\":\"passport\",\"_sourceCaseId\":\"CASE-2\"}]}");
+
+        FilterAndPairFn.stripProvenanceRecursively(withAttributionA);
+        FilterAndPairFn.stripProvenanceRecursively(withAttributionB);
+
+        assertEquals("Two payloads differing ONLY in attribution bookkeeping must be "
+                        + "byte-identical once stripped, so their signatures match",
+                withAttributionA, withAttributionB);
+        assertFalse(withAttributionA.has("_caseIdByField"));
+        assertFalse(withAttributionA.getAsJsonObject("address").has("_caseIdByField"));
+        assertFalse(withAttributionA.getAsJsonArray("documentProofs")
+                .get(0).getAsJsonObject().has("_sourceCaseId"));
+    }
 }
