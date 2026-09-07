@@ -591,4 +591,42 @@ public class FilterAndPairFnMergeTest {
         assertFalse(withAttributionA.getAsJsonArray("documentProofs")
                 .get(0).getAsJsonObject().has("_sourceCaseId"));
     }
+
+    /**
+     * Regression test for the second, independent source of the same production incident:
+     * mergeJsonObjects/mergeArrayItems build their output by iterating LinkedHashSets seeded
+     * from "existing" then "incoming" keys, and which side is "existing" vs "incoming" traces
+     * back to the order result.getAll(SOURCE_TAG) returns rows — a plain SELECT with no
+     * ORDER BY, so BigQuery does not guarantee the same row order across separate query
+     * executions. Two payloads with the exact same fields/values but different OBJECT KEY
+     * insertion order must canonicalize to the identical structure, so their signatures match
+     * regardless of which order a given merge round happened to produce them in.
+     */
+    @Test
+    public void canonicalizeIsIndifferentToObjectKeyOrder() {
+        JsonObject orderA = obj("{\"firstName\":\"John\",\"lastName\":\"Doe\",\"age\":30}");
+        JsonObject orderB = obj("{\"age\":30,\"lastName\":\"Doe\",\"firstName\":\"John\"}");
+
+        assertEquals(FilterAndPairFn.canonicalize(orderA), FilterAndPairFn.canonicalize(orderB));
+    }
+
+    /** Same as above, but for array element order rather than object key order. */
+    @Test
+    public void canonicalizeIsIndifferentToArrayElementOrder() {
+        JsonObject orderA = obj(
+                "{\"tradelines\":[{\"accountNumber\":\"111\"},{\"accountNumber\":\"222\"}]}");
+        JsonObject orderB = obj(
+                "{\"tradelines\":[{\"accountNumber\":\"222\"},{\"accountNumber\":\"111\"}]}");
+
+        assertEquals(FilterAndPairFn.canonicalize(orderA), FilterAndPairFn.canonicalize(orderB));
+    }
+
+    /** Canonicalize must still distinguish payloads that are genuinely different. */
+    @Test
+    public void canonicalizeStillDistinguishesGenuinelyDifferentContent() {
+        JsonObject a = obj("{\"firstName\":\"John\"}");
+        JsonObject b = obj("{\"firstName\":\"Johnny\"}");
+
+        assertFalse(FilterAndPairFn.canonicalize(a).equals(FilterAndPairFn.canonicalize(b)));
+    }
 }

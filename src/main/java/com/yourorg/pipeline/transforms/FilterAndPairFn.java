@@ -1161,19 +1161,30 @@ public class FilterAndPairFn
         // Strip provenance bookkeeping (_caseIdByField, _sourceCaseId) before hashing — a
         // multi-case group's payload is re-merged from scratch every run (the persisted state
         // combined with fresh re-reads of the same underlying case rows), and that re-merge can
-        // assign DIFFERENT attribution for an identical-content tie (e.g. existingWinsTies
-        // depends on which side happens to land in the "existing" vs "incoming" role, which can
-        // vary with BigQuery's unordered row-read order across runs) even when every actual
-        // submitted field value is unchanged. Since these keys are pure bookkeeping — never
-        // real submitted data — they must never be able to affect "did the content change";
-        // otherwise a purely cosmetic attribution reshuffle looks like a genuine edit and
-        // triggers a spurious comparison, forever, every run, for any group whose re-merge
-        // attribution never happens to stabilize. Stripping them here makes the signature
-        // immune to attribution non-determinism by construction, rather than relying on the
-        // merge itself being perfectly deterministic.
+        // assign DIFFERENT attribution for an identical-content tie even when every actual
+        // submitted field value is unchanged. These keys are pure bookkeeping — never real
+        // submitted data — so they must never be able to affect "did the content change."
+        //
+        // Canonicalize what's left (sort every object's keys, sort every array's elements by
+        // their own canonical form) before hashing — NOT just cosmetic, this fixes a second,
+        // independent source of non-determinism: mergeJsonObjects/mergeArrayItems build their
+        // output by iterating LinkedHashSets seeded from "existing" then "incoming" keys, and
+        // which side is "existing" vs "incoming" traces back to the order
+        // result.getAll(SOURCE_TAG) returns rows — a plain `SELECT * FROM ... WHERE ...` with
+        // no ORDER BY, so BigQuery does not guarantee the same row order across separate query
+        // executions. That means the SET of fields/items and their values can be 100% identical
+        // between two runs while their INSERTION order differs purely by chance — and
+        // JsonObject/JsonArray.toString() serializes in insertion order, so an object-key or
+        // array-item reshuffle with zero actual content change still produces a different
+        // string, hence a different hash. Observed in production: a multi-case group's
+        // comparison_version climbed on every single run for days with every extractable field
+        // value confirmed identical between consecutive iterations — stripping provenance alone
+        // did not stop it, confirming order (not just attribution) was also unstable.
+        // Canonicalizing makes the signature depend only on the actual set of fields/values,
+        // never on which transient order the merge happened to produce them in.
         JsonObject stripped = json.deepCopy();
         stripProvenanceRecursively(stripped);
-        return sha256Hex(stripped.toString());
+        return sha256Hex(canonicalize(stripped).toString());
     }
 
     /** Package-visible for direct unit testing. */
@@ -1190,6 +1201,34 @@ public class FilterAndPairFn
                     if (nested.isJsonObject()) stripProvenanceRecursively(nested.getAsJsonObject());
                 }
             }
+        }
+    }
+
+    /**
+     * Returns a deep copy of {@code el} with every object's keys sorted alphabetically and
+     * every array's elements sorted by their own canonical string form — so the result depends
+     * only on the actual set of fields/values present, never on the transient insertion order
+     * a particular merge round happened to produce. Package-visible for direct unit testing.
+     */
+    static JsonElement canonicalize(JsonElement el) {
+        if (el.isJsonObject()) {
+            JsonObject obj = el.getAsJsonObject();
+            List<String> keys = new ArrayList<>(obj.keySet());
+            Collections.sort(keys);
+            JsonObject sorted = new JsonObject();
+            for (String key : keys) {
+                sorted.add(key, canonicalize(obj.get(key)));
+            }
+            return sorted;
+        } else if (el.isJsonArray()) {
+            List<JsonElement> items = new ArrayList<>();
+            for (JsonElement item : el.getAsJsonArray()) items.add(canonicalize(item));
+            items.sort(Comparator.comparing(JsonElement::toString));
+            JsonArray sorted = new JsonArray();
+            items.forEach(sorted::add);
+            return sorted;
+        } else {
+            return el;
         }
     }
 
