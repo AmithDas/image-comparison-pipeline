@@ -954,6 +954,20 @@ public class FilterAndPairFn
      * </ul>
      * Each slot's own contents are copied wholesale too (not merged internally) — it's
      * treated as one atomic value, same spirit as the object it lives in.
+     *
+     * <p><b>Carrying forward a slot that was ITSELF already tagged in an earlier merge
+     * round</b> (e.g. a third case arrives in a later run, forcing a slot from the first
+     * round's merge to be carried forward again): the loser side here may not be a fresh,
+     * single-case object at all — it can be the OUTPUT of an earlier {@code
+     * mergeAtomicWithSlots} call, which embeds its own per-slot {@code _caseIdByField}
+     * overrides (for whichever slots IT had carried forward from an even older case) inside
+     * itself. The object-level {@code loserCase} only reflects who won THAT prior round as a
+     * whole, not any individual slot's own specific attribution — so a slot must first check
+     * whether the loser object already records a more specific tag for itself, and only fall
+     * back to the blanket object-level {@code loserCase} when it doesn't (a genuinely fresh,
+     * never-merged case). Skipping this would silently overwrite an already-correct,
+     * more specific slot attribution with the wrong, less specific object-level one every time
+     * that slot has to be carried forward again.
      */
     private static JsonObject mergeAtomicWithSlots(JsonObject existingObj, JsonObject existingByFieldParent,
                                                      JsonObject incomingObj, JsonObject incomingByFieldParent,
@@ -962,6 +976,8 @@ public class FilterAndPairFn
         JsonObject winnerObj = existingWinsTies ? existingObj : incomingObj;
         JsonObject loserObj  = existingWinsTies ? incomingObj : existingObj;
         String loserCase  = attributionOf(existingWinsTies ? incomingByFieldParent : existingByFieldParent, parentKey);
+        JsonObject loserOwnByField = loserObj.has(CASE_ID_BY_FIELD_KEY)
+                ? loserObj.getAsJsonObject(CASE_ID_BY_FIELD_KEY) : new JsonObject();
 
         JsonObject merged = new JsonObject();
         JsonObject caseIdByField = new JsonObject();
@@ -976,7 +992,9 @@ public class FilterAndPairFn
                 merged.add(slotKey, winnerObj.get(slotKey));
             } else if (loserObj.has(slotKey)) {
                 merged.add(slotKey, loserObj.get(slotKey));
-                if (loserCase != null && !loserCase.isEmpty()) caseIdByField.addProperty(slotKey, loserCase);
+                String slotCase = attributionOf(loserOwnByField, slotKey);
+                if (slotCase == null || slotCase.isEmpty()) slotCase = loserCase;
+                if (slotCase != null && !slotCase.isEmpty()) caseIdByField.addProperty(slotKey, slotCase);
             }
         }
 

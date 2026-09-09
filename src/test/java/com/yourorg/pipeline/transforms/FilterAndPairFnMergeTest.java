@@ -480,6 +480,106 @@ public class FilterAndPairFnMergeTest {
                 result.has("_caseIdByField"));
     }
 
+    /**
+     * Regression reproduction: production observed a multi-case group where the LATER case's
+     * own slot (its own field, needing no attribution) and the EARLIER case's carried-forward
+     * slot (a DIFFERENT slot the latest case never submitted) both ended up attributed to the
+     * same case in the final comparison, even though they came from two different cases. This
+     * mirrors {@link #atomicObjectFieldSlotOnlyInEarlierCaseIsCarriedForward} but exercises TWO
+     * distinct slots simultaneously — one the winner has (dateOfBirthRequested), one only the
+     * loser has (currentNameRequested) — to confirm the slot loop resolves each independently
+     * rather than one call's outcome leaking into the other.
+     */
+    @Test
+    public void winnerAndLoserEachContributingADifferentSlotAreAttributedToTheirOwnCase() {
+        JsonObject existing = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"dateOfBirthRequested\":{\"disputeCodes\":[{\"code\":\"DOB\"}]}}}",
+                "CASE-31");
+        JsonObject incoming = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"NAME\"}]}}}",
+                "CASE-32");
+
+        // CASE-31 is later (winner); CASE-32 is earlier (loser) — matches production exactly.
+        JsonObject merged = FilterAndPairFn.mergeJsonObjects(
+                existing, "2026-01-02T00:00:00.000000Z",
+                incoming, "2026-01-01T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, Map.of(), Map.of(), "", "img", "main");
+
+        JsonObject header = merged.getAsJsonObject("creditReportHeader");
+        assertEquals("Both slots must survive the merge",
+                "DOB", header.getAsJsonObject("dateOfBirthRequested")
+                        .getAsJsonArray("disputeCodes").get(0).getAsJsonObject().get("code").getAsString());
+        assertEquals("Both slots must survive the merge",
+                "NAME", header.getAsJsonObject("currentNameRequested")
+                        .getAsJsonArray("disputeCodes").get(0).getAsJsonObject().get("code").getAsString());
+
+        assertEquals("Object-level entry must point to the winner (CASE-31)",
+                "CASE-31", merged.getAsJsonObject("_caseIdByField").get("creditReportHeader").getAsString());
+        assertFalse("The winner's own slot (dateOfBirthRequested) needs no explicit override",
+                header.has("_caseIdByField")
+                        && header.getAsJsonObject("_caseIdByField").has("dateOfBirthRequested"));
+        assertEquals("The loser's carried-forward slot (currentNameRequested) must be explicitly "
+                        + "attributed to CASE-32, not fall back to the object-level CASE-31 entry",
+                "CASE-32", header.getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+    }
+
+    /**
+     * Regression probe: a THIRD case arriving in a later, separate merge round, contributing
+     * a new slot ({@code socialSecurityNumberRequested}), forces the two slots from the FIRST
+     * round ({@code dateOfBirthRequested} from CASE-31, {@code currentNameRequested} from
+     * CASE-32) to be carried forward AGAIN as loser-side content. {@code mergeAtomicWithSlots}
+     * derives the tag for every carried-forward slot in one call from a single object-level
+     * {@code loserCase} (the OTHER side's {@code creditReportHeader} -> case entry) rather than
+     * each slot's own already-recorded inner tag — so if the loser side here is the ROUND-1
+     * MERGED result (whose object-level entry now says "CASE-31", the round-1 winner, not
+     * CASE-32), the currentNameRequested slot's already-correct CASE-32 attribution could be
+     * silently overwritten with CASE-31 on this second round.
+     */
+    @Test
+    public void thirdCaseInALaterRoundMustNotCorruptAnEarlierRoundsSlotAttribution() {
+        // Round 1: CASE-31 (later) contributes dateOfBirthRequested, CASE-32 (earlier)
+        // contributes currentNameRequested — same as the production scenario already verified.
+        JsonObject case31 = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"dateOfBirthRequested\":{\"disputeCodes\":[{\"code\":\"DOB\"}]}}}", "CASE-31");
+        JsonObject case32 = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"912\"}]}}}", "CASE-32");
+        JsonObject roundOneMerged = FilterAndPairFn.mergeJsonObjects(
+                case31, "2026-01-02T00:00:00.000000Z",
+                case32, "2026-01-01T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, Map.of(), Map.of(), "", "img", "main");
+
+        JsonObject roundOneHeader = roundOneMerged.getAsJsonObject("creditReportHeader");
+        assertEquals("Sanity check: round 1 must already have currentNameRequested tagged CASE-32",
+                "CASE-32",
+                roundOneHeader.getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+
+        // Round 2: CASE-33 arrives LATER than CASE-31, contributing socialSecurityNumberRequested
+        // — a slot neither prior case had. CASE-33 becomes the new object-level winner.
+        JsonObject case33 = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"socialSecurityNumberRequested\":{\"disputeCodes\":[{\"code\":\"SSN\"}]}}}",
+                "CASE-33");
+
+        JsonObject roundTwoMerged = FilterAndPairFn.mergeJsonObjects(
+                roundOneMerged, "2026-01-02T00:00:00.000000Z",
+                case33, "2026-01-03T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, Map.of(), Map.of(), "", "img", "main");
+
+        JsonObject header = roundTwoMerged.getAsJsonObject("creditReportHeader");
+        assertEquals("CASE-33", roundTwoMerged.getAsJsonObject("_caseIdByField").get("creditReportHeader").getAsString());
+
+        assertEquals("dateOfBirthRequested must still resolve to CASE-31 after round 2",
+                "CASE-31", header.getAsJsonObject("_caseIdByField").get("dateOfBirthRequested").getAsString());
+        assertEquals("currentNameRequested must STILL resolve to CASE-32 after round 2 — "
+                        + "not be corrupted to CASE-31 (round 1's object-level winner) just because "
+                        + "it had to be carried forward a second time",
+                "CASE-32", header.getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+    }
+
     // ── arrayItemPriorityField (e.g. addresses keyed by addressType) ─────────
 
     private static final Map<String, String> ADDRESS_PRIORITY = Map.of("addresses", "addressRequested");

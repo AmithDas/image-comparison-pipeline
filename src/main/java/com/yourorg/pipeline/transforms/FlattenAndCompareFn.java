@@ -439,8 +439,10 @@ public class FlattenAndCompareFn
      * {@code caseIdByPath} under its fully-qualified dot-notation path (parent path + field
      * name) so {@link #resolveCaseId} can look it up the same way {@link JsonFieldExtractor}
      * names flattened fields. Returns {@code payload} unchanged if it isn't valid JSON.
+     *
+     * <p>Package-visible for direct unit testing.
      */
-    private static String extractAndStripCaseIdByField(String payload, Map<String, String> caseIdByPath) {
+    static String extractAndStripCaseIdByField(String payload, Map<String, String> caseIdByPath) {
         try {
             JsonElement parsed = JsonParser.parseString(payload);
             if (!parsed.isJsonObject()) return payload;
@@ -481,8 +483,10 @@ public class FlattenAndCompareFn
      * sibling field of each merged array item, sharing that item's matchKey. Pulls those
      * entries out into a {@code matchKey -> case_id} lookup and removes them from
      * {@code humanFields} so they're never treated as a comparable field.
+     *
+     * <p>Package-visible for direct unit testing.
      */
-    private static Map<String, String> extractAndStripSourceCaseId(
+    static Map<String, String> extractAndStripSourceCaseId(
             Map<String, List<FieldValue>> humanFields) {
         Map<String, String> caseIdByMatchKey = new HashMap<>();
         List<String> toRemove = new ArrayList<>();
