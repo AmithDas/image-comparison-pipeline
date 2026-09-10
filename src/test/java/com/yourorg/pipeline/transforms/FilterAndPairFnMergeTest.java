@@ -1,5 +1,6 @@
 package com.yourorg.pipeline.transforms;
 
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.junit.Test;
@@ -578,6 +579,98 @@ public class FilterAndPairFnMergeTest {
                         + "not be corrupted to CASE-31 (round 1's object-level winner) just because "
                         + "it had to be carried forward a second time",
                 "CASE-32", header.getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+    }
+
+    /**
+     * Regression test: {@code FilterAndPairFn#mergeAcrossCases} must set the MERGED record's
+     * own {@code created_at} to the LATEST of its two contributors' timestamps (via {@code
+     * maxCreatedAt}) — this value feeds {@code existingWinsTies} in the NEXT merge round (via
+     * {@code humanBySubType}'s sequential fold), so it must always reflect the group's true
+     * most-recent contributor. Before the fix, this used the EARLIEST contributor instead,
+     * which let a case that is chronologically earlier than the group's true latest
+     * contributor still "win" a later round's non-slot wholesale content, simply because it
+     * was later than the group's understated (earliest-of-two) reported timestamp. This test
+     * simulates {@code mergeAcrossCases}'s bookkeeping directly against {@code
+     * mergeJsonObjects} (bypassing encryption, same limitation as every other test in this
+     * file) to confirm that no longer happens.
+     */
+    @Test
+    public void groupCreatedAtTracksTheLatestContributorSoAnEarlierCaseCannotWinALaterRound() {
+        // Round 1: CASE-31 (2026-01-02, later) beats CASE-32 (2026-01-01, earlier) — CASE-31
+        // wins non-slot wholesale content (customerNumber = "FROM31").
+        JsonObject case31 = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"FROM31\"}}", "CASE-31");
+        JsonObject case32 = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"FROM32\"}}", "CASE-32");
+        JsonObject roundOneMerged = FilterAndPairFn.mergeJsonObjects(
+                case31, "2026-01-02T00:00:00.000000Z",
+                case32, "2026-01-01T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, Map.of(), Map.of(), "", "img", "main");
+        assertEquals("Sanity check: CASE-31 must win round 1's wholesale content",
+                "FROM31",
+                roundOneMerged.getAsJsonObject("creditReportHeader").get("customerNumber").getAsString());
+
+        // Mirrors the FIXED FilterAndPairFn.mergeAcrossCases: the merged record's own
+        // created_at is now the LATEST of the two contributors — CASE-31's timestamp.
+        String roundOneGroupCreatedAt = "2026-01-02T00:00:00.000000Z";
+
+        // Round 2: CASE-33 arrives with a timestamp BETWEEN CASE-32 and CASE-31 — chronologically
+        // EARLIER than the group's true latest contributor (CASE-31).
+        JsonObject case33 = stamped(
+                "{\"creditReportHeader\":{\"customerNumber\":\"FROM33\"}}", "CASE-33");
+        JsonObject roundTwoMerged = FilterAndPairFn.mergeJsonObjects(
+                roundOneMerged, roundOneGroupCreatedAt,
+                case33, "2026-01-01T12:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, Map.of(), Map.of(), "", "img", "main");
+
+        assertEquals("CASE-31 must remain the wholesale-content winner — CASE-33 is "
+                        + "chronologically earlier and must not win just because the group's "
+                        + "reported created_at used to understate the true latest contributor",
+                "FROM31",
+                roundTwoMerged.getAsJsonObject("creditReportHeader").get("customerNumber").getAsString());
+    }
+
+    /**
+     * Array-side analog of the atomicObjectFields probe above: a THIRD case arrives in a later,
+     * separate merge round, contributing a brand-new address slot ("Former2"). Confirms the
+     * array-merge path does NOT share the atomicObjectFields bug — items from round 1
+     * ("Current" from CASE-1, "Former1" from CASE-2) must keep their own {@code _sourceCaseId}
+     * after round 2, not get relabeled with whichever case contributed round 2's item.
+     */
+    @Test
+    public void thirdCaseInALaterRoundMustNotCorruptEarlierArrayItemAttribution() {
+        JsonObject case1 = stamped(
+                "{\"addresses\":[{\"addressType\":\"Current\",\"streetNumber\":\"100\"}]}", "CASE-1");
+        JsonObject case2 = stamped(
+                "{\"addresses\":[{\"addressType\":\"Former1\",\"streetNumber\":\"200\"}]}", "CASE-2");
+
+        JsonObject roundOneMerged = FilterAndPairFn.mergeJsonObjects(
+                case1, "2026-01-02T00:00:00.000000Z",
+                case2, "2026-01-01T00:00:00.000000Z",
+                Set.of("addresses"), Map.of(), Map.of(),
+                Map.of("addresses", "addressType"), "", "img", "main");
+
+        JsonObject case3 = stamped(
+                "{\"addresses\":[{\"addressType\":\"Former2\",\"streetNumber\":\"300\"}]}", "CASE-3");
+
+        JsonObject roundTwoMerged = FilterAndPairFn.mergeJsonObjects(
+                roundOneMerged, "2026-01-02T00:00:00.000000Z",
+                case3, "2026-01-03T00:00:00.000000Z",
+                Set.of("addresses"), Map.of(), Map.of(),
+                Map.of("addresses", "addressType"), "", "img", "main");
+
+        Map<String, String> caseByAddressType = new java.util.HashMap<>();
+        for (JsonElement el : roundTwoMerged.getAsJsonArray("addresses")) {
+            JsonObject item = el.getAsJsonObject();
+            caseByAddressType.put(item.get("addressType").getAsString(), item.get("_sourceCaseId").getAsString());
+        }
+
+        assertEquals("Current (round 1, CASE-1) must keep its own attribution after round 2",
+                "CASE-1", caseByAddressType.get("Current"));
+        assertEquals("Former1 (round 1, CASE-2) must keep its own attribution after round 2",
+                "CASE-2", caseByAddressType.get("Former1"));
+        assertEquals("Former2 (round 2, CASE-3) must be attributed to CASE-3",
+                "CASE-3", caseByAddressType.get("Former2"));
     }
 
     // ── arrayItemPriorityField (e.g. addresses keyed by addressType) ─────────

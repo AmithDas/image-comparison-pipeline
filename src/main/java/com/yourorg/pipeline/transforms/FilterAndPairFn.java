@@ -728,14 +728,19 @@ public class FilterAndPairFn
                 arrayItemPriorityField, mergeItemKeyField, "", imageId, segment);
 
         String reEncrypted = BarricadeEncryptionUtil.encrypt(keyId, merged.toString());
-        String earliestCreatedAt = minCreatedAt(existingCreatedAt, incomingCreatedAt);
+        // The merged record's own created_at must track the LATEST contributor, not the
+        // earliest — this value feeds existingWinsTies in the NEXT merge round (via
+        // humanBySubType's sequential fold), so reporting anything other than the true latest
+        // contributor lets an older case incorrectly "win" a later round's non-slot wholesale
+        // content just for being later than an understated group timestamp.
+        String latestCreatedAt = maxCreatedAt(existingCreatedAt, incomingCreatedAt);
 
         GenericRecord result = new GenericData.Record(payloadSchema);
         result.put("image_id",     imageId);
         result.put("key_id",       keyId);
         result.put("payload_type", "human");
         result.put("payload",      reEncrypted);
-        result.put("created_at",   earliestCreatedAt);
+        result.put("created_at",   latestCreatedAt);
         return result;
     }
 
@@ -1153,10 +1158,10 @@ public class FilterAndPairFn
         }
     }
 
-    private static String minCreatedAt(String a, String b) {
+    private static String maxCreatedAt(String a, String b) {
         if (a == null) return b;
         if (b == null) return a;
-        return a.compareTo(b) <= 0 ? a : b;
+        return a.compareTo(b) >= 0 ? a : b;
     }
 
     /**
