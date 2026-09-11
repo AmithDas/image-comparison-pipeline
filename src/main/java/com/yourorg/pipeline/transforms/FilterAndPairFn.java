@@ -962,17 +962,23 @@ public class FilterAndPairFn
      *
      * <p><b>Carrying forward a slot that was ITSELF already tagged in an earlier merge
      * round</b> (e.g. a third case arrives in a later run, forcing a slot from the first
-     * round's merge to be carried forward again): the loser side here may not be a fresh,
+     * round's merge to be carried forward again): EITHER side here may not be a fresh,
      * single-case object at all — it can be the OUTPUT of an earlier {@code
      * mergeAtomicWithSlots} call, which embeds its own per-slot {@code _caseIdByField}
      * overrides (for whichever slots IT had carried forward from an even older case) inside
-     * itself. The object-level {@code loserCase} only reflects who won THAT prior round as a
-     * whole, not any individual slot's own specific attribution — so a slot must first check
-     * whether the loser object already records a more specific tag for itself, and only fall
-     * back to the blanket object-level {@code loserCase} when it doesn't (a genuinely fresh,
-     * never-merged case). Skipping this would silently overwrite an already-correct,
-     * more specific slot attribution with the wrong, less specific object-level one every time
-     * that slot has to be carried forward again.
+     * itself. This applies on the WINNER side too, not just the loser: a slot the winner
+     * "has" isn't necessarily the winner's own untouched contribution — it may itself be on
+     * loan from an earlier round's loser (a case whose {@code humanLookbackDays} re-read keeps
+     * making it a fresh contributor every run, forcing repeated self-merges that can leave an
+     * already-merged composite as the new "winner"). The object-level {@code winnerCase}/
+     * {@code loserCase} only reflect who won THIS round as a whole, not any individual slot's
+     * own specific attribution — so a slot must first check whether ITS side already records a
+     * more specific tag for itself, and only fall back to the blanket object-level default
+     * when it doesn't (a genuinely fresh, never-merged case, or a slot that really is that
+     * side's own content). Skipping this would silently overwrite an already-correct, more
+     * specific slot attribution with the wrong, less specific object-level one every time that
+     * slot has to be carried forward again — on the winner side, "no tag" and "the wrong
+     * inherited tag never gets set" both look identical unless this is checked explicitly.
      */
     private static JsonObject mergeAtomicWithSlots(JsonObject existingObj, JsonObject existingByFieldParent,
                                                      JsonObject incomingObj, JsonObject incomingByFieldParent,
@@ -981,6 +987,8 @@ public class FilterAndPairFn
         JsonObject winnerObj = existingWinsTies ? existingObj : incomingObj;
         JsonObject loserObj  = existingWinsTies ? incomingObj : existingObj;
         String loserCase  = attributionOf(existingWinsTies ? incomingByFieldParent : existingByFieldParent, parentKey);
+        JsonObject winnerOwnByField = winnerObj.has(CASE_ID_BY_FIELD_KEY)
+                ? winnerObj.getAsJsonObject(CASE_ID_BY_FIELD_KEY) : new JsonObject();
         JsonObject loserOwnByField = loserObj.has(CASE_ID_BY_FIELD_KEY)
                 ? loserObj.getAsJsonObject(CASE_ID_BY_FIELD_KEY) : new JsonObject();
 
@@ -995,6 +1003,8 @@ public class FilterAndPairFn
         for (String slotKey : slotKeys) {
             if (winnerObj.has(slotKey)) {
                 merged.add(slotKey, winnerObj.get(slotKey));
+                String slotCase = attributionOf(winnerOwnByField, slotKey);
+                if (slotCase != null && !slotCase.isEmpty()) caseIdByField.addProperty(slotKey, slotCase);
             } else if (loserObj.has(slotKey)) {
                 merged.add(slotKey, loserObj.get(slotKey));
                 String slotCase = attributionOf(loserOwnByField, slotKey);

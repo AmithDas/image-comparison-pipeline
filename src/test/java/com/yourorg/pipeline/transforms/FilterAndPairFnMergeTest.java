@@ -34,12 +34,27 @@ public class FilterAndPairFnMergeTest {
 
     /**
      * A stamped record — every field of {@code json}, recursively at every nesting level,
-     * attributed to {@code caseId}. Mirrors exactly what
-     * {@link FilterAndPairFn#stampCaseIdByField} does at ingestion in production.
+     * attributed to {@code caseId}. Mirrors {@link FilterAndPairFn#stampCaseIdByField} for
+     * tests with no {@code atomicObjectFields} path in play — for those, use {@link
+     * #stampedWithAtomicPaths} instead, since this overload passes no {@code atomicPaths} and
+     * so (unlike production) recurses into every level, including inside atomic-object slots.
      */
     private static JsonObject stamped(String json, String caseId) {
         JsonObject o = obj(json);
         FilterAndPairFn.stampObjectRecursively(o, caseId);
+        return o;
+    }
+
+    /**
+     * Production-faithful stamping for tests involving {@code atomicObjectFields} paths (e.g.
+     * {@code creditReportHeader}) — matches exactly what {@link
+     * FilterAndPairFn#stampCaseIdByField} does at ingestion, stopping recursion at each given
+     * atomic path so no spurious inner {@code _caseIdByField} gets created inside a slot's own
+     * content (which the plain {@link #stamped} above does, since it passes no atomicPaths).
+     */
+    private static JsonObject stampedWithAtomicPaths(String json, String caseId, Set<String> atomicPaths) {
+        JsonObject o = obj(json);
+        FilterAndPairFn.stampObjectRecursively(o, caseId, "", atomicPaths);
         return o;
     }
 
@@ -402,12 +417,14 @@ public class FilterAndPairFnMergeTest {
     /** A slot present in the LATEST case wins outright — its own version, not blended with the earlier one. */
     @Test
     public void atomicObjectFieldSlotPresentInLatestCaseWinsOutright() {
-        JsonObject existing = stamped(
+        JsonObject existing = stampedWithAtomicPaths(
                 "{\"creditReportHeader\":{\"customerNumber\":\"X\","
-                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"OLD\"}]}}}", "CASE-1");
-        JsonObject incoming = stamped(
+                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"OLD\"}]}}}", "CASE-1",
+                CREDIT_REPORT_HEADER_ATOMIC.keySet());
+        JsonObject incoming = stampedWithAtomicPaths(
                 "{\"creditReportHeader\":{\"customerNumber\":\"X\","
-                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"NEW\"}]}}}", "CASE-2");
+                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"NEW\"}]}}}", "CASE-2",
+                CREDIT_REPORT_HEADER_ATOMIC.keySet());
 
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
                 existing, "2026-01-01T00:00:00.000000Z",
@@ -493,14 +510,14 @@ public class FilterAndPairFnMergeTest {
      */
     @Test
     public void winnerAndLoserEachContributingADifferentSlotAreAttributedToTheirOwnCase() {
-        JsonObject existing = stamped(
+        JsonObject existing = stampedWithAtomicPaths(
                 "{\"creditReportHeader\":{\"customerNumber\":\"X\","
                         + "\"dateOfBirthRequested\":{\"disputeCodes\":[{\"code\":\"DOB\"}]}}}",
-                "CASE-31");
-        JsonObject incoming = stamped(
+                "CASE-31", CREDIT_REPORT_HEADER_ATOMIC.keySet());
+        JsonObject incoming = stampedWithAtomicPaths(
                 "{\"creditReportHeader\":{\"customerNumber\":\"X\","
                         + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"NAME\"}]}}}",
-                "CASE-32");
+                "CASE-32", CREDIT_REPORT_HEADER_ATOMIC.keySet());
 
         // CASE-31 is later (winner); CASE-32 is earlier (loser) — matches production exactly.
         JsonObject merged = FilterAndPairFn.mergeJsonObjects(
@@ -579,6 +596,73 @@ public class FilterAndPairFnMergeTest {
                         + "not be corrupted to CASE-31 (round 1's object-level winner) just because "
                         + "it had to be carried forward a second time",
                 "CASE-32", header.getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+    }
+
+    /**
+     * Regression probe for the WINNER-side counterpart of the earlier loser-side fix: an
+     * already-merged composite that carries its own inner {@code _caseIdByField} (e.g.
+     * {@code roundOneMerged} from the test above, where CASE-31 won round 1 but CASE-32's
+     * {@code currentNameRequested} slot was correctly carried forward and tagged) can itself
+     * REMAIN the object-level winner of a LATER round against a third, older case — this
+     * happens in production whenever a long {@code humanLookbackDays} window keeps re-reading
+     * an older case fresh every run, forcing repeated self-merges. Before this fix,
+     * {@code mergeAtomicWithSlots} only checked the LOSER side for a slot's own more specific
+     * tag; the winner-side copy (`winnerObj.has(slotKey)`) blindly assumed "winner has it, no
+     * tag needed" — silently discarding {@code currentNameRequested}'s already-correct
+     * CASE-32 tag the moment the composite that carries it wins yet another round.
+     */
+    @Test
+    public void winnerSideCompositeMustNotLoseASlotsTagItAlreadyCarriedFromAnEarlierRound() {
+        // Production-faithful stamping (real atomicPaths, matching stampCaseIdByField) — the
+        // plain stamped() helper over-recurses into creditReportHeader's own children, which
+        // would add noise not present in real data for this specific test.
+        Set<String> atomicPaths = Set.of("creditReportHeader");
+        JsonObject case31 = JsonParser.parseString(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"dateOfBirthRequested\":{\"disputeCodes\":[{\"code\":\"DOB\"}]}}}").getAsJsonObject();
+        FilterAndPairFn.stampObjectRecursively(case31, "CASE-31", "", atomicPaths);
+        JsonObject case32 = JsonParser.parseString(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"currentNameRequested\":{\"disputeCodes\":[{\"code\":\"912\"}]}}}").getAsJsonObject();
+        FilterAndPairFn.stampObjectRecursively(case32, "CASE-32", "", atomicPaths);
+
+        // Round 1: CASE-31 (winner, dateOfBirthRequested) vs CASE-32 (loser, currentNameRequested).
+        JsonObject roundOneMerged = FilterAndPairFn.mergeJsonObjects(
+                case31, "2026-01-02T00:00:00.000000Z",
+                case32, "2026-01-01T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, Map.of(), Map.of(), "", "img", "main");
+        assertEquals("Sanity check: round 1 must tag currentNameRequested to CASE-32",
+                "CASE-32",
+                roundOneMerged.getAsJsonObject("creditReportHeader")
+                        .getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+        assertFalse("Sanity check: round 1 must NOT tag the winner's own dateOfBirthRequested",
+                roundOneMerged.getAsJsonObject("creditReportHeader")
+                        .getAsJsonObject("_caseIdByField").has("dateOfBirthRequested"));
+
+        // Round 2: roundOneMerged (created_at = CASE-31's, the latest so far, per the
+        // maxCreatedAt fix) merges against a THIRD, OLDER case — roundOneMerged REMAINS the
+        // object-level winner, since it's still the latest.
+        JsonObject case34 = JsonParser.parseString(
+                "{\"creditReportHeader\":{\"customerNumber\":\"X\","
+                        + "\"socialSecurityNumberRequested\":{\"disputeCodes\":[{\"code\":\"SSN\"}]}}}")
+                .getAsJsonObject();
+        FilterAndPairFn.stampObjectRecursively(case34, "CASE-34", "", atomicPaths);
+        JsonObject roundTwoMerged = FilterAndPairFn.mergeJsonObjects(
+                roundOneMerged, "2026-01-02T00:00:00.000000Z",
+                case34, "2025-12-31T00:00:00.000000Z",
+                Set.of(), CREDIT_REPORT_HEADER_ATOMIC, Map.of(), Map.of(), "", "img", "main");
+
+        JsonObject header = roundTwoMerged.getAsJsonObject("creditReportHeader");
+        assertEquals("roundOneMerged must remain the object-level winner (still the latest)",
+                "CASE-31", roundTwoMerged.getAsJsonObject("_caseIdByField").get("creditReportHeader").getAsString());
+        assertEquals("SSN slot from the older CASE-34 must be carried forward and tagged to it",
+                "CASE-34", header.getAsJsonObject("_caseIdByField").get("socialSecurityNumberRequested").getAsString());
+        assertEquals("currentNameRequested must NOT lose its CASE-32 tag just because the "
+                        + "composite that carries it won this round too — it is still on loan, "
+                        + "not the current winner's own content",
+                "CASE-32", header.getAsJsonObject("_caseIdByField").get("currentNameRequested").getAsString());
+        assertFalse("dateOfBirthRequested is genuinely CASE-31's own field — still needs no tag",
+                header.getAsJsonObject("_caseIdByField").has("dateOfBirthRequested"));
     }
 
     /**
