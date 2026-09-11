@@ -231,8 +231,16 @@ public class FilterAndPairFn
         Map<String, GenericRecord> aiPendingMeta = new HashMap<>();
         for (TableRow pr : result.getAll(AI_PENDING_TAG)) {
             GenericRecord p = toAiPendingRecord(pr);
-            aiPendingMeta.merge(aiContentKey(str(p.get("key_id")), str(p.get("payload")), seg), p,
-                    FilterAndPairFn::mergeAiPendingMeta);
+            String persistedKeyStr = str(p.get("payload"));
+            String persistedKey = aiContentKey(str(p.get("key_id")), persistedKeyStr, seg);
+            LOG.info("SIGCHECK-PERSISTED imageId={} segment={} keyIdLen={} payloadLen={} "
+                            + "payloadHash={} aiContentKey={}",
+                    imageId, segment,
+                    str(p.get("key_id")) == null ? -1 : str(p.get("key_id")).length(),
+                    persistedKeyStr == null ? -1 : persistedKeyStr.length(),
+                    persistedKeyStr == null ? 0 : persistedKeyStr.hashCode(),
+                    persistedKey);
+            aiPendingMeta.merge(persistedKey, p, FilterAndPairFn::mergeAiPendingMeta);
         }
         Instant maxAiCreatedAt = null;
         for (GenericRecord p : aiPendingMeta.values()) {
@@ -251,7 +259,16 @@ public class FilterAndPairFn
         // bump assignment is deterministic across runs.
         Map<String, GenericRecord> dedupedFresh = new LinkedHashMap<>();
         for (GenericRecord c : freshAiCandidates) {
-            dedupedFresh.putIfAbsent(aiContentKey(str(c.get("key_id")), str(c.get("payload")), seg), c);
+            String freshPayloadStr = str(c.get("payload"));
+            String freshKey = aiContentKey(str(c.get("key_id")), freshPayloadStr, seg);
+            LOG.info("SIGCHECK-FRESH imageId={} segment={} keyIdLen={} payloadLen={} "
+                            + "payloadHash={} aiContentKey={} alreadyKnown={}",
+                    imageId, segment,
+                    str(c.get("key_id")) == null ? -1 : str(c.get("key_id")).length(),
+                    freshPayloadStr == null ? -1 : freshPayloadStr.length(),
+                    freshPayloadStr == null ? 0 : freshPayloadStr.hashCode(),
+                    freshKey, aiPendingMeta.containsKey(freshKey));
+            dedupedFresh.putIfAbsent(freshKey, c);
         }
         List<GenericRecord> orderedFresh = new ArrayList<>(dedupedFresh.values());
         orderedFresh.sort(Comparator
