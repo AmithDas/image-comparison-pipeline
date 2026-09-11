@@ -231,7 +231,8 @@ public class FilterAndPairFn
         Map<String, GenericRecord> aiPendingMeta = new HashMap<>();
         for (TableRow pr : result.getAll(AI_PENDING_TAG)) {
             GenericRecord p = toAiPendingRecord(pr);
-            aiPendingMeta.merge(dedupKey(str(p.get("payload"))), p, FilterAndPairFn::mergeAiPendingMeta);
+            aiPendingMeta.merge(aiContentKey(str(p.get("key_id")), str(p.get("payload")), seg), p,
+                    FilterAndPairFn::mergeAiPendingMeta);
         }
         Instant maxAiCreatedAt = null;
         for (GenericRecord p : aiPendingMeta.values()) {
@@ -250,7 +251,7 @@ public class FilterAndPairFn
         // bump assignment is deterministic across runs.
         Map<String, GenericRecord> dedupedFresh = new LinkedHashMap<>();
         for (GenericRecord c : freshAiCandidates) {
-            dedupedFresh.putIfAbsent(dedupKey(str(c.get("payload"))), c);
+            dedupedFresh.putIfAbsent(aiContentKey(str(c.get("key_id")), str(c.get("payload")), seg), c);
         }
         List<GenericRecord> orderedFresh = new ArrayList<>(dedupedFresh.values());
         orderedFresh.sort(Comparator
@@ -258,7 +259,7 @@ public class FilterAndPairFn
                 .thenComparing(c -> str(c.get("payload"))));
 
         for (GenericRecord candidate : orderedFresh) {
-            String key = dedupKey(str(candidate.get("payload")));
+            String key = aiContentKey(str(candidate.get("key_id")), str(candidate.get("payload")), seg);
             if (aiPendingMeta.containsKey(key)) {
                 // Replay of an already-known row — the pending-pool copy above already
                 // covers it with its previously-assigned created_at; don't re-bump it.
@@ -328,7 +329,8 @@ public class FilterAndPairFn
 
         // ── Always re-pend every AI row, aged against its own first_seen_at ─────
         for (GenericRecord ai : aiRows) {
-            GenericRecord meta = aiPendingMeta.get(dedupKey(str(ai.get("payload"))));
+            GenericRecord meta = aiPendingMeta.get(
+                    aiContentKey(str(ai.get("key_id")), str(ai.get("payload")), seg));
             Instant firstSeen  = meta != null ? parseInstant(str(meta.get("first_seen_at"))) : null;
             if (firstSeen == null) firstSeen = now;
             long daysWaited = ChronoUnit.DAYS.between(firstSeen, now);
@@ -437,12 +439,15 @@ public class FilterAndPairFn
         // --humanLookbackDays re-selecting it from source with zero actual content change.
         // Signing the ciphertext made every such re-read look like a genuine change, firing a
         // spurious comparison and appending duplicate rows every run for as long as the
-        // lookback window kept re-selecting it. The AI side doesn't have this problem — AI
-        // payloads are never re-encrypted after ingestion, so their ciphertext is already a
-        // stable identity (see dedupKey's own doc).
+        // lookback window kept re-selecting it. The AI side has the identical problem, for a
+        // different reason: the upstream audit/source system has been observed to log more
+        // than one physical row for one logical AI event (e.g. a retried request that both
+        // succeeded), each independently encrypted, so ciphertext identity is not reliable
+        // there either — see aiContentKey's own doc.
         GenericRecord latestAi = aiRows.isEmpty() ? null : aiRows.get(aiRows.size() - 1);
         String currentSignature = latestAi != null
-                ? humanContentSignature(humanRec, seg) + "|" + dedupKey(str(latestAi.get("payload")))
+                ? humanContentSignature(humanRec, seg) + "|"
+                        + aiContentKey(str(latestAi.get("key_id")), str(latestAi.get("payload")), seg)
                 : null;
 
         boolean justMatched = latestAi != null && !Objects.equals(currentSignature, persistedSignature);
@@ -1305,14 +1310,37 @@ public class FilterAndPairFn
     // ── AI identity keys ─────────────────────────────────────────────────────
 
     /**
-     * AI row identity is the payload alone (trimmed ciphertext) — created_at can
-     * no longer participate since it's now an assigned, monotonically-bumped
-     * value rather than a passthrough of the source timestamp. The Barricade
-     * ciphertext is a random-IV envelope carried through unchanged, so identical
-     * payload strings are strong evidence of the same row reappearing.
+     * Ciphertext-based fallback identity, used only when a payload can't be decrypted/parsed
+     * (see {@link #aiContentKey}, which is the real identity used everywhere an AI row's
+     * identity matters). Kept as trimmed ciphertext for that fallback case only — do not use
+     * this as AI identity directly; the source audit system has been observed to write more
+     * than one physical row for what is logically a single event (e.g. a client-side retry
+     * that both succeeded), each with its own random-IV ciphertext despite identical decrypted
+     * content, so ciphertext equality is not reliable AI identity on its own.
      */
     private static String dedupKey(String payload) {
         return strTrim(payload);
+    }
+
+    /**
+     * Stable content-identity key for an AI payload — decrypted-content based, the AI-side
+     * counterpart to {@link #humanContentSignature}. AI identity was originally assumed safe
+     * as raw ciphertext ("Barricade ciphertext is a random-IV envelope carried through
+     * unchanged, so identical payload strings are strong evidence of the same row
+     * reappearing") — that assumption doesn't hold when the source audit system itself writes
+     * more than one physical row for one logical event (observed in production: a single AI
+     * event logged as 2-3 separate rows, each independently encrypted, all decrypting to
+     * identical content). Ciphertext-based identity treated each of those rows as a distinct
+     * "new" AI payload forever, causing comparison_version to climb indefinitely with zero
+     * real content change. Hashed (SHA-256) exactly like humanContentSignature — no decrypted
+     * content is ever persisted, only this one-way digest.
+     */
+    private String aiContentKey(String keyId, String payload, SegmentConfig seg) {
+        JsonObject json = decryptToJson(keyId, payload, seg);
+        if (json == null) {
+            return dedupKey(payload);
+        }
+        return sha256Hex(canonicalize(json).toString());
     }
 
     private static Set<String> parseKeys(String joined) {
