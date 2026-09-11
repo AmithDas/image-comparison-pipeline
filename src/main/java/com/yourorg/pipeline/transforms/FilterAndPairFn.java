@@ -467,6 +467,23 @@ public class FilterAndPairFn
                         + aiContentKey(str(latestAi.get("key_id")), str(latestAi.get("payload")), seg)
                 : null;
 
+        // TEMPORARY diagnostic logging — remove once the spurious re-comparison root cause is
+        // confirmed. Compact fingerprint (lengths/hashCodes/the actual short content-key), not
+        // full payload dumps, so two runs' worth of output can be diffed by eye in the logs.
+        if (latestAi != null) {
+            String aiPayloadStr = str(latestAi.get("payload"));
+            LOG.info("SIGCHECK imageId={} segment={} aiKeyLen={} aiKeyHash={} aiContentKey={} "
+                            + "humanPart={} persistedSignature={} currentSignature={} match={}",
+                    imageId, segment,
+                    aiPayloadStr == null ? -1 : aiPayloadStr.length(),
+                    aiPayloadStr == null ? 0 : aiPayloadStr.hashCode(),
+                    aiContentKey(str(latestAi.get("key_id")), aiPayloadStr, seg),
+                    humanContentSignature(humanRec, seg),
+                    persistedSignature,
+                    currentSignature,
+                    Objects.equals(currentSignature, persistedSignature));
+        }
+
         boolean justMatched = latestAi != null && !Objects.equals(currentSignature, persistedSignature);
         if (justMatched) {
             comparisonVersion += 1;
