@@ -374,7 +374,29 @@ public class FilterAndPairFn
         // this run.
         Map<String, GenericRecord> humanBySubType = new LinkedHashMap<>();
 
-        for (Map.Entry<String, Map<String, GenericRecord>> caseEntry : humanByCase.entrySet()) {
+        // humanByCase's own iteration order traces back to a non-deterministic BigQuery read
+        // (no ORDER BY on the source query — see aiContentKey's Javadoc for the analogous AI-side
+        // history of this exact class of bug), so it varies run to run for the same underlying
+        // data. That matters here because this loop is a LEFT FOLD: when three or more cases
+        // contribute to the same subType, "existing" at any given step is the ACCUMULATED result
+        // of every case already folded in, not a single raw case — so a fold-order change can
+        // feed mergeJsonObjects's existingWinsTies tie-break two objects with different content
+        // even though the same underlying two cases are the ones actually tied, since one side may
+        // now also carry a third case's unrelated fields. That silently flips the tie-break's
+        // outcome across runs despite the comparison itself being deterministic given fixed
+        // inputs. Sorting into a fixed order first — by each case's own earliest contribution
+        // timestamp, then by caseKey to fully break any remaining tie — guarantees every run folds
+        // the exact same sequence of cases in the exact same order, so the accumulator at each step
+        // is byte-identical run to run and the final merged result is fully deterministic.
+        List<Map.Entry<String, Map<String, GenericRecord>>> orderedCaseEntries =
+                new ArrayList<>(humanByCase.entrySet());
+        orderedCaseEntries.sort(Comparator
+                .<Map.Entry<String, Map<String, GenericRecord>>, String>comparing(
+                        e -> earliestCreatedAt(e.getValue()),
+                        Comparator.nullsFirst(Comparator.naturalOrder()))
+                .thenComparing(Map.Entry::getKey));
+
+        for (Map.Entry<String, Map<String, GenericRecord>> caseEntry : orderedCaseEntries) {
             String  caseKey            = caseEntry.getKey();
             boolean isPendingGroupState = PENDING_GROUP_KEY.equals(caseKey);
             if (!isPendingGroupState && !caseKey.isEmpty()) allContributingCaseIds.add(caseKey);
@@ -629,6 +651,22 @@ public class FilterAndPairFn
                                           String caseKey, String subType, GenericRecord incoming) {
         humanByCase.computeIfAbsent(caseKey, k -> new LinkedHashMap<>())
                 .putIfAbsent(subType, incoming);
+    }
+
+    /**
+     * The earliest {@code created_at} across a case's subType records — used purely as a stable
+     * sort key so the fold in {@code processElement} visits cases in a fixed, source-read-order-
+     * independent sequence. Package-visible for direct unit testing.
+     */
+    static String earliestCreatedAt(Map<String, GenericRecord> subTypeRecords) {
+        String earliest = null;
+        for (GenericRecord rec : subTypeRecords.values()) {
+            String createdAt = str(rec.get("created_at"));
+            if (createdAt != null && (earliest == null || createdAt.compareTo(earliest) < 0)) {
+                earliest = createdAt;
+            }
+        }
+        return earliest;
     }
 
     private static String displayCase(String caseKey) {

@@ -5,6 +5,9 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -88,6 +91,104 @@ public class FilterAndPairFnMergeTest {
                         + "'existing' vs 'incoming' for this call",
                 mergedAExistingBIncoming.get("shared").getAsString(),
                 mergedBExistingAIncoming.get("shared").getAsString());
+    }
+
+    /** One contributing case's stamped payload plus its own created_at, for fold simulation. */
+    private static final class CaseFoldEntry {
+        final JsonObject json;
+        final String createdAt;
+        final String caseId;
+
+        CaseFoldEntry(JsonObject json, String createdAt, String caseId) {
+            this.json = json;
+            this.createdAt = createdAt;
+            this.caseId = caseId;
+        }
+    }
+
+    /**
+     * Simulates FilterAndPairFn's own humanBySubType fold: a LEFT FOLD of
+     * {@link FilterAndPairFn#mergeJsonObjects} over N contributing cases in the given order,
+     * tracking the accumulator's created_at as the max seen so far (mirroring
+     * {@code mergeAcrossCases}'s {@code maxCreatedAt} rule) so it correctly feeds the next
+     * round's tie-break.
+     */
+    private static JsonObject foldInOrder(List<CaseFoldEntry> entries) {
+        JsonObject acc = null;
+        String accCreatedAt = null;
+        for (CaseFoldEntry e : entries) {
+            if (acc == null) {
+                acc = e.json;
+                accCreatedAt = e.createdAt;
+            } else {
+                acc = FilterAndPairFn.mergeJsonObjects(acc, accCreatedAt, e.json, e.createdAt,
+                        Set.of(), Map.of(), Map.of(), Map.of(), "", "img", "main");
+                accCreatedAt = accCreatedAt.compareTo(e.createdAt) >= 0 ? accCreatedAt : e.createdAt;
+            }
+        }
+        return acc;
+    }
+
+    /**
+     * The fix: a fixed visiting order — by created_at, then case id — applied before folding,
+     * matching the sort FilterAndPairFn now applies to {@code humanByCase.entrySet()} (see
+     * {@code earliestCreatedAt}) so the fold no longer depends on source-read order.
+     */
+    private static List<CaseFoldEntry> sortedByCreatedAtThenCaseId(List<CaseFoldEntry> entries) {
+        List<CaseFoldEntry> sorted = new ArrayList<>(entries);
+        sorted.sort(Comparator.<CaseFoldEntry, String>comparing(e -> e.createdAt)
+                .thenComparing(e -> e.caseId));
+        return sorted;
+    }
+
+    /**
+     * Regression test: the tie-break fix above makes a single pairwise
+     * {@code mergeJsonObjects} call order-independent, but production folds three or more
+     * contributing cases through a SEQUENCE of pairwise calls (see FilterAndPairFn's
+     * {@code humanBySubType} fold) — where "existing" at any step past the first is the
+     * ACCUMULATED result of every case already folded in, not a single raw case. When two of
+     * three cases share an exact created_at tie, whether that tie is evaluated between the two
+     * RAW cases directly or between an accumulator (already carrying a third, untied case's
+     * unrelated content) and one raw case depends entirely on fold order — and the
+     * accumulator's extra content can flip the deterministic content-comparison's outcome even
+     * though the same two cases are the ones actually tied. This reproduces that flip directly,
+     * then proves that visiting cases in a FIXED order (sorted by created_at then case id, as
+     * FilterAndPairFn now does before folding) makes the final result identical regardless of
+     * the original (source-read) order.
+     */
+    @Test
+    public void threeWayFoldPicksSameTiedWinnerRegardlessOfSourceReadOrder() {
+        String t1 = "2026-01-01T00:00:00.000000Z";
+        String t2 = "2026-01-02T00:00:00.000000Z";
+
+        // Case A and case B share an exact created_at tie on "shared"; A's content is
+        // lexically greater, so a CLEAN two-way tie-break (no third case involved) always
+        // picks A — see exactTimestampTieProducesTheSameWinnerRegardlessOfRole for that
+        // baseline. Case C is strictly earlier and contributes a disjoint field ("aField")
+        // whose name sorts before "shared" alphabetically — the exact positioning that flips
+        // the tie-break once C's content has already been folded into the accumulator ahead
+        // of the direct A-vs-B comparison.
+        CaseFoldEntry caseA = new CaseFoldEntry(stamped("{\"shared\":\"zzzz\"}", "CASE-A"), t2, "CASE-A");
+        CaseFoldEntry caseB = new CaseFoldEntry(stamped("{\"shared\":\"aaaa\"}", "CASE-B"), t2, "CASE-B");
+        CaseFoldEntry caseC = new CaseFoldEntry(stamped("{\"aField\":\"c-value\"}", "CASE-C"), t1, "CASE-C");
+
+        // Naive fold, unsorted, in two different source-read orders.
+        String orderCAB = foldInOrder(List.of(caseC, caseA, caseB)).get("shared").getAsString();
+        String orderABC = foldInOrder(List.of(caseA, caseB, caseC)).get("shared").getAsString();
+        assertFalse("Sanity check: the naive unsorted fold order must actually change the "
+                        + "winner here, or this test isn't reproducing the bug",
+                orderCAB.equals(orderABC));
+
+        // The fix: sort by (created_at, case id) before folding — both original source-read
+        // orders above collapse to the SAME fold sequence and must therefore produce the SAME
+        // winner.
+        String sortedFromCAB = foldInOrder(sortedByCreatedAtThenCaseId(List.of(caseC, caseA, caseB)))
+                .get("shared").getAsString();
+        String sortedFromABC = foldInOrder(sortedByCreatedAtThenCaseId(List.of(caseA, caseB, caseC)))
+                .get("shared").getAsString();
+        assertEquals("A fixed fold order must produce the same winner regardless of the "
+                        + "original source-read order",
+                sortedFromCAB, sortedFromABC);
     }
 
     /**
