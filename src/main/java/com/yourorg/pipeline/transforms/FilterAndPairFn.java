@@ -837,9 +837,24 @@ public class FilterAndPairFn
         // On a scalar value collision, the LATEST created_at wins — a case correcting/updating
         // a field should take precedence over an earlier submission of the same field. A known
         // timestamp still beats an unknown one either way (existingCreatedAt != null fallback).
+        //
+        // An EXACT tie (both cases share the identical created_at — observed in production for
+        // cases submitted in the same batch/load) has no timestamp basis to decide on. Simply
+        // defaulting to "existing wins" is order-dependent: which case ends up in the
+        // "existing" vs "incoming" role for this call is a function of humanByCase's iteration
+        // order, which itself traces back to a plain `SELECT *` with no ORDER BY — not
+        // guaranteed stable across separate query executions. That let the SAME group produce a
+        // genuinely different merged winner (different wholesale field set, different
+        // humanContentSignature) from one run to the next despite identical inputs, causing a
+        // spurious re-comparison every run. Breaking the tie by comparing the canonicalized
+        // CONTENT itself is intrinsic to the data, not to processing order, so it always picks
+        // the same winner regardless of which side happens to be "existing" this time.
         boolean existingWinsTies;
         if (existingCreatedAt != null && incomingCreatedAt != null) {
-            existingWinsTies = existingCreatedAt.compareTo(incomingCreatedAt) >= 0;
+            int cmp = existingCreatedAt.compareTo(incomingCreatedAt);
+            existingWinsTies = cmp != 0
+                    ? cmp > 0
+                    : canonicalize(existingJson).toString().compareTo(canonicalize(incomingJson).toString()) >= 0;
         } else {
             existingWinsTies = existingCreatedAt != null;
         }

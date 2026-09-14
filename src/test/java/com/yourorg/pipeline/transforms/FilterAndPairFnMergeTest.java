@@ -59,6 +59,38 @@ public class FilterAndPairFnMergeTest {
     }
 
     /**
+     * Regression test: two cases sharing the EXACT SAME created_at (observed in production —
+     * cases submitted in the same batch/load) must produce the SAME merge winner regardless of
+     * which one happens to be passed as "existing" vs "incoming" — that role assignment is a
+     * function of {@code humanByCase}'s iteration order, which traces back to an unordered
+     * {@code SELECT *} with no guaranteed row order across separate query executions. Before
+     * this fix, an exact tie always favored "existing" unconditionally, so the SAME group could
+     * produce a genuinely different merged winner (different wholesale field set, different
+     * humanContentSignature) from one run to the next with zero real content change, causing a
+     * spurious re-comparison every run. Field sets deliberately differ between the two cases
+     * (mirrors the production symptom: a real change in TOTAL FIELD COUNT between runs, not
+     * just field order) so the test can directly detect which one "won" wholesale content.
+     */
+    @Test
+    public void exactTimestampTieProducesTheSameWinnerRegardlessOfRole() {
+        JsonObject caseA = stamped("{\"shared\":\"fromA\",\"onlyA\":\"x\"}", "CASE-A");
+        JsonObject caseB = stamped("{\"shared\":\"fromB\",\"onlyB\":\"y\"}", "CASE-B");
+        String tiedCreatedAt = "2026-01-01T00:00:00.000000Z";
+
+        JsonObject mergedAExistingBIncoming = FilterAndPairFn.mergeJsonObjects(
+                caseA, tiedCreatedAt, caseB, tiedCreatedAt,
+                Set.of(), Map.of(), Map.of(), Map.of(), "", "img", "main");
+        JsonObject mergedBExistingAIncoming = FilterAndPairFn.mergeJsonObjects(
+                caseB, tiedCreatedAt, caseA, tiedCreatedAt,
+                Set.of(), Map.of(), Map.of(), Map.of(), "", "img", "main");
+
+        assertEquals("The winner of an exact tie must not depend on which side is "
+                        + "'existing' vs 'incoming' for this call",
+                mergedAExistingBIncoming.get("shared").getAsString(),
+                mergedBExistingAIncoming.get("shared").getAsString());
+    }
+
+    /**
      * A field present in only one contributing case is kept as-is, and attributed to that
      * case — both sides are pre-stamped (as production ingestion would do), so provenance is
      * recorded per field even though no single field's *value* was actually contested.
