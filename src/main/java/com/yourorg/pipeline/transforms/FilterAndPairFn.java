@@ -1243,21 +1243,56 @@ public class FilterAndPairFn
         }
     }
 
+    /** Human-side decrypt: applies the segment's {@code id_request} unwrap, if configured. */
     private JsonObject decryptToJson(String keyId, String payload, SegmentConfig seg) {
+        return decryptToJson(keyId, payload, seg, true);
+    }
+
+    /**
+     * @param applyIdRequestUnwrap whether to try the segment's {@code id_request} wire-format
+     *                             unwrap ({@link PayloadParser}) before parsing as JSON. Must be
+     *                             {@code false} for AI payloads — {@code payloadFormat: "id_request"}
+     *                             (and {@link PayloadParser} itself, see its own Javadoc) exists
+     *                             solely for HUMAN payloads in segments like
+     *                             {@code authanddocreview}; AI payloads are always plain JSON
+     *                             regardless of the segment's human-side format (mirrors
+     *                             {@code DecryptAndKeyFn}'s own AI-vs-human split, where AI rows
+     *                             always go through {@code extractImageKeyPlainJson}, never
+     *                             {@code PayloadParser}). Passing {@code true} for an AI payload
+     *                             makes every AI row in an id_request segment fail to parse here
+     *                             (since it never matches the {@code id=...,request=...} pattern),
+     *                             silently falling back to ciphertext-based identity wherever the
+     *                             caller does that — this is exactly what caused
+     *                             {@code comparison_version} to climb on every run for
+     *                             {@code authanddocreview} despite unchanged AI content, the same
+     *                             class of bug {@link #aiContentKey} was introduced to fix.
+     */
+    private JsonObject decryptToJson(String keyId, String payload, SegmentConfig seg,
+                                      boolean applyIdRequestUnwrap) {
         try {
             String decrypted = BarricadeEncryptionUtil.decrypt(keyId, payload);
-            String json = decrypted;
-            if (seg != null && seg.isIdRequestFormat()) {
-                PayloadParser.Parsed p = PayloadParser.parse(decrypted);
-                if (p == null) return null;
-                json = p.json();
-            }
-            JsonElement parsed = JsonParser.parseString(json);
-            return parsed.isJsonObject() ? parsed.getAsJsonObject() : null;
+            return parseDecryptedPayload(decrypted, seg, applyIdRequestUnwrap);
         } catch (Exception e) {
             LOG.warn("Could not decrypt/parse payload for cross-case merge: {}", e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * The post-decrypt half of {@link #decryptToJson}, split out so it's directly testable
+     * without live Barricade decrypt/encrypt (same rationale as {@link #mergeJsonObjects}).
+     * Package-visible for direct unit testing.
+     */
+    static JsonObject parseDecryptedPayload(String decrypted, SegmentConfig seg,
+                                             boolean applyIdRequestUnwrap) {
+        String json = decrypted;
+        if (applyIdRequestUnwrap && seg != null && seg.isIdRequestFormat()) {
+            PayloadParser.Parsed p = PayloadParser.parse(decrypted);
+            if (p == null) return null;
+            json = p.json();
+        }
+        JsonElement parsed = JsonParser.parseString(json);
+        return parsed.isJsonObject() ? parsed.getAsJsonObject() : null;
     }
 
     private static String maxCreatedAt(String a, String b) {
@@ -1423,7 +1458,7 @@ public class FilterAndPairFn
      * content is ever persisted, only this one-way digest.
      */
     private String aiContentKey(String keyId, String payload, SegmentConfig seg) {
-        JsonObject json = decryptToJson(keyId, payload, seg);
+        JsonObject json = decryptToJson(keyId, payload, seg, false);
         if (json == null) {
             return dedupKey(payload);
         }

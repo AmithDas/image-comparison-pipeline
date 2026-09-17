@@ -3,6 +3,7 @@ package com.yourorg.pipeline.transforms;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.yourorg.pipeline.config.SegmentConfig;
 import org.junit.Test;
 
 import java.util.ArrayList;
@@ -13,6 +14,7 @@ import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
 /**
@@ -1038,5 +1040,70 @@ public class FilterAndPairFnMergeTest {
         JsonObject b = obj("{\"firstName\":\"Johnny\"}");
 
         assertFalse(FilterAndPairFn.canonicalize(a).equals(FilterAndPairFn.canonicalize(b)));
+    }
+
+    // ── parseDecryptedPayload: id_request unwrap must be human-side only ────────
+
+    private static final SegmentConfig ID_REQUEST_SEGMENT =
+            new SegmentConfig("authanddocreview", "auth.ai", "auth.human",
+                    "id_request", null);
+
+    /**
+     * Baseline: a human payload in an id_request-format segment (e.g. authanddocreview) is
+     * wrapped as {@code id=...,request=<json>} — applyIdRequestUnwrap=true must unwrap it and
+     * return the inner JSON.
+     */
+    @Test
+    public void idRequestUnwrapExtractsInnerJsonForHumanPayload() {
+        String decrypted = "id=\"img1\",request=\"{\\\"documentProofs\\\":[]}\"";
+
+        JsonObject result = FilterAndPairFn.parseDecryptedPayload(
+                decrypted, ID_REQUEST_SEGMENT, true);
+
+        assertNotNull(result);
+        assertEquals("[]", result.get("documentProofs").toString());
+    }
+
+    /**
+     * Regression test: AI payloads are always plain JSON (see DecryptAndKeyFn, which never
+     * routes AI rows through PayloadParser regardless of the segment's human-side
+     * payloadFormat) — they never match the {@code id=...,request=...} wire format. Before this
+     * fix, {@code aiContentKey} called the same decrypt path as the human side with the unwrap
+     * unconditionally enabled whenever the segment was id_request-format, so every AI payload
+     * in authanddocreview failed to parse here and silently fell back to ciphertext-based
+     * identity — reintroducing, for that one segment, the exact "comparison_version climbs
+     * forever on unchanged AI content" bug {@code aiContentKey} was built to fix everywhere
+     * else. With applyIdRequestUnwrap=false, a plain-JSON AI payload must parse directly.
+     */
+    @Test
+    public void aiPlainJsonPayloadParsesDirectlyWithUnwrapDisabledEvenInAnIdRequestSegment() {
+        String decrypted = "{\"aiField\":\"aiValue\"}";
+
+        JsonObject result = FilterAndPairFn.parseDecryptedPayload(
+                decrypted, ID_REQUEST_SEGMENT, false);
+
+        assertNotNull("A plain-JSON AI payload must parse directly when the unwrap is "
+                        + "correctly disabled for the AI side, even in an id_request segment",
+                result);
+        assertEquals("aiValue", result.get("aiField").getAsString());
+    }
+
+    /**
+     * The bug this fixes, reproduced directly: the SAME plain-JSON AI payload, but with the
+     * unwrap left enabled (the pre-fix behavior for any id_request segment), fails to parse —
+     * proving the fallback to ciphertext identity was inevitable, not incidental, before the
+     * AI/human split was added.
+     */
+    @Test
+    public void aiPlainJsonPayloadFailsToParseWhenUnwrapIsWronglyEnabled() {
+        String decrypted = "{\"aiField\":\"aiValue\"}";
+
+        JsonObject result = FilterAndPairFn.parseDecryptedPayload(
+                decrypted, ID_REQUEST_SEGMENT, true);
+
+        assertNull("Demonstrates the bug: a plain-JSON AI payload never matches "
+                        + "id=...,request=..., so leaving the unwrap enabled for AI payloads "
+                        + "makes every one of them fail to parse",
+                result);
     }
 }
