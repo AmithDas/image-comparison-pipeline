@@ -8,19 +8,13 @@ explore: acis_creditsvc_imagequeue {
   # Mirrors the original ai_processed_img CTE's WHERE (final_action IS NOT NULL)
   # plus the outer query's WHERE clause on apt.
   sql_always_where:
-    ${acis_creditsvc_ai_metadata_summary.final_action} IS NOT NULL
+    ${acis_creditsvc_imagequeue.outcome} IS NOT NULL
     AND ${gcs_salesforce_curr_case.parent_id} IS NULL
     AND ${gcs_salesforce_curr_event.confirmation_number_raw} IS NOT NULL
     AND ${gcs_salesforce_curr_event.end_time} IS NOT NULL
     AND ${gcs_salesforce_curr_image_attached.name} IS NOT NULL
     AND ${gcs_salesforce_curr_event.processing_time_seconds} IS NOT NULL
   ;;
-
-  join: acis_creditsvc_ai_metadata_summary {
-    type: left_outer
-    relationship: one_to_one
-    sql_on: ${acis_creditsvc_imagequeue.file_name} = ${acis_creditsvc_ai_metadata_summary.file_name} ;;
-  }
 
   join: gcs_salesforce_curr_image_attached {
     type: left_outer

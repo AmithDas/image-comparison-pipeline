@@ -47,6 +47,22 @@ view: acis_creditsvc_imagequeue {
     sql: DATE_TRUNC(${load_date}, MONTH) ;;
   }
 
+  # acis_creditsvc_ai_metadata_summary_view has multiple rows per file_name
+  # (not unique). Do NOT join it directly as one_to_one — that produced fan-out
+  # that corrupted both the image count and the average processing time via
+  # Looker's symmetric aggregates. The original requirements query resolved
+  # this by keeping only the row where final_action IS NOT NULL, so we
+  # reproduce that here as a correlated scalar subquery instead.
+  dimension: outcome {
+    type: string
+    sql:
+      (SELECT metadata.final_action
+       FROM `usis_iris_views.acis_creditsvc_ai_metadata_summary_view` AS metadata
+       WHERE metadata.file_name = ${TABLE}.file_name
+         AND metadata.final_action IS NOT NULL
+       LIMIT 1) ;;
+  }
+
   measure: count {
     type: count
   }
