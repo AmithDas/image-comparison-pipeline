@@ -47,15 +47,6 @@ view: acis_creditsvc_imagequeue {
     sql: DATE_TRUNC(${load_date}, MONTH) ;;
   }
 
-  # Replaces the ai_processed_img derived table's outcome column.
-  dimension: outcome {
-    type: string
-    sql:
-      (SELECT metadata.final_action
-       FROM `usis_iris_views.acis_creditsvc_ai_metadata_summary_view` AS metadata
-       WHERE metadata.file_name = ${TABLE}.file_name) ;;
-  }
-
   measure: count {
     type: count
   }
