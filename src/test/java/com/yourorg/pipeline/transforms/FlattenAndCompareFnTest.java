@@ -12,6 +12,8 @@ import java.util.Set;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Direct unit tests for {@link FlattenAndCompareFn#resolveCaseId}, the pure case-id resolution
@@ -159,5 +161,72 @@ public class FlattenAndCompareFnTest {
                 dobField, dobValues.get(0).matchKey, caseIdByMatchKey, caseIdByPath, "CASE-31");
         assertEquals("The winner's own dateOfBirthRequested slot must resolve to CASE-31",
                 "CASE-31", dobResolved);
+    }
+
+    // ── extractAndStripSourceCaseId: matchKey collisions between different items ────
+
+    /**
+     * Regression test for a production bug: {@code addresses} is keyed for comparison by
+     * content ({@code streetNumber-postalCode}), which is NOT guaranteed unique across
+     * different items of the array — a case's {@code former} address can legitimately equal
+     * another case's {@code current} address. Reproduced exactly: case1's {@code current}
+     * (streetNumber=8027, postalCode=78645) and case3's {@code former} (the same
+     * streetNumber/postalCode) produce the identical matchKey "8027-78645" despite being two
+     * different items attributed to two different cases. Before this fix, the second item
+     * processed silently overwrote the first's entry in {@code caseIdByMatchKey}, so
+     * {@code current}'s own fields resolved to whichever case's item happened to be iterated
+     * last (case3) instead of its own correct case (case1) — observed in production as
+     * {@code current} showing the wrong (later) case_id in {@code comparison_results} despite
+     * the merged payload's own embedded {@code _sourceCaseId} being correct.
+     */
+    @Test
+    public void ambiguousMatchKeyFromTwoDifferentItemsIsExcludedRatherThanGuessed() {
+        String matchKey = "8027-78645";
+        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields = new HashMap<>();
+        humanFields.put("addresses._sourceCaseId", List.of(
+                new JsonFieldExtractor.FieldValue(matchKey, "case1"),   // current
+                new JsonFieldExtractor.FieldValue(matchKey, "case3")));  // former (colliding)
+
+        Map<String, String> caseIdByMatchKey =
+                FlattenAndCompareFn.extractAndStripSourceCaseId(humanFields);
+
+        assertNull("An ambiguous matchKey (two different items, two different cases) must not "
+                        + "be resolvable to either case — confidently returning one would be a "
+                        + "guess, not a fact",
+                caseIdByMatchKey.get(matchKey));
+        assertTrue("_sourceCaseId must still be stripped from the comparable field set even "
+                        + "when ambiguous",
+                humanFields.isEmpty());
+    }
+
+    /** Two items sharing a matchKey but attributed to the SAME case is not ambiguous at all. */
+    @Test
+    public void sameCaseAttributedTwiceAtTheSameMatchKeyIsNotTreatedAsAmbiguous() {
+        String matchKey = "8027-78645";
+        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields = new HashMap<>();
+        humanFields.put("addresses._sourceCaseId", List.of(
+                new JsonFieldExtractor.FieldValue(matchKey, "case1"),
+                new JsonFieldExtractor.FieldValue(matchKey, "case1")));
+
+        Map<String, String> caseIdByMatchKey =
+                FlattenAndCompareFn.extractAndStripSourceCaseId(humanFields);
+
+        assertEquals("case1", caseIdByMatchKey.get(matchKey));
+    }
+
+    /** A genuine, non-colliding matchKey resolves normally alongside an unrelated ambiguous one. */
+    @Test
+    public void nonCollidingMatchKeyStillResolvesWhenAnotherMatchKeyIsAmbiguous() {
+        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields = new HashMap<>();
+        humanFields.put("addresses._sourceCaseId", List.of(
+                new JsonFieldExtractor.FieldValue("8027-78645", "case1"),
+                new JsonFieldExtractor.FieldValue("8027-78645", "case3"),  // ambiguous
+                new JsonFieldExtractor.FieldValue("9148-52267", "case2"))); // unambiguous
+
+        Map<String, String> caseIdByMatchKey =
+                FlattenAndCompareFn.extractAndStripSourceCaseId(humanFields);
+
+        assertNull(caseIdByMatchKey.get("8027-78645"));
+        assertEquals("case2", caseIdByMatchKey.get("9148-52267"));
     }
 }

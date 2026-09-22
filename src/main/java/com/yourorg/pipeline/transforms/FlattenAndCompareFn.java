@@ -484,22 +484,50 @@ public class FlattenAndCompareFn
      * entries out into a {@code matchKey -> case_id} lookup and removes them from
      * {@code humanFields} so they're never treated as a comparable field.
      *
+     * <h3>matchKey collisions between different items</h3>
+     * The matchKey (e.g. {@code addresses}' {@code streetNumber-postalCode}) identifies items
+     * by CONTENT for AI-vs-human comparison purposes — it is not guaranteed unique across
+     * different items of the same array. Two genuinely different items (different
+     * {@code addressType}, different contributing case) can legitimately share the same
+     * content — e.g. a case's {@code former} address happens to equal another case's
+     * {@code current} address. Naively {@code put()}-ing every entry into one flat map let
+     * whichever item was iterated last silently overwrite an earlier item's correct
+     * attribution, so a field under the EARLIER item's own (correct, untouched) matchKey would
+     * resolve to the LATER item's case instead — reproduced directly in production: a
+     * {@code current} address (case1) got attributed to {@code case3} purely because
+     * {@code case3}'s {@code former} address happened to share {@code current}'s street/postal.
+     * When a matchKey maps to more than one distinct case_id, there is no reliable way to tell
+     * from the matchKey alone which item a given comparison row actually belongs to — so rather
+     * than confidently reporting a possibly-wrong case, that matchKey is left out of the result
+     * entirely, letting {@link #resolveCaseId} fall through to its next-best signal
+     * (path-based attribution, then {@code canonicalCaseId}) instead of an arbitrary guess.
+     *
      * <p>Package-visible for direct unit testing.
      */
     static Map<String, String> extractAndStripSourceCaseId(
             Map<String, List<FieldValue>> humanFields) {
         Map<String, String> caseIdByMatchKey = new HashMap<>();
+        Set<String> ambiguousMatchKeys = new HashSet<>();
         List<String> toRemove = new ArrayList<>();
         for (Map.Entry<String, List<FieldValue>> e : humanFields.entrySet()) {
             String key = e.getKey();
             if (!key.equals(SOURCE_CASE_ID_KEY) && !key.endsWith(SOURCE_CASE_ID_SUFFIX)) continue;
             toRemove.add(key);
             for (FieldValue fv : e.getValue()) {
-                if (fv.matchKey != null && fv.value != null) {
+                if (fv.matchKey == null || fv.value == null) continue;
+                String existing = caseIdByMatchKey.get(fv.matchKey);
+                if (existing == null) {
                     caseIdByMatchKey.put(fv.matchKey, fv.value);
+                } else if (!existing.equals(fv.value)) {
+                    ambiguousMatchKeys.add(fv.matchKey);
+                    LOG.warn("matchKey='{}' shared by items attributed to both '{}' and '{}' — "
+                                    + "can't tell them apart by content alone, leaving case_id "
+                                    + "attribution to fall through to the next signal",
+                            fv.matchKey, existing, fv.value);
                 }
             }
         }
+        ambiguousMatchKeys.forEach(caseIdByMatchKey::remove);
         toRemove.forEach(humanFields::remove);
         return caseIdByMatchKey;
     }

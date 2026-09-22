@@ -256,7 +256,7 @@ public class FilterAndPairFn
         // ── Assign always-increasing created_at to genuinely new AI payloads ────
         // Dedup fresh candidates by payload identity first (a single physical row
         // must only be bump-assigned once), then process in a stable order so the
-        // bump assignment is deterministic across runs.
+        // bump assignment is deterministic across runs.d
         Map<String, GenericRecord> dedupedFresh = new LinkedHashMap<>();
         for (GenericRecord c : freshAiCandidates) {
             String freshPayloadStr = str(c.get("payload"));
@@ -700,7 +700,7 @@ public class FilterAndPairFn
                                               SegmentConfig seg, String imageId, String segment) {
         if (caseKey == null || caseKey.isEmpty()) return record;
         String keyId = str(record.get("key_id"));
-        JsonObject json = decryptToJson(keyId, str(record.get("payload")), seg);
+        JsonObject json = decryptHumanPayloadToJson(keyId, str(record.get("payload")), seg);
         if (json == null) {
             LOG.warn("imageId={} segment={} case={} — could not parse human payload to stamp "
                             + "case attribution; falls back to the group's canonical case_id instead",
@@ -777,8 +777,8 @@ public class FilterAndPairFn
         String existingCreatedAt = str(existing.get("created_at"));
         String incomingCreatedAt = str(incoming.get("created_at"));
 
-        JsonObject existingJson = decryptToJson(keyId, str(existing.get("payload")), seg);
-        JsonObject incomingJson = decryptToJson(keyId, str(incoming.get("payload")), seg);
+        JsonObject existingJson = decryptHumanPayloadToJson(keyId, str(existing.get("payload")), seg);
+        JsonObject incomingJson = decryptHumanPayloadToJson(keyId, str(incoming.get("payload")), seg);
         if (existingJson == null || incomingJson == null) {
             LOG.warn("imageId={} segment={} — could not parse a colliding human payload for "
                     + "cross-case merge, keeping the later record whole", imageId, segment);
@@ -1243,30 +1243,34 @@ public class FilterAndPairFn
         }
     }
 
-    /** Human-side decrypt: applies the segment's {@code id_request} unwrap, if configured. */
-    private JsonObject decryptToJson(String keyId, String payload, SegmentConfig seg) {
+    /**
+     * Decrypts a HUMAN payload and applies the segment's {@code id_request} wire-format unwrap
+     * ({@link PayloadParser}) when configured — {@code payloadFormat: "id_request"} (see
+     * {@code authanddocreview}) exists solely for human payloads (see {@link PayloadParser}'s
+     * own Javadoc). Every human-side caller (case attribution, cross-case merge, content
+     * signature) must go through this, never {@link #decryptAiPayloadToJson}.
+     */
+    private JsonObject decryptHumanPayloadToJson(String keyId, String payload, SegmentConfig seg) {
         return decryptToJson(keyId, payload, seg, true);
     }
 
     /**
-     * @param applyIdRequestUnwrap whether to try the segment's {@code id_request} wire-format
-     *                             unwrap ({@link PayloadParser}) before parsing as JSON. Must be
-     *                             {@code false} for AI payloads — {@code payloadFormat: "id_request"}
-     *                             (and {@link PayloadParser} itself, see its own Javadoc) exists
-     *                             solely for HUMAN payloads in segments like
-     *                             {@code authanddocreview}; AI payloads are always plain JSON
-     *                             regardless of the segment's human-side format (mirrors
-     *                             {@code DecryptAndKeyFn}'s own AI-vs-human split, where AI rows
-     *                             always go through {@code extractImageKeyPlainJson}, never
-     *                             {@code PayloadParser}). Passing {@code true} for an AI payload
-     *                             makes every AI row in an id_request segment fail to parse here
-     *                             (since it never matches the {@code id=...,request=...} pattern),
-     *                             silently falling back to ciphertext-based identity wherever the
-     *                             caller does that — this is exactly what caused
-     *                             {@code comparison_version} to climb on every run for
-     *                             {@code authanddocreview} despite unchanged AI content, the same
-     *                             class of bug {@link #aiContentKey} was introduced to fix.
+     * Decrypts an AI payload — never applies the {@code id_request} unwrap, because AI payloads
+     * are always plain JSON regardless of the segment's human-side {@code payloadFormat}
+     * (mirrors {@code DecryptAndKeyFn}'s own AI-vs-human split, where AI rows always go through
+     * {@code extractImageKeyPlainJson}, never {@link PayloadParser}). Using {@link
+     * #decryptHumanPayloadToJson} here instead would make every AI payload in an id_request
+     * segment fail to parse (it never matches {@code id=...,request=...}), silently falling
+     * back to ciphertext-based identity wherever the caller does that — this is exactly what
+     * caused {@code comparison_version} to climb on every run for {@code authanddocreview}
+     * despite unchanged AI content, the same class of bug {@link #aiContentKey} was introduced
+     * to fix. Named/split from the human variant (rather than a boolean parameter) so a future
+     * call site can't silently pass the wrong side.
      */
+    private JsonObject decryptAiPayloadToJson(String keyId, String payload, SegmentConfig seg) {
+        return decryptToJson(keyId, payload, seg, false);
+    }
+
     private JsonObject decryptToJson(String keyId, String payload, SegmentConfig seg,
                                       boolean applyIdRequestUnwrap) {
         try {
@@ -1312,7 +1316,7 @@ public class FilterAndPairFn
      */
     private String humanContentSignature(GenericRecord humanRec, SegmentConfig seg) {
         String keyId = str(humanRec.get("key_id"));
-        JsonObject json = decryptToJson(keyId, str(humanRec.get("payload")), seg);
+        JsonObject json = decryptHumanPayloadToJson(keyId, str(humanRec.get("payload")), seg);
         if (json == null) {
             // Could not decrypt/parse — fall back to ciphertext identity. Less stable across
             // lookback re-reads, but only reachable if the payload is malformed to begin with.
@@ -1458,7 +1462,7 @@ public class FilterAndPairFn
      * content is ever persisted, only this one-way digest.
      */
     private String aiContentKey(String keyId, String payload, SegmentConfig seg) {
-        JsonObject json = decryptToJson(keyId, payload, seg, false);
+        JsonObject json = decryptAiPayloadToJson(keyId, payload, seg);
         if (json == null) {
             return dedupKey(payload);
         }

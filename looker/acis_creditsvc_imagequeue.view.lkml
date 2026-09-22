@@ -47,6 +47,26 @@ view: acis_creditsvc_imagequeue {
     sql: DATE_TRUNC(${load_date}, MONTH) ;;
   }
 
+  # The raw table has multiple rows per file_name (e.g. reprocessing attempts on
+  # different dates) — the original CTE's GROUP BY 1,2,3,4 confirms this, since it
+  # grouped on (file_name, received_date, load_date, outcome) together, not
+  # file_name alone. file_name is therefore NOT a valid primary key by itself;
+  # declaring it as one silently broke symmetric aggregates for every measure in
+  # the explore (near-doubled counts/averages). Dedup to one row per file_name —
+  # the most recent load_date_EST — via a correlated subquery instead of a
+  # derived table. NOTE: if two rows for the same file_name share the exact same
+  # load_date_EST, both will pass this check and the fan-out returns; if that
+  # turns out to happen in practice, we need an additional tiebreaker column.
+  dimension: is_latest_load {
+    type: yesno
+    hidden: yes
+    sql: ${TABLE}.load_date_EST = (
+           SELECT MAX(latest.load_date_EST)
+           FROM `usis_iris_views.acis_creditsvc_imagequeue_and_process_and_activity_history_view` AS latest
+           WHERE latest.file_name = ${TABLE}.file_name
+         ) ;;
+  }
+
   # acis_creditsvc_ai_metadata_summary_view has multiple rows per file_name
   # (not unique). Do NOT join it directly as one_to_one — that produced fan-out
   # that corrupted both the image count and the average processing time via
