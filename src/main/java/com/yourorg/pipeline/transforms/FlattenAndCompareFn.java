@@ -235,10 +235,11 @@ public class FlattenAndCompareFn
 
     // ── Processing ────────────────────────────────────────────────────────────
 
-    /** Reserved JSON keys FilterAndPairFn embeds for cross-case provenance — see mergeAcrossCases. */
+    /** Reserved JSON key FilterAndPairFn embeds for cross-case provenance — see mergeAcrossCases.
+     *  ({@code _sourceCaseId}, the array-item counterpart, is now consumed directly inside
+     *  {@code JsonFieldExtractor.flatten} — see {@code FieldValue.caseId} — so it never needs
+     *  handling here.) */
     private static final String CASE_ID_BY_FIELD_KEY = "_caseIdByField";
-    private static final String SOURCE_CASE_ID_KEY   = "_sourceCaseId";
-    private static final String SOURCE_CASE_ID_SUFFIX = "." + SOURCE_CASE_ID_KEY;
 
     @ProcessElement
     public void processElement(ProcessContext ctx) {
@@ -290,11 +291,6 @@ public class FlattenAndCompareFn
         Map<String, List<FieldValue>> aiFields =
                 applyFieldMappings(JsonFieldExtractor.flatten(aiPayload, ARRAY_MATCH_KEYS), segment);
 
-        // _sourceCaseId rides through flatten() as an ordinary sibling field of each merged
-        // array item (sharing that item's matchKey) — pull it out into a matchKey -> case_id
-        // lookup and drop it from the comparable field set.
-        Map<String, String> caseIdByMatchKey = extractAndStripSourceCaseId(humanFields);
-
         Map<String, String> rootToLabel = rootToLabelBySegment.getOrDefault(
                 segment, Collections.emptyMap());
 
@@ -338,22 +334,30 @@ public class FlattenAndCompareFn
                          || aiEntries.stream().anyMatch(fv -> fv.matchKey != null);
 
             if (keyed) {
-                Map<String, List<String>> humanGroups = groupByKey(humanEntries);
-                Map<String, List<String>> aiGroups    = groupByKey(aiEntries);
+                Map<String, List<FieldValue>> humanGroups = groupByKey(humanEntries);
+                Map<String, List<FieldValue>> aiGroups    = groupByKey(aiEntries);
                 Set<String> allMatchKeys = new TreeSet<>();
                 allMatchKeys.addAll(humanGroups.keySet());
                 allMatchKeys.addAll(aiGroups.keySet());
 
                 for (String matchKey : allMatchKeys) {
-                    List<String> humanVals =
+                    List<FieldValue> humanVals =
                             humanGroups.getOrDefault(matchKey, Collections.emptyList());
-                    List<String> aiVals =
+                    List<FieldValue> aiVals =
                             aiGroups.getOrDefault(matchKey, Collections.emptyList());
                     int count = Math.max(humanVals.size(), aiVals.size());
                     for (int i = 0; i < count; i++) {
-                        String humanVal = i < humanVals.size() ? humanVals.get(i) : null;
-                        String aiVal    = i < aiVals.size()    ? aiVals.get(i)    : null;
-                        String rowCaseId = resolveCaseId(field, matchKey, caseIdByMatchKey,
+                        // Each value carries its own item's case_id directly (see
+                        // FieldValue.caseId) — no matchKey-keyed lookup involved, so two
+                        // different items sharing the same content-derived matchKey can never
+                        // be confused with each other. AI never carries a case_id, so prefer
+                        // the human side's when present at this position.
+                        FieldValue humanFv = i < humanVals.size() ? humanVals.get(i) : null;
+                        FieldValue aiFv     = i < aiVals.size()    ? aiVals.get(i)    : null;
+                        String humanVal = humanFv != null ? humanFv.value : null;
+                        String aiVal    = aiFv    != null ? aiFv.value    : null;
+                        String itemCaseId = humanFv != null ? humanFv.caseId : null;
+                        String rowCaseId = resolveCaseId(field, itemCaseId,
                                 caseIdByPath, canonicalCaseId);
                         emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
@@ -364,9 +368,11 @@ public class FlattenAndCompareFn
             } else {
                 int count = Math.max(humanEntries.size(), aiEntries.size());
                 for (int i = 0; i < count; i++) {
-                    String humanVal = i < humanEntries.size() ? humanEntries.get(i).value : null;
-                    String aiVal    = i < aiEntries.size()    ? aiEntries.get(i).value    : null;
-                    String rowCaseId = resolveCaseId(field, null, caseIdByMatchKey,
+                    FieldValue humanFv = i < humanEntries.size() ? humanEntries.get(i) : null;
+                    String humanVal = humanFv != null ? humanFv.value : null;
+                    String aiVal    = i < aiEntries.size() ? aiEntries.get(i).value : null;
+                    String itemCaseId = humanFv != null ? humanFv.caseId : null;
+                    String rowCaseId = resolveCaseId(field, itemCaseId,
                             caseIdByPath, canonicalCaseId);
                     emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
@@ -383,43 +389,28 @@ public class FlattenAndCompareFn
     /**
      * Resolves the {@code case_id} to write for one output row, in precedence order:
      * <ol>
-     *   <li>The array item's {@code _sourceCaseId} stamp, looked up by matchKey — for a
-     *       {@code mergeArrayFields} array with more than one contributing case.</li>
+     *   <li>{@code itemCaseId} — the SPECIFIC {@link FieldValue}'s own case_id, carried
+     *       directly on the value by {@link JsonFieldExtractor#flatten} from the nearest
+     *       enclosing array item's {@code _sourceCaseId} stamp (see {@code FieldValue.caseId}'s
+     *       own Javadoc). This is attached per-value, not looked up afterward by matchKey, so
+     *       it can't be confused with another item's attribution even when two different items
+     *       happen to share the same content-derived matchKey — see the Javadoc on {@code
+     *       FieldValue.caseId} for the production bug a matchKey-keyed lookup caused.</li>
      *   <li>{@code caseIdByPath}, walking from the field's own full path up through each
      *       ancestor path (removing one dot-segment at a time) until a match is found —
      *       {@code _caseIdByField} is recorded at whatever depth a collision actually
      *       happened (see {@code FilterAndPairFn.mergeJsonObjects}), so a leaf field with no
      *       collision of its own inherits its nearest ancestor's attribution (e.g. a whole
-     *       nested object that came from a single case).</li>
+     *       nested object that came from a single case). Used only when {@code itemCaseId} is
+     *       absent — i.e. this value isn't inside any case-attributed array item at all.</li>
      *   <li>{@code canonicalCaseId} — nothing recorded at any level: the field's section had
      *       a single contributor overall (the common case).</li>
      * </ol>
      */
-    static String resolveCaseId(String field, String matchKey,
-                                 Map<String, String> caseIdByMatchKey,
+    static String resolveCaseId(String field, String itemCaseId,
                                  Map<String, String> caseIdByPath,
                                  String canonicalCaseId) {
-        // A field nested inside a keyed sub-array one level deeper than where _sourceCaseId is
-        // stamped (e.g. addresses.addressRequested.disputeCodes.code, whose matchKey composites
-        // the parent address item's own key with the disputeCodes item's own key — see
-        // JsonFieldExtractor.flattenArray) has a matchKey MORE SPECIFIC than any entry
-        // caseIdByMatchKey actually has, since _sourceCaseId is only ever stamped on the
-        // OUTERMOST array item, not re-stamped on nested keyed sub-arrays. An exact-only lookup
-        // therefore always misses for such fields, silently falling through to the path-walk
-        // (which doesn't cover array-item provenance at all — see extractAndStripSourceCaseId)
-        // and then to canonicalCaseId, misattributing every such field to the group's canonical
-        // case regardless of which item it actually came from. Stripping trailing "-"-joined
-        // components and retrying finds the correct, less-specific (parent item's own) key.
-        if (matchKey != null) {
-            String mk = matchKey;
-            while (true) {
-                String fromArrayItem = caseIdByMatchKey.get(mk);
-                if (fromArrayItem != null) return fromArrayItem;
-                int dash = mk.lastIndexOf('-');
-                if (dash < 0) break;
-                mk = mk.substring(0, dash);
-            }
-        }
+        if (itemCaseId != null && !itemCaseId.isEmpty()) return itemCaseId;
         String path = field;
         while (true) {
             String fromPath = caseIdByPath.get(path);
@@ -476,60 +467,6 @@ public class FlattenAndCompareFn
                 stripCaseIdByField(child.getAsJsonObject(), path, caseIdByPath);
             }
         }
-    }
-
-    /**
-     * {@code _sourceCaseId} rides through {@link JsonFieldExtractor#flatten} as an ordinary
-     * sibling field of each merged array item, sharing that item's matchKey. Pulls those
-     * entries out into a {@code matchKey -> case_id} lookup and removes them from
-     * {@code humanFields} so they're never treated as a comparable field.
-     *
-     * <h3>matchKey collisions between different items</h3>
-     * The matchKey (e.g. {@code addresses}' {@code streetNumber-postalCode}) identifies items
-     * by CONTENT for AI-vs-human comparison purposes — it is not guaranteed unique across
-     * different items of the same array. Two genuinely different items (different
-     * {@code addressType}, different contributing case) can legitimately share the same
-     * content — e.g. a case's {@code former} address happens to equal another case's
-     * {@code current} address. Naively {@code put()}-ing every entry into one flat map let
-     * whichever item was iterated last silently overwrite an earlier item's correct
-     * attribution, so a field under the EARLIER item's own (correct, untouched) matchKey would
-     * resolve to the LATER item's case instead — reproduced directly in production: a
-     * {@code current} address (case1) got attributed to {@code case3} purely because
-     * {@code case3}'s {@code former} address happened to share {@code current}'s street/postal.
-     * When a matchKey maps to more than one distinct case_id, there is no reliable way to tell
-     * from the matchKey alone which item a given comparison row actually belongs to — so rather
-     * than confidently reporting a possibly-wrong case, that matchKey is left out of the result
-     * entirely, letting {@link #resolveCaseId} fall through to its next-best signal
-     * (path-based attribution, then {@code canonicalCaseId}) instead of an arbitrary guess.
-     *
-     * <p>Package-visible for direct unit testing.
-     */
-    static Map<String, String> extractAndStripSourceCaseId(
-            Map<String, List<FieldValue>> humanFields) {
-        Map<String, String> caseIdByMatchKey = new HashMap<>();
-        Set<String> ambiguousMatchKeys = new HashSet<>();
-        List<String> toRemove = new ArrayList<>();
-        for (Map.Entry<String, List<FieldValue>> e : humanFields.entrySet()) {
-            String key = e.getKey();
-            if (!key.equals(SOURCE_CASE_ID_KEY) && !key.endsWith(SOURCE_CASE_ID_SUFFIX)) continue;
-            toRemove.add(key);
-            for (FieldValue fv : e.getValue()) {
-                if (fv.matchKey == null || fv.value == null) continue;
-                String existing = caseIdByMatchKey.get(fv.matchKey);
-                if (existing == null) {
-                    caseIdByMatchKey.put(fv.matchKey, fv.value);
-                } else if (!existing.equals(fv.value)) {
-                    ambiguousMatchKeys.add(fv.matchKey);
-                    LOG.warn("matchKey='{}' shared by items attributed to both '{}' and '{}' — "
-                                    + "can't tell them apart by content alone, leaving case_id "
-                                    + "attribution to fall through to the next signal",
-                            fv.matchKey, existing, fv.value);
-                }
-            }
-        }
-        ambiguousMatchKeys.forEach(caseIdByMatchKey::remove);
-        toRemove.forEach(humanFields::remove);
-        return caseIdByMatchKey;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -749,7 +686,7 @@ public class FlattenAndCompareFn
                                             fv.matchKey != null
                                                     ? keyRemap.getOrDefault(fv.matchKey, fv.matchKey)
                                                     : null,
-                                            fv.value))
+                                            fv.value, fv.caseId))
                                     .collect(Collectors.toList());
                         },
                         (a, b) -> a,
@@ -784,11 +721,11 @@ public class FlattenAndCompareFn
                 .set("load_time",        loadTime));
     }
 
-    private static Map<String, List<String>> groupByKey(List<FieldValue> entries) {
-        Map<String, List<String>> groups = new LinkedHashMap<>();
+    private static Map<String, List<FieldValue>> groupByKey(List<FieldValue> entries) {
+        Map<String, List<FieldValue>> groups = new LinkedHashMap<>();
         for (FieldValue fv : entries) {
             if (fv.matchKey != null) {
-                groups.computeIfAbsent(fv.matchKey, k -> new ArrayList<>()).add(fv.value);
+                groups.computeIfAbsent(fv.matchKey, k -> new ArrayList<>()).add(fv);
             }
         }
         return groups;

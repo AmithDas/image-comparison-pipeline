@@ -55,8 +55,17 @@ public final class JsonFieldExtractor {
 
     // ─────────────────────────────────────────────────────────────────────────
 
+    /** The synthetic sibling field {@code FilterAndPairFn.stampSourceCaseId} stamps onto each
+     *  merged array item — carries that item's contributing case_id. Read here (rather than
+     *  left for a caller to extract from a separately-flattened field list) specifically so
+     *  attribution travels WITH each value at the point it's produced, not through a secondary
+     *  matchKey-keyed lookup built afterward — see {@link #flattenObject}'s {@code caseId}
+     *  parameter for why. */
+    private static final String SOURCE_CASE_ID_KEY = "_sourceCaseId";
+
     /**
-     * A single flattened value together with its array match key.
+     * A single flattened value together with its array match key and, when it originated
+     * inside a case-attributed array item, that item's case_id.
      *
      * <ul>
      *   <li>{@code matchKey} is {@code null} for scalars and positional-array elements.</li>
@@ -64,20 +73,34 @@ public final class JsonFieldExtractor {
      *       (e.g. {@code "A"} when the element's {@code code} field equals {@code "A"}).</li>
      *   <li>{@code value} is the field's string value and may itself be {@code null}
      *       when the JSON value is {@code null}.</li>
+     *   <li>{@code caseId} is the case_id of the nearest enclosing array item that carried a
+     *       {@code _sourceCaseId} stamp — {@code null} for scalars outside any such array, or
+     *       when the payload has no case attribution at all (NO_CASE data). Distinct from
+     *       {@code matchKey}: two different items can share the same content-derived matchKey
+     *       (see {@code FlattenAndCompareFn.extractAndStripSourceCaseId}'s Javadoc for the
+     *       production bug that caused — a matchKey-keyed side lookup can't tell such items
+     *       apart, but each item's own {@code caseId}, carried directly on its values, always
+     *       can.</li>
      * </ul>
      */
     public static final class FieldValue {
         public final String matchKey;
         public final String value;
+        public final String caseId;
 
         public FieldValue(String matchKey, String value) {
+            this(matchKey, value, null);
+        }
+
+        public FieldValue(String matchKey, String value, String caseId) {
             this.matchKey = matchKey;
             this.value    = value;
+            this.caseId   = caseId;
         }
 
         @Override
         public String toString() {
-            return "FieldValue{matchKey=" + matchKey + ", value=" + value + "}";
+            return "FieldValue{matchKey=" + matchKey + ", value=" + value + ", caseId=" + caseId + "}";
         }
     }
 
@@ -184,7 +207,7 @@ public final class JsonFieldExtractor {
         try {
             JsonElement root = JsonParser.parseString(json);
             if (root.isJsonObject()) {
-                flattenObject(root.getAsJsonObject(), "", null, false, result, arrayMatchKeys);
+                flattenObject(root.getAsJsonObject(), "", null, false, result, arrayMatchKeys, null);
             } else {
                 List<FieldValue> list = new ArrayList<>();
                 list.add(new FieldValue(null, root.isJsonNull() ? null : root.toString()));
@@ -210,12 +233,19 @@ public final class JsonFieldExtractor {
      *                           {@code inheritedMatchKey}, so the object-level key
      *                           extraction block must be skipped to prevent doubling.
      *                           {@code false} in all other cases.
+     * @param inheritedCaseId    the case_id propagated from the nearest enclosing array item
+     *                           that carried a {@code _sourceCaseId} stamp ({@code null} at
+     *                           the root, inside a NO_CASE payload, or before any such item has
+     *                           been entered). Overridden by this object's OWN
+     *                           {@code _sourceCaseId} when present (see below), so a deeper
+     *                           item's stamp always takes precedence over an outer one's.
      */
     private static void flattenObject(JsonObject obj, String prefix,
                                       String inheritedMatchKey,
                                       boolean ownKeyAlreadySet,
                                       Map<String, List<FieldValue>> result,
-                                      Map<String, String> arrayMatchKeys) {
+                                      Map<String, String> arrayMatchKeys,
+                                      String inheritedCaseId) {
         // If this object path is configured with a key field AND the key was not
         // already extracted by a parent flattenArray call for the same path, extract
         // it now and incorporate it into inheritedMatchKey for all children.
@@ -236,21 +266,31 @@ public final class JsonFieldExtractor {
             }
         }
 
+        // This object's own _sourceCaseId (if any) takes over attribution for it and every
+        // descendant that doesn't carry a more specific stamp of its own — see the field
+        // Javadoc on FieldValue.caseId for why this travels with each value directly instead
+        // of through a matchKey-keyed side lookup built after the fact.
+        JsonElement ownCaseIdEl = obj.get(SOURCE_CASE_ID_KEY);
+        String caseId = (ownCaseIdEl != null && ownCaseIdEl.isJsonPrimitive())
+                ? ownCaseIdEl.getAsString() : inheritedCaseId;
+
         for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
+            if (SOURCE_CASE_ID_KEY.equals(entry.getKey())) continue; // bookkeeping, not a field
             String      key = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
             JsonElement val = entry.getValue();
 
             if (val.isJsonObject()) {
                 flattenObject(val.getAsJsonObject(), key, inheritedMatchKey, false,
-                              result, arrayMatchKeys);
+                              result, arrayMatchKeys, caseId);
             } else if (val.isJsonArray()) {
-                flattenArray(val.getAsJsonArray(), key, inheritedMatchKey, result, arrayMatchKeys);
+                flattenArray(val.getAsJsonArray(), key, inheritedMatchKey, result, arrayMatchKeys,
+                             caseId);
             } else if (val.isJsonNull()) {
                 result.computeIfAbsent(key, k -> new ArrayList<>())
-                      .add(new FieldValue(inheritedMatchKey, null));
+                      .add(new FieldValue(inheritedMatchKey, null, caseId));
             } else {
                 result.computeIfAbsent(key, k -> new ArrayList<>())
-                      .add(new FieldValue(inheritedMatchKey, val.getAsString()));
+                      .add(new FieldValue(inheritedMatchKey, val.getAsString(), caseId));
             }
         }
     }
@@ -266,7 +306,8 @@ public final class JsonFieldExtractor {
     private static void flattenArray(JsonArray arr, String prefix,
                                      String inheritedMatchKey,
                                      Map<String, List<FieldValue>> result,
-                                     Map<String, String> arrayMatchKeys) {
+                                     Map<String, String> arrayMatchKeys,
+                                     String inheritedCaseId) {
         List<JsonElement> elements = new ArrayList<>();
         arr.forEach(elements::add);
 
@@ -286,11 +327,14 @@ public final class JsonFieldExtractor {
                 if (el.isJsonObject()) {
                     // ownKeyAlreadySet=true: the element's key is already in keyValue;
                     // flattenObject must not extract it a second time for the same path.
+                    // caseId resolution (this element's own _sourceCaseId, if any, else
+                    // inheritedCaseId) happens inside flattenObject itself.
                     flattenObject(el.getAsJsonObject(), prefix, keyValue, true,
-                                  result, arrayMatchKeys);
+                                  result, arrayMatchKeys, inheritedCaseId);
                 } else {
                     result.computeIfAbsent(prefix, k -> new ArrayList<>())
-                          .add(new FieldValue(keyValue, el.isJsonNull() ? null : el.getAsString()));
+                          .add(new FieldValue(keyValue, el.isJsonNull() ? null : el.getAsString(),
+                                  inheritedCaseId));
                 }
             }
 
@@ -304,18 +348,18 @@ public final class JsonFieldExtractor {
                 if (el.isJsonObject()) {
                     Map<String, List<FieldValue>> temp = new LinkedHashMap<>();
                     flattenObject(el.getAsJsonObject(), prefix, inheritedMatchKey, false,
-                                  temp, arrayMatchKeys);
+                                  temp, arrayMatchKeys, inheritedCaseId);
                     temp.forEach((k, vals) ->
                             result.computeIfAbsent(k, x -> new ArrayList<>()).addAll(vals));
                 } else if (el.isJsonArray()) {
                     flattenArray(el.getAsJsonArray(), prefix, inheritedMatchKey,
-                                 result, arrayMatchKeys);
+                                 result, arrayMatchKeys, inheritedCaseId);
                 } else if (el.isJsonNull()) {
                     result.computeIfAbsent(prefix, k -> new ArrayList<>())
-                          .add(new FieldValue(inheritedMatchKey, null));
+                          .add(new FieldValue(inheritedMatchKey, null, inheritedCaseId));
                 } else {
                     result.computeIfAbsent(prefix, k -> new ArrayList<>())
-                          .add(new FieldValue(inheritedMatchKey, el.getAsString()));
+                          .add(new FieldValue(inheritedMatchKey, el.getAsString(), inheritedCaseId));
                 }
             }
         }

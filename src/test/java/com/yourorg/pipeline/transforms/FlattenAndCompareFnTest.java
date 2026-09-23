@@ -12,77 +12,45 @@ import java.util.Set;
 import com.yourorg.pipeline.util.JsonFieldExtractor;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
 
 /**
- * Direct unit tests for {@link FlattenAndCompareFn#resolveCaseId}, the pure case-id resolution
- * logic used per output row. Tested directly since the surrounding DoFn needs live Barricade
- * decryption with no local test seam (same limitation as {@code FilterAndPairFnMergeTest}'s doc
- * on why it tests {@code mergeJsonObjects} directly).
+ * Direct unit tests for {@link FlattenAndCompareFn#resolveCaseId} and for
+ * {@link JsonFieldExtractor#flatten}'s per-value case_id propagation (the mechanism
+ * {@code resolveCaseId}'s first-priority signal now relies on). Tested directly since the
+ * surrounding DoFn needs live Barricade decryption with no local test seam (same limitation as
+ * {@code FilterAndPairFnMergeTest}'s doc on why it tests {@code mergeJsonObjects} directly).
  */
 public class FlattenAndCompareFnTest {
 
-    /**
-     * A field directly under an array item (not itself inside a further nested keyed
-     * sub-array) has a matchKey identical to the item's own key — the exact lookup succeeds
-     * with no stripping needed.
-     */
+    /** The item's own case_id (carried directly on the FieldValue) always wins first. */
     @Test
-    public void directArrayItemFieldResolvesByExactMatchKey() {
-        Map<String, String> caseIdByMatchKey = Map.of("9148-52267", "CASE-34");
-
+    public void itemCaseIdTakesPrecedenceOverPathAndCanonical() {
         String result = FlattenAndCompareFn.resolveCaseId(
-                "addresses.addressRequested.streetNumber", "9148-52267",
-                caseIdByMatchKey, Map.of(), "CASE-CANONICAL");
+                "addresses.addressRequested.streetNumber", "CASE-34",
+                Map.of("addresses", "CASE-PATH"), "CASE-CANONICAL");
 
         assertEquals("CASE-34", result);
     }
 
-    /**
-     * Regression test: a field nested inside a keyed sub-array one level deeper than where
-     * _sourceCaseId is stamped (e.g. addresses.addressRequested.disputeCodes.code) has a
-     * matchKey that composites the parent item's own key with the sub-array item's own key
-     * (see JsonFieldExtractor.flattenArray) — MORE SPECIFIC than any key caseIdByMatchKey
-     * actually has, since _sourceCaseId is only ever stamped on the outermost array item.
-     * Before the fix, an exact-only lookup always missed here and fell through all the way to
-     * canonicalCaseId, misattributing every such field to the group's canonical case regardless
-     * of which item it actually came from — this is exactly the bug that surfaced in production
-     * as an address's disputeCodes rows resolving to the wrong case_id.
-     */
+    /** With no item case_id, falls back to the path-walk. */
     @Test
-    public void nestedSubArrayFieldFallsBackToParentItemsOwnMatchKey() {
-        Map<String, String> caseIdByMatchKey = Map.of(
-                "9547-52684", "CASE-33",
-                "9148-52267", "CASE-34");
-
-        String result = FlattenAndCompareFn.resolveCaseId(
-                "addresses.addressRequested.disputeCodes.code", "9547-52684-913-913",
-                caseIdByMatchKey, Map.of(), "CASE-CANONICAL");
-
-        assertEquals("Must fall back to the parent address item's own key (9547-52684), "
-                        + "not the group's canonical case",
-                "CASE-33", result);
-    }
-
-    /** When no matchKey entry exists at any stripped level, falls through to the path-walk. */
-    @Test
-    public void fallsBackToPathWalkWhenNoMatchKeyEntryFoundAtAnyLevel() {
-        Map<String, String> caseIdByMatchKey = Map.of("9148-52267", "CASE-34");
+    public void fallsBackToPathWalkWhenItemCaseIdAbsent() {
         Map<String, String> caseIdByPath = Map.of("addresses", "CASE-PATH");
 
         String result = FlattenAndCompareFn.resolveCaseId(
-                "addresses.addressRequested.disputeCodes.code", "9999-00000-111-111",
-                caseIdByMatchKey, caseIdByPath, "CASE-CANONICAL");
+                "addresses.addressRequested.disputeCodes.code", null,
+                caseIdByPath, "CASE-CANONICAL");
 
         assertEquals("CASE-PATH", result);
     }
 
-    /** With no matchKey, no path match, and no per-field attribution, falls back to canonical. */
+    /** With no item case_id and no path match, falls back to canonical. */
     @Test
     public void fallsBackToCanonicalWhenNothingElseMatches() {
         String result = FlattenAndCompareFn.resolveCaseId(
-                "someField", null, Map.of(), Map.of(), "CASE-CANONICAL");
+                "someField", null, Map.of(), "CASE-CANONICAL");
 
         assertEquals("CASE-CANONICAL", result);
     }
@@ -103,10 +71,12 @@ public class FlattenAndCompareFnTest {
      * (using the real {@link FlattenAndCompareFn#ARRAY_MATCH_KEYS}, which configures
      * {@code creditReportHeader} itself as a "customerNumber" keying context — see
      * JsonFieldExtractor.flattenObject — so nested disputeCodes items inherit a matchKey
-     * prefixed with the shared customerNumber, not just their own bare code value) →
-     * {@link FlattenAndCompareFn#extractAndStripSourceCaseId} → {@link
-     * FlattenAndCompareFn#resolveCaseId}. Confirms the loser's carried-forward slot resolves to
-     * its own case even with this extra matchKey-prefixing layer in play.
+     * prefixed with the shared customerNumber, not just their own bare code value) → {@link
+     * FlattenAndCompareFn#resolveCaseId}, reading each field's own {@code caseId} directly off
+     * its {@link JsonFieldExtractor.FieldValue} (carried through flatten from {@code
+     * _sourceCaseId} — no separate matchKey-keyed lookup involved). Confirms the loser's
+     * carried-forward slot resolves to its own case even with this extra matchKey-prefixing
+     * layer in play.
      */
     @Test
     public void creditReportHeaderLoserSlotResolvesToItsOwnCaseThroughFullPipeline() {
@@ -133,17 +103,14 @@ public class FlattenAndCompareFnTest {
 
         Map<String, List<JsonFieldExtractor.FieldValue>> humanFields =
                 JsonFieldExtractor.flatten(strippedPayload, FlattenAndCompareFn.ARRAY_MATCH_KEYS);
-        Map<String, String> caseIdByMatchKey =
-                FlattenAndCompareFn.extractAndStripSourceCaseId(humanFields);
 
         String field = "creditReportHeader.currentNameRequested.disputeCodes.code";
         List<JsonFieldExtractor.FieldValue> values = humanFields.get(field);
         assertEquals("Expected exactly one disputeCodes.code entry for the loser's slot",
                 1, values.size());
-        String matchKey = values.get(0).matchKey;
 
         String resolved = FlattenAndCompareFn.resolveCaseId(
-                field, matchKey, caseIdByMatchKey, caseIdByPath, "CASE-31");
+                field, values.get(0).caseId, caseIdByPath, "CASE-31");
 
         assertEquals("The earlier case's (CASE-32) carried-forward currentNameRequested slot "
                         + "must resolve to CASE-32, not the winner CASE-31 or canonical fallback",
@@ -151,82 +118,103 @@ public class FlattenAndCompareFnTest {
 
         // Also verify the WINNER's own slot (dateOfBirthRequested) resolves to CASE-31 through
         // this same full pipeline — not yet separately confirmed end-to-end, only at the pure
-        // merge-output level. It has no inner tag of its own, so it must fall through the
-        // matchKey branch (customerNumber-prefixed key, same mechanism as currentNameRequested)
-        // and land on the object-level "creditReportHeader" -> CASE-31 path entry.
+        // merge-output level. It has no inner tag of its own, so it must fall through to the
+        // object-level "creditReportHeader" -> CASE-31 path entry.
         String dobField = "creditReportHeader.dateOfBirthRequested.disputeCodes.code";
         List<JsonFieldExtractor.FieldValue> dobValues = humanFields.get(dobField);
         assertEquals(1, dobValues.size());
         String dobResolved = FlattenAndCompareFn.resolveCaseId(
-                dobField, dobValues.get(0).matchKey, caseIdByMatchKey, caseIdByPath, "CASE-31");
+                dobField, dobValues.get(0).caseId, caseIdByPath, "CASE-31");
         assertEquals("The winner's own dateOfBirthRequested slot must resolve to CASE-31",
                 "CASE-31", dobResolved);
     }
 
-    // ── extractAndStripSourceCaseId: matchKey collisions between different items ────
+    // ── Regression: items whose content collides on the comparison-time matchKey ────
 
     /**
-     * Regression test for a production bug: {@code addresses} is keyed for comparison by
-     * content ({@code streetNumber-postalCode}), which is NOT guaranteed unique across
-     * different items of the array — a case's {@code former} address can legitimately equal
-     * another case's {@code current} address. Reproduced exactly: case1's {@code current}
-     * (streetNumber=8027, postalCode=78645) and case3's {@code former} (the same
-     * streetNumber/postalCode) produce the identical matchKey "8027-78645" despite being two
-     * different items attributed to two different cases. Before this fix, the second item
-     * processed silently overwrote the first's entry in {@code caseIdByMatchKey}, so
-     * {@code current}'s own fields resolved to whichever case's item happened to be iterated
-     * last (case3) instead of its own correct case (case1) — observed in production as
-     * {@code current} showing the wrong (later) case_id in {@code comparison_results} despite
-     * the merged payload's own embedded {@code _sourceCaseId} being correct.
+     * Regression test for a production bug: {@code addresses} is keyed for AI-vs-human
+     * comparison by content ({@code streetNumber-postalCode}), which is NOT guaranteed unique
+     * across different items of the array — a case's {@code former} address can legitimately
+     * equal another case's {@code current} address. Reproduced exactly: case1's {@code current}
+     * (streetNumber=8027, postalCode=78645) and case3's {@code former} (the same values)
+     * produce the identical matchKey "8027-78645" despite being two different items
+     * attributed to two different cases.
+     *
+     * <p>Before the fix, {@code _sourceCaseId} was extracted into a separate {@code matchKey ->
+     * case_id} side map, so a shared matchKey meant one item's attribution silently overwrote
+     * the other's (or, after an interim fix, both were left unresolved). Now each item's
+     * {@code caseId} is carried directly on its own {@link JsonFieldExtractor.FieldValue} by
+     * {@code flatten} itself — a matchKey collision can no longer cause cross-contamination,
+     * because there is no shared lookup to collide in. Both items resolve correctly: {@code
+     * current} to case1, {@code former} to case3.
      */
     @Test
-    public void ambiguousMatchKeyFromTwoDifferentItemsIsExcludedRatherThanGuessed() {
-        String matchKey = "8027-78645";
-        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields = new HashMap<>();
-        humanFields.put("addresses._sourceCaseId", List.of(
-                new JsonFieldExtractor.FieldValue(matchKey, "case1"),   // current
-                new JsonFieldExtractor.FieldValue(matchKey, "case3")));  // former (colliding)
+    public void differentItemsSharingAMatchKeyEachResolveToTheirOwnCase() {
+        JsonObject payload = JsonParser.parseString(
+                "{\"addresses\":["
+                        + "{\"addressType\":\"current\",\"streetNumber\":\"8027\","
+                        + "\"postalCode\":\"78645\",\"addressRequested\":{\"disputeCodes\":"
+                        + "[{\"code\":\"A1\"}]},\"_sourceCaseId\":\"case1\"},"
+                        + "{\"addressType\":\"former\",\"streetNumber\":\"8027\","
+                        + "\"postalCode\":\"78645\",\"_sourceCaseId\":\"case3\"}"
+                        + "]}").getAsJsonObject();
 
-        Map<String, String> caseIdByMatchKey =
-                FlattenAndCompareFn.extractAndStripSourceCaseId(humanFields);
+        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields =
+                JsonFieldExtractor.flatten(payload.toString(), FlattenAndCompareFn.ARRAY_MATCH_KEYS);
 
-        assertNull("An ambiguous matchKey (two different items, two different cases) must not "
-                        + "be resolvable to either case — confidently returning one would be a "
-                        + "guess, not a fact",
-                caseIdByMatchKey.get(matchKey));
-        assertTrue("_sourceCaseId must still be stripped from the comparable field set even "
-                        + "when ambiguous",
-                humanFields.isEmpty());
+        List<JsonFieldExtractor.FieldValue> addressTypes = humanFields.get("addresses.addressType");
+        assertEquals(2, addressTypes.size());
+        assertEquals("8027-78645", addressTypes.get(0).matchKey);
+        assertEquals("8027-78645", addressTypes.get(1).matchKey);
+
+        JsonFieldExtractor.FieldValue currentType = addressTypes.stream()
+                .filter(fv -> "current".equals(fv.value)).findFirst().orElseThrow();
+        JsonFieldExtractor.FieldValue formerType = addressTypes.stream()
+                .filter(fv -> "former".equals(fv.value)).findFirst().orElseThrow();
+
+        assertEquals("current's own case_id must survive despite sharing former's matchKey",
+                "case1", currentType.caseId);
+        assertEquals("former's own case_id must survive despite sharing current's matchKey",
+                "case3", formerType.caseId);
+
+        // The nested disputeCodes item (only present under `current`) must inherit `current`'s
+        // case_id, not fall through to the group canonical or pick up `former`'s.
+        List<JsonFieldExtractor.FieldValue> disputeCodes =
+                humanFields.get("addresses.addressRequested.disputeCodes.code");
+        assertEquals(1, disputeCodes.size());
+        assertEquals("case1", disputeCodes.get(0).caseId);
+
+        // resolveCaseId, as the production row-emission loop actually calls it: each item's
+        // own caseId is used directly, taking precedence over any path/canonical fallback.
+        assertEquals("case1", FlattenAndCompareFn.resolveCaseId(
+                "addresses.addressType", currentType.caseId, Map.of(), "CASE-CANONICAL"));
+        assertEquals("case3", FlattenAndCompareFn.resolveCaseId(
+                "addresses.addressType", formerType.caseId, Map.of(), "CASE-CANONICAL"));
     }
 
-    /** Two items sharing a matchKey but attributed to the SAME case is not ambiguous at all. */
+    /** {@code _sourceCaseId} itself must never surface as a comparable field. */
     @Test
-    public void sameCaseAttributedTwiceAtTheSameMatchKeyIsNotTreatedAsAmbiguous() {
-        String matchKey = "8027-78645";
-        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields = new HashMap<>();
-        humanFields.put("addresses._sourceCaseId", List.of(
-                new JsonFieldExtractor.FieldValue(matchKey, "case1"),
-                new JsonFieldExtractor.FieldValue(matchKey, "case1")));
+    public void sourceCaseIdIsNeverEmittedAsItsOwnComparableField() {
+        JsonObject payload = JsonParser.parseString(
+                "{\"addresses\":[{\"streetNumber\":\"8027\",\"postalCode\":\"78645\","
+                        + "\"_sourceCaseId\":\"case1\"}]}").getAsJsonObject();
 
-        Map<String, String> caseIdByMatchKey =
-                FlattenAndCompareFn.extractAndStripSourceCaseId(humanFields);
+        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields =
+                JsonFieldExtractor.flatten(payload.toString(), FlattenAndCompareFn.ARRAY_MATCH_KEYS);
 
-        assertEquals("case1", caseIdByMatchKey.get(matchKey));
+        assertFalse(humanFields.containsKey("addresses._sourceCaseId"));
     }
 
-    /** A genuine, non-colliding matchKey resolves normally alongside an unrelated ambiguous one. */
+    /** A NO_CASE payload (no _sourceCaseId anywhere) leaves every FieldValue's caseId null. */
     @Test
-    public void nonCollidingMatchKeyStillResolvesWhenAnotherMatchKeyIsAmbiguous() {
-        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields = new HashMap<>();
-        humanFields.put("addresses._sourceCaseId", List.of(
-                new JsonFieldExtractor.FieldValue("8027-78645", "case1"),
-                new JsonFieldExtractor.FieldValue("8027-78645", "case3"),  // ambiguous
-                new JsonFieldExtractor.FieldValue("9148-52267", "case2"))); // unambiguous
+    public void noCaseAttributionLeavesCaseIdNullThroughoutFlatten() {
+        JsonObject payload = JsonParser.parseString(
+                "{\"addresses\":[{\"streetNumber\":\"1\",\"postalCode\":\"2\"}]}")
+                .getAsJsonObject();
 
-        Map<String, String> caseIdByMatchKey =
-                FlattenAndCompareFn.extractAndStripSourceCaseId(humanFields);
+        Map<String, List<JsonFieldExtractor.FieldValue>> humanFields =
+                JsonFieldExtractor.flatten(payload.toString(), FlattenAndCompareFn.ARRAY_MATCH_KEYS);
 
-        assertNull(caseIdByMatchKey.get("8027-78645"));
-        assertEquals("case2", caseIdByMatchKey.get("9148-52267"));
+        assertNull(humanFields.get("addresses.streetNumber").get(0).caseId);
     }
 }
