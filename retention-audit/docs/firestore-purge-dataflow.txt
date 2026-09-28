@@ -1,0 +1,423 @@
+================================================================================
+HOW THE FIRESTORE PURGE PIPELINE (DATAFLOW) WORKS
+================================================================================
+Audience: Engineers reviewing / deploying the job, audit & compliance team
+Status:   PROPOSED DESIGN — not yet implemented. This document describes how
+          the job is intended to work so it can be reviewed before coding.
+Related:  retention-audit/README.md (overall 7-year retention audit)
+          retention-audit/docs/firestore-scan-dataflow.txt (the scan job
+          that produces the input for this job)
+          retention-audit/docs/firestore-purge-architecture.png (diagram)
+
+
+--------------------------------------------------------------------------------
+1. PURPOSE
+--------------------------------------------------------------------------------
+
+Compliance allows keeping data for 7 years only. The scan job produces one
+metadata row per Firestore document. From that, a list of documents older
+than 7 years is built, reviewed and approved. This job deletes EXACTLY the
+approved documents — nothing else — and records what happened to each one.
+
+This is the ONLY component in the retention design that writes to prod
+Firestore. Everything about it is built around not deleting the wrong thing:
+
+  - it only acts on compliance-approved batches;
+  - it runs in dry-run mode unless a real delete is explicitly requested;
+  - every delete carries a precondition, so a document that changed after
+    the scan is never deleted;
+  - every outcome is logged as compliance evidence.
+
+It is a ONE-TIME cleanup. Ongoing retention is handled by Firestore TTL
+policies (section 13), after which this job is no longer needed.
+
+
+--------------------------------------------------------------------------------
+2. WHERE IT RUNS AND WHAT IT CAN ACCESS
+--------------------------------------------------------------------------------
+
+Everything runs inside the PROD project:
+
+  Firestore (Native) ........ target of the deletes
+  Dataflow batch job ........ runs as a dedicated PURGE service account
+  BigQuery dataset "audit" .. approved list (input) + purge log (output)
+  GCS bucket (backup) ....... pre-purge export, 30-day lifecycle rule
+  GCS bucket (temp/staging) . Dataflow staging, 1-day lifecycle rule
+
+Purge service account (separate from the scan SA):
+
+  roles/datastore.user          on the prod project   -> Firestore deletes
+  roles/bigquery.dataViewer     on the "audit" dataset -> read approved list
+  roles/bigquery.dataEditor     on the "audit" dataset -> write purge log
+  roles/bigquery.jobUser        on the prod project   -> run read/load jobs
+  roles/dataflow.worker         on the prod project   -> run as a worker
+  roles/storage.objectAdmin     on the temp bucket    -> staging files only
+
+Separation of duties:
+
+  Compliance ....... approves batches; cannot run the job
+  Ops / engineer ... launches the job with an approved batch_id;
+                     cannot approve batches
+  Purge SA ......... the only identity with Firestore write access in the
+                     retention design; used only by this job
+
+
+--------------------------------------------------------------------------------
+3. PIPELINE AT A GLANCE
+--------------------------------------------------------------------------------
+
+  audit.firestore_doc_metadata (from the scan job)
+          |
+          v
+  Review & approval (compliance)  -->  audit.firestore_purge_approved
+                                               |
+  ---------------------------------------------|------ Purge Dataflow job --
+                                               v
+  [1] Read approved list (BigQueryIO)          rows for one batch_id
+          |
+          v
+  [2] Guardrails                               stop the job on any failure
+          |
+          v
+  [3] Build deletes                            Write with updateTime
+          |                                    precondition
+          v
+  [4] Batch write (FirestoreIO)  ---- or ----  Dry run: batchGet + compare,
+          |          \                         no writes
+          |           \--> failures (dead-letter)
+          v
+  [5] Log outcomes                             audit.firestore_purge_log
+  ---------------------------------------------------------------------------
+          |
+          v
+  [6] Verification (after the run)
+
+Language / SDK: Beam Java, using Beam's built-in FirestoreIO and BigQueryIO.
+
+
+--------------------------------------------------------------------------------
+4. BEFORE THE JOB RUNS
+--------------------------------------------------------------------------------
+
+4.1 Build the candidate list
+
+  Start from the document-level "older than 7 years" query on
+  audit.firestore_doc_metadata (see README.md). Each candidate has an age
+  (business date field where one exists, otherwise createTime) and an
+  age_source.
+
+4.2 Remove documents that must not be deleted
+
+  - Legal hold:        document IDs supplied by compliance.
+  - Recently updated:  old documents with update_time within the last
+                       7 years, IF the policy runs from last activity
+                       rather than creation (compliance decides).
+  - Unreliable age:    createTime-based ages inside a migration/import
+                       spike (the age may be the migration date).
+  - Subcollections:    decide per collection whether children of a
+                       deleted parent are also in scope (a parent delete
+                       does NOT delete its subcollections).
+
+4.3 Write the approved list
+
+  The reviewed rows are written to audit.firestore_purge_approved, grouped
+  into batches (e.g. one batch per collection group):
+
+  Column            Type       Description
+  ----------------  ---------  -----------------------------------------------
+  batch_id          STRING     Approval unit, e.g. "2026-10-orders-01"
+  doc_path          STRING     Document path within the database
+  collection_group  STRING     e.g. orders
+  update_time       TIMESTAMP  update_time AS SCANNED (used as precondition)
+  age_ts            TIMESTAMP  Age used for the decision
+  age_source        STRING     'date field' or 'createTime'
+  scan_time         TIMESTAMP  When the scan that produced the row ran
+  approved_by       STRING     Compliance approver
+  approved_at       TIMESTAMP  Approval time
+
+  IMPORTANT: this table must NOT inherit the audit dataset's 30-day
+  expiry while a batch is pending (set a longer expiration on it), and it
+  should be deleted once the purge is complete and logged.
+
+4.4 Compliance sign-off
+
+  Compliance reviews each batch (row counts per collection, age sources,
+  exclusions) and sets approved_by / approved_at. The job refuses any row
+  without an approval.
+
+4.5 Backup
+
+  Export the affected collection groups (Firestore managed export) to the
+  backup bucket BEFORE the first real run. The export is itself a copy of
+  over-age data, so the bucket has a 30-day lifecycle rule; otherwise the
+  backup becomes the new compliance problem.
+
+
+--------------------------------------------------------------------------------
+5. STEP BY STEP
+--------------------------------------------------------------------------------
+
+5.1 Read the approved list
+
+  BigQueryIO.read() runs a parameterised query:
+
+      SELECT doc_path, collection_group, update_time, age_ts, scan_time
+      FROM audit.firestore_purge_approved
+      WHERE batch_id = @batch_id
+        AND approved_by IS NOT NULL
+        AND approved_at IS NOT NULL
+
+  One element per document to delete.
+
+5.2 Guardrails — checked BEFORE anything is written
+
+  The job stops with zero writes if any check fails:
+
+  Check                        Why
+  ---------------------------  ----------------------------------------------
+  --dryRun (default: true)     A real delete must be requested explicitly
+                               with --dryRun=false
+  --allowedCollectionGroups    Rows outside the listed groups fail the job,
+                               even if they are in the approved list
+  --maxDeletes                 Batch larger than expected (e.g. a bad join
+                               in the list query) fails the job
+  Scan age (--maxScanAgeDays)  List built from a scan older than N days
+                               (e.g. 14) is refused — data may have changed
+  Age re-check                 Every row's age_ts must be before
+                               CURRENT_DATE - 7 years, computed in code at
+                               run time — a recent document can never be
+                               deleted even if the list is wrong
+  Empty batch                  Unknown or empty batch_id fails the job
+
+  The count and group checks run over the whole batch first (a global
+  combine), so the job fails before the first delete, not halfway through.
+
+5.3 Build the delete requests
+
+  Each row becomes a Firestore Write:
+
+      Write.newBuilder()
+          .setDelete("projects/<p>/databases/<db>/documents/" + docPath)
+          .setCurrentDocument(Precondition.newBuilder()
+              .setUpdateTime(scannedUpdateTime))
+          .build();
+
+  The updateTime precondition is the key safety net. Firestore deletes the
+  document ONLY if its current updateTime equals the scanned value:
+
+    - document updated since the scan  -> delete rejected, document kept,
+                                          logged as SKIPPED_MODIFIED
+    - document already deleted         -> delete rejected,
+                                          logged as SKIPPED_MISSING
+    - document unchanged               -> deleted, logged as DELETED
+
+  So even a stale or wrong list cannot delete a document that was touched
+  after the scan.
+
+5.4 Batch write (real run)
+
+  FirestoreIO.v1().write().batchWrite().withDeadLetterQueue():
+
+    - groups deletes into BatchWrite requests (up to 500 writes each);
+      writes in a batch succeed or fail individually (not a transaction);
+    - throttles with RpcQosOptions: ramps traffic up gradually instead of
+      hitting prod at full rate, backs off when Firestore pushes back, and
+      retries transient errors with exponential backoff;
+    - sends every write that finally fails (failed precondition, not found,
+      permission denied, ...) to a dead-letter output instead of failing
+      the job.
+
+  --maxNumWorkers caps the overall delete rate. Start with 1-2, off-peak.
+
+5.5 Dry run (default)
+
+  Instead of 5.4, the job does a read-only check:
+
+    - batchGet the current version of every document in the batch;
+    - compare its updateTime with the scanned value;
+    - emit WOULD_DELETE, WOULD_SKIP_MODIFIED or WOULD_SKIP_MISSING.
+
+  Nothing is written to Firestore. The outcomes go to the purge log with
+  dry_run = true. ALWAYS dry-run a batch before the real run and review
+  the counts with compliance.
+
+5.6 Log outcomes
+
+  Every document gets exactly one row in audit.firestore_purge_log:
+
+  Column            Type       Description
+  ----------------  ---------  -----------------------------------------------
+  run_id            STRING     Dataflow job ID
+  batch_id          STRING     Approved batch
+  doc_path          STRING     Document
+  collection_group  STRING     e.g. orders
+  outcome           STRING     DELETED | SKIPPED_MODIFIED | SKIPPED_MISSING |
+                               FAILED | WOULD_DELETE | WOULD_SKIP_MODIFIED |
+                               WOULD_SKIP_MISSING
+  error             STRING     Firestore status message for rejected writes
+  dry_run           BOOL       True for dry runs
+  run_time          TIMESTAMP  When the job ran
+
+  How outcomes are derived in a real run:
+
+    - dead-letter element with FAILED_PRECONDITION / NOT_FOUND
+        -> SKIPPED_MODIFIED or SKIPPED_MISSING (checked with a batchGet:
+           document exists -> modified, absent -> missing)
+    - any other dead-letter element -> FAILED
+    - every other document in the batch -> DELETED
+      (attempted set minus dead-letter set, joined on doc_path)
+
+  Written with BigQueryIO FILE_LOADS, WRITE_APPEND (each run adds rows).
+
+  The purge log is the COMPLIANCE EVIDENCE of what was deleted, when and
+  under which approval. It contains only IDs and outcomes and must be kept
+  as long as compliance requires — it is the one audit table that must
+  NOT have the 30-day expiry.
+
+5.7 Verification (after a real run)
+
+  1. Sample check: batchGet a sample of DELETED paths — none should exist.
+  2. Counts: per collection group,
+       DELETED + SKIPPED_* + FAILED = rows in the approved batch
+     and the collection's document count (count query) should drop by the
+     number of DELETED rows.
+  3. SKIPPED_MODIFIED review: these documents changed after the scan, which
+     usually means they are in active use — review with the data owner.
+  4. FAILED review: fix the cause (e.g. permissions) and re-run the batch;
+     re-running is safe (see section 8).
+
+
+--------------------------------------------------------------------------------
+6. PARAMETERS
+--------------------------------------------------------------------------------
+
+  --project                  Prod project (where the job runs)
+  --region                   Dataflow region
+  --databaseId               Firestore database, default "(default)"
+  --batchId                  Approved batch to process (required)
+  --approvedTable            prod-project:audit.firestore_purge_approved
+  --logTable                 prod-project:audit.firestore_purge_log
+  --dryRun                   Default true; set false for a real delete
+  --allowedCollectionGroups  Comma-separated groups this run may touch
+  --maxDeletes               Hard cap on rows in the batch
+  --maxScanAgeDays           Refuse lists from older scans, e.g. 14
+  --maxNumWorkers            Parallelism / delete-rate cap, start with 1-2
+  --serviceAccount           The dedicated purge SA (section 2)
+  --tempLocation             gs://<restricted-bucket>/tmp
+  --stagingLocation          gs://<restricted-bucket>/staging
+
+
+--------------------------------------------------------------------------------
+7. MONITORING A RUN
+--------------------------------------------------------------------------------
+
+  Dataflow UI (custom counters):
+    rows_read            approved rows for the batch
+    deletes_attempted    writes sent to Firestore
+    deleted              successful deletes
+    skipped_modified     rejected: changed since scan
+    skipped_missing      rejected: already gone
+    failed               other failures
+
+  Cloud Monitoring (Firestore):
+    delete operations    should ramp up gradually and plateau
+    latency / errors     watch application-facing latency; if it degrades,
+                         cancel the job and re-run with fewer workers
+
+  Cancelling mid-run is safe: documents already deleted stay deleted, the
+  rest are untouched, and a re-run picks up where it left off (section 8).
+  The purge log may be missing rows for a cancelled run — re-run the batch
+  (dry run is enough) to produce a complete log.
+
+
+--------------------------------------------------------------------------------
+8. RE-RUNS AND FAILURE HANDLING
+--------------------------------------------------------------------------------
+
+  - Re-running a batch is safe: documents deleted in an earlier run come
+    back as SKIPPED_MISSING; nothing is ever deleted twice and nothing
+    outside the batch is touched.
+  - Transient Firestore errors are retried automatically (RpcQosOptions);
+    only persistent failures reach the dead-letter output.
+  - If the scan is older than --maxScanAgeDays, re-run the scan job and
+    rebuild / re-approve the list rather than raising the limit.
+
+
+--------------------------------------------------------------------------------
+9. COST AND RUN TIME
+--------------------------------------------------------------------------------
+
+  Firestore deletes   1 delete operation per document
+                      (~$0.02 per 100,000 deletes, varies by region)
+  Firestore reads     dry runs and verification: 1 read per document checked
+  Dataflow            small; delete rate is throttled, not compute-bound
+  BigQuery            load jobs are free; purge log is small (IDs only)
+  Run time            deliberately throttled — plan for hours on very large
+                      batches; smaller batches per collection are easier to
+                      review and schedule
+
+  Storage cost drops once the deletes complete (index entries are removed
+  with the documents).
+
+
+--------------------------------------------------------------------------------
+10. ROLLOUT
+--------------------------------------------------------------------------------
+
+  1. Non-prod: dry run, then real run, then verification (5.7).
+  2. Prod: dry run of the FULL first batch; review WOULD_* counts with
+     compliance.
+  3. Prod: backup export of the affected collection group(s) (4.5).
+  4. Prod: real run on ONE small collection group, --maxNumWorkers=1,
+     off-peak; verify.
+  5. Prod: remaining batches one at a time (dry run -> approval -> real
+     run -> verify), off-peak.
+
+
+--------------------------------------------------------------------------------
+11. SECURITY AND COMPLIANCE NOTES
+--------------------------------------------------------------------------------
+
+  - Deleted data can still exist for a while elsewhere:
+      * point-in-time recovery (if enabled) keeps old versions up to 7 days;
+      * managed backups / exports keep copies until they expire (30-day
+        lifecycle on the backup bucket).
+    Compliance should be told about these windows.
+  - Subcollections are not deleted with their parent. If a parent is
+    deleted and its newer children are not, the children remain reachable
+    by path — decide per collection whether that is acceptable.
+  - The purge log contains document IDs only and is kept as evidence; the
+    approved list is deleted once the batch is complete and logged.
+  - Creating the SA, buckets and job in prod goes through the normal prod
+    change-management approval.
+
+
+--------------------------------------------------------------------------------
+12. BIGQUERY DOES NOT NEED THIS PIPELINE
+--------------------------------------------------------------------------------
+
+  BigQuery retention is SQL / table settings, run by the dataset owners:
+
+  - Tables partitioned on the business date:
+        ALTER TABLE ... SET OPTIONS (partition_expiration_days = 2557);
+    (2557 days ~ 7 years) — old partitions are dropped automatically.
+  - Other tables: a scheduled query
+        DELETE FROM ... WHERE date_col <
+          DATE_SUB(CURRENT_DATE(), INTERVAL 7 YEAR);
+  - Deleted data stays in time travel + fail-safe for up to 14 days.
+
+
+--------------------------------------------------------------------------------
+13. AFTER THE CLEANUP: FIRESTORE TTL
+--------------------------------------------------------------------------------
+
+  To avoid ever needing this job again, per collection:
+
+  1. Backfill createdAt (from the date field / ID / parent / createTime)
+     and expireAt = createdAt + 7 years.
+  2. Set both in application code on every write.
+  3. Enable a TTL policy on expireAt:
+       Firestore -> TTL -> create policy (collection group, field expireAt)
+  4. Firestore then deletes expired documents automatically (typically
+     within a day or so of expiry). TTL deletes also do not cascade to
+     subcollections, so each subcollection needs its own expireAt + policy.

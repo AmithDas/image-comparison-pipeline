@@ -1,0 +1,359 @@
+================================================================================
+HOW THE FIRESTORE METADATA SCAN (DATAFLOW) WORKS
+================================================================================
+Audience: Engineers reviewing / deploying the job, audit & compliance team
+Status:   PROPOSED DESIGN — not yet implemented. This document describes how
+          the job is intended to work so it can be reviewed before coding.
+Related:  retention-audit/README.md (overall 7-year retention audit)
+          retention-audit/docs/firestore-scan-architecture.png (diagram)
+
+
+--------------------------------------------------------------------------------
+1. PURPOSE
+--------------------------------------------------------------------------------
+
+Compliance allows keeping data for 7 years only. To find Firestore data older
+than that we need, for EVERY document, (a) how old it is and (b) how big it
+is. Firestore (Native mode) cannot answer this directly:
+
+  - There is no INFORMATION_SCHEMA and no per-collection size or count.
+  - Each document carries createTime / updateTime, but they are NOT
+    queryable — you cannot ask "documents created before 2019".
+  - Many collections have no date field of their own.
+
+The job solves this by reading every document ONCE and writing one small
+metadata row per document into a BigQuery table. After that, every audit
+question — per collection, per document, per size — is a SQL query.
+
+What the job does NOT do:
+
+  - It does not write, update or delete anything in Firestore.
+  - It does not copy document content. Only IDs, timestamps, date-like
+    values and a computed size reach BigQuery.
+  - It does not purge. Purging is a separate, later job (section 11).
+
+
+--------------------------------------------------------------------------------
+2. WHERE IT RUNS AND WHAT IT CAN ACCESS
+--------------------------------------------------------------------------------
+
+Everything runs inside the PROD project:
+
+  Firestore (Native) ........ source, read-only
+  Dataflow batch job ........ runs as a dedicated service account (SA)
+  BigQuery dataset "audit" .. restricted destination, 30-day table expiry
+  GCS bucket (temp/staging) . Dataflow staging + BigQuery load files,
+                              lifecycle rule: delete objects after 1 day
+
+Service account permissions (least privilege):
+
+  roles/datastore.viewer        on the prod project   -> read Firestore only
+  roles/bigquery.dataEditor     on the "audit" DATASET -> write there only
+  roles/bigquery.jobUser        on the prod project   -> run load jobs
+  roles/dataflow.worker         on the prod project   -> run as a worker
+  roles/storage.objectAdmin     on the temp BUCKET    -> staging files only
+
+The SA cannot write to Firestore or to any other BigQuery dataset.
+Launching the job needs someone with Dataflow deploy rights; reading the
+results only needs BigQuery Data Viewer on the "audit" dataset.
+
+
+--------------------------------------------------------------------------------
+3. PIPELINE AT A GLANCE
+--------------------------------------------------------------------------------
+
+  Collection group IDs (parameter)
+          |
+          v
+  [1] Build PartitionQuery requests        one request per collection group
+          |
+          v
+  [2] PartitionQuery (FirestoreIO)         split each group into N ranges
+          |
+          v
+  [3] RunQuery (FirestoreIO)               read each range in parallel
+          |                                -> Document (name, fields,
+          |                                   createTime, updateTime)
+          v
+  [4] ExtractDocMetadataFn (ParDo)         build metadata row,
+          |            \                   discard content
+          |             \--> errors -----> audit.firestore_doc_metadata_errors
+          v
+  [5] BigQueryIO write (file loads)        audit.firestore_doc_metadata
+                                           (WRITE_TRUNCATE)
+
+Language / SDK: Beam Java (same stack as the existing Dataflow jobs), using
+Beam's built-in org.apache.beam.sdk.io.gcp.firestore.FirestoreIO.
+
+
+--------------------------------------------------------------------------------
+4. STEP BY STEP
+--------------------------------------------------------------------------------
+
+4.1 Input: which collections to scan
+
+  The job takes a list of COLLECTION GROUP IDs, e.g.
+
+      --collectionGroups=users,orders,events,line_items
+
+  A collection group is every collection with that ID at any depth, so
+  "orders" covers both /orders and /users/{id}/orders. The list comes from
+  the Firestore Studio inventory done during the console audit.
+
+  Why a list instead of automatic discovery: finding every subcollection
+  means calling listCollectionIds on every single document, which doubles
+  the cost and run time. A reviewed list is cheaper and predictable.
+
+  Optional shortcut to test on non-prod first: a query with
+  allDescendants=true and NO collection ID spans all collections. If it
+  works on this database, one pass covers everything without a list.
+
+4.2 Build PartitionQuery requests
+
+  For each collection group, a small DoFn builds one PartitionQueryRequest:
+
+      parent          = projects/<p>/databases/<db>/documents
+      structuredQuery = from { collectionId: <group>, allDescendants: true }
+                        orderBy __name__ ASC      (required for partitioning)
+      partitionCount  = --partitionCount (e.g. 200)
+
+4.3 PartitionQuery — split the work
+
+  FirestoreIO.v1().read().partitionQuery().withNameOnlyQuery() asks
+  Firestore for cursor points that split the group into roughly equal
+  ranges of document names. Each range becomes its own RunQueryRequest.
+
+  This is what makes the job fast: instead of one worker walking a
+  100-million-document collection, hundreds of ranges are read in parallel
+  by all workers. Firestore may return fewer partitions than requested for
+  small collections — that is normal.
+
+4.4 RunQuery — read the documents
+
+  FirestoreIO.v1().read().runQuery() executes each range and streams back
+  RunQueryResponse messages. Each contains a Document with:
+
+      name        projects/p/databases/(default)/documents/users/u1/orders/o9
+      fields      full document content (used only in step 4.5)
+      createTime  when the document was first written
+      updateTime  when it was last changed
+
+  Protecting prod:
+
+    - RpcQosOptions: FirestoreIO's built-in adaptive throttling. When
+      Firestore returns throttling/unavailable errors, the client backs off
+      and lowers its request rate automatically; transient errors are
+      retried with exponential backoff.
+    - --maxNumWorkers caps total parallelism (start small, e.g. 5-10).
+    - Run off-peak.
+
+  Consistency (optional read time):
+
+    - withReadTime(<timestamp>) makes every range read the database as of
+      the same instant (a consistent snapshot).
+    - Without point-in-time recovery (PITR) the read time must be within
+      the last hour; with PITR, within the last 7 days.
+    - If PITR is off and the job may run longer than an hour, leave the
+      read time unset. Documents changing during the scan do not matter for
+      an audit, and the purge job re-checks each document (section 11).
+
+4.5 ExtractDocMetadataFn — build the row, drop the content
+
+  For every document the worker computes the fields below, emits ONE row,
+  and lets the document go out of scope. Content never leaves the worker.
+
+  a) Path fields — parsed from the document name after ".../documents/":
+
+       users/u1/orders/o9
+         doc_path         users/u1/orders/o9
+         doc_id           o9
+         collection_group orders
+         collection_path  users/{id}/orders    (IDs replaced by {id})
+         parent_doc_path  users/u1             (null for top-level docs)
+         depth            2                    (collection nesting level)
+
+  b) System timestamps: create_time, update_time.
+
+  c) date_fields (JSON) — only values that LOOK like dates, found by walking
+     top-level fields and nested maps (dotted paths, e.g. "meta.createdAt"):
+
+       - any timestampValue
+       - strings matching ^\d{4}-\d{2}-\d{2} (ISO dates / datetimes)
+       - integers whose field name looks like a date
+         (date|time|_at|At|_ts|_ms) AND whose value falls between
+         1970 and 2100 as epoch seconds or milliseconds
+
+     Arrays are not walked (would multiply entries); capped at 20 entries
+     per document. Example:
+       {"createdAt":"2018-03-01T10:22:05Z","meta.updated_at":"2020-02-02"}
+
+     No other values are kept — names, emails, payloads etc. are dropped.
+
+  d) est_size_bytes — Firestore's documented storage size formula:
+
+       document size = document name size
+                     + sum over fields of (field name size + value size)
+                     + 32
+
+       document name size = sum over path segments of
+                            (UTF-8 bytes + 1, or 8 for integer IDs) + 16
+       field name size    = UTF-8 bytes + 1
+       value size:
+         string        UTF-8 bytes + 1      bytes      length
+         integer       8                    double     8
+         boolean       1                    null       1
+         timestamp     8                    geo point  16
+         reference     document name size of the referenced document
+         map           sum of (key size + value size)
+         array         sum of element sizes
+
+     Index storage is NOT included, so real storage is somewhat higher;
+     the figure is for ranking and relative sizing.
+
+  e) scan_time: when the job ran.
+
+  Any document that cannot be processed (unexpected value type, malformed
+  name) goes to a side output with only its path and the error message.
+  One bad document never stops the job.
+
+4.6 BigQueryIO — write the results
+
+  Main output  -> audit.firestore_doc_metadata
+  Side output  -> audit.firestore_doc_metadata_errors
+
+  - Method: FILE_LOADS (default for batch): rows are staged as files in the
+    temp bucket and loaded in bulk — no streaming-insert cost.
+  - WRITE_TRUNCATE: each run replaces the previous results, so re-running
+    is safe (idempotent).
+  - Table clustered by collection_group for cheap per-collection queries.
+  - The dataset's default table expiration (30 days) deletes the tables
+    automatically; the temp bucket lifecycle rule deletes staged files.
+
+
+--------------------------------------------------------------------------------
+5. OUTPUT TABLE: audit.firestore_doc_metadata
+--------------------------------------------------------------------------------
+
+  Column            Type       Description
+  ----------------  ---------  -----------------------------------------------
+  doc_path          STRING     Path within the database
+  doc_id            STRING     Last path segment
+  collection_group  STRING     Collection ID, e.g. orders
+  collection_path   STRING     Path with IDs as {id}, e.g. users/{id}/orders
+  parent_doc_path   STRING     Parent document for subcollections, else NULL
+  depth             INT64      Collection nesting level (1 = top level)
+  create_time       TIMESTAMP  Firestore createTime
+  update_time       TIMESTAMP  Firestore updateTime
+  date_fields       JSON       Date-like values only (see 4.5 c)
+  est_size_bytes    INT64      Estimated stored size (see 4.5 d)
+  scan_time         TIMESTAMP  Job run time
+
+  Error table: doc_path STRING, error STRING, scan_time TIMESTAMP.
+
+
+--------------------------------------------------------------------------------
+6. PARAMETERS
+--------------------------------------------------------------------------------
+
+  --project              Prod project (where the job runs)
+  --region               Dataflow region (same region as Firestore/BigQuery)
+  --databaseId           Firestore database, default "(default)"
+  --collectionGroups     Comma-separated collection group IDs
+  --partitionCount       Ranges per collection group, e.g. 200
+  --outputTable          prod-project:audit.firestore_doc_metadata
+  --errorTable           prod-project:audit.firestore_doc_metadata_errors
+  --readTime             Optional snapshot time (see 4.4)
+  --maxNumWorkers        Parallelism cap, start with 5-10
+  --serviceAccount       The dedicated scan SA (section 2)
+  --tempLocation         gs://<restricted-bucket>/tmp
+  --stagingLocation      gs://<restricted-bucket>/staging
+
+
+--------------------------------------------------------------------------------
+7. MONITORING A RUN
+--------------------------------------------------------------------------------
+
+  Dataflow UI (job graph + custom counters):
+    docs_read            documents returned by RunQuery
+    rows_written         metadata rows emitted
+    parse_errors         documents sent to the error table
+    date_fields_found    documents with at least one date-like value
+
+  Cloud Monitoring (Firestore):
+    read operations      should rise to a steady plateau, not spike
+    latency / errors     watch app-facing latency during the run; if it
+                         degrades, cancel and re-run with fewer workers
+
+  Cancelling is safe: nothing is written to Firestore, and a re-run
+  truncates the partial BigQuery output.
+
+
+--------------------------------------------------------------------------------
+8. VALIDATING THE OUTPUT
+--------------------------------------------------------------------------------
+
+  1. Completeness — compare rows per collection group with a Firestore
+     count query (runAggregationQuery, allDescendants=true):
+
+       SELECT collection_group, COUNT(*) AS rows
+       FROM audit.firestore_doc_metadata
+       GROUP BY collection_group;
+
+     Differences should be tiny (only documents written during the scan)
+     unless a fixed read time was used, in which case they should match.
+
+  2. Errors — the error table should be empty or near-empty.
+
+  3. createTime reliability — look for migration/import spikes and
+     cross-check against real date fields (see README, "Can createTime be
+     trusted?").
+
+
+--------------------------------------------------------------------------------
+9. COST AND RUN TIME
+--------------------------------------------------------------------------------
+
+  Firestore reads   1 read per document scanned
+                    ~ $3-6 per 10M documents, ~$30-60 per 100M (by region)
+  Dataflow          a few worker-hours for tens of millions of documents
+  BigQuery          load jobs are free; storage is small (~100-300 bytes per
+                    row) and expires after 30 days
+  Run time          throttling-bound: minutes for millions of documents,
+                    a few hours for hundreds of millions
+
+  Suggested rollout:
+    1. Non-prod Firestore, full run, validate output (section 8).
+    2. Prod, one small collection group, maxNumWorkers=2.
+    3. Prod, all collection groups, off-peak, maxNumWorkers=5-10.
+
+
+--------------------------------------------------------------------------------
+10. SECURITY AND COMPLIANCE NOTES
+--------------------------------------------------------------------------------
+
+  - Document content is read into worker memory only to compute size and
+    date fields; it is never logged, written or shuffled between workers.
+    (Extraction happens in the same step that reads the document.)
+  - The audit table is itself a copy of prod data (IDs and timestamps), so
+    it is restricted to the audit team and expires after 30 days.
+  - Exclude the "audit" dataset from the BigQuery data-age audit — its rows
+    carry old create_time values (see bq_data_age_audit.sql).
+  - Creating the dataset, bucket, SA and job in prod goes through the
+    normal prod change-management approval.
+
+
+--------------------------------------------------------------------------------
+11. WHAT HAPPENS NEXT (OUT OF SCOPE FOR THIS JOB)
+--------------------------------------------------------------------------------
+
+  1. Audit reports and the document-level "older than 7 years" list are
+     SQL on the output table (queries in README.md).
+  2. Compliance approves the list (business date per collection, legal
+     holds, recently updated old documents, subcollections).
+  3. A SEPARATE purge job reads the approved list and deletes documents via
+     FirestoreIO.v1().write().batchWrite(), each delete carrying an
+     updateTime precondition equal to the scanned update_time — a document
+     modified after the scan is NOT deleted, only reported.
+  4. Long term: backfill createdAt / expireAt, set them in application
+     code on every write, and enable Firestore TTL policies so no further
+     purge job is needed.

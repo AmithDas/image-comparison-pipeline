@@ -11,6 +11,9 @@ month can still hold 2015 rows).
 | [`bq_data_age_audit.sql`](bq_data_age_audit.sql) | Read-only BigQuery script: data age + storage for every table in a project/region |
 | [`firestore_data_age_audit.sh`](firestore_data_age_audit.sh) | Read-only Firestore count script (for someone with CLI access) |
 | [`docs/firestore-scan-architecture.png`](docs/firestore-scan-architecture.png) | Architecture of the proposed Firestore metadata scan ([SVG source](docs/firestore-scan-architecture.svg)) |
+| [`docs/firestore-scan-dataflow.txt`](docs/firestore-scan-dataflow.txt) | How the Firestore metadata scan (Dataflow) works, step by step |
+| [`docs/firestore-purge-architecture.png`](docs/firestore-purge-architecture.png) | Architecture of the proposed Firestore purge pipeline ([SVG source](docs/firestore-purge-architecture.svg)) |
+| [`docs/firestore-purge-dataflow.txt`](docs/firestore-purge-dataflow.txt) | How the Firestore purge pipeline (Dataflow) works, step by step |
 
 The cutoff everywhere is `CURRENT_DATE() - 7 years`.
 
