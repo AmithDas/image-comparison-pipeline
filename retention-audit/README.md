@@ -14,6 +14,7 @@ month can still hold 2015 rows).
 | [`docs/firestore-scan-dataflow.txt`](docs/firestore-scan-dataflow.txt) | How the Firestore metadata scan (Dataflow) works, step by step |
 | [`docs/firestore-purge-architecture.png`](docs/firestore-purge-architecture.png) | Architecture of the proposed Firestore purge pipeline ([SVG source](docs/firestore-purge-architecture.svg)) |
 | [`docs/firestore-purge-dataflow.txt`](docs/firestore-purge-dataflow.txt) | How the Firestore purge pipeline (Dataflow) works, step by step |
+| [`docs/firestore-cost-benefit.md`](docs/firestore-cost-benefit.md) | Firestore storage + PITR cost, savings scenarios and cost levers |
 
 The cutoff everywhere is `CURRENT_DATE() - 7 years`.
 
