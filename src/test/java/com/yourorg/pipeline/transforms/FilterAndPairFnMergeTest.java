@@ -1042,6 +1042,113 @@ public class FilterAndPairFnMergeTest {
         assertFalse(FilterAndPairFn.canonicalize(a).equals(FilterAndPairFn.canonicalize(b)));
     }
 
+    // ── Same-key items on one side must never be collapsed ────────────────────
+
+    private static JsonObject mergeAka(JsonObject existing, String existingAt,
+                                       JsonObject incoming, String incomingAt) {
+        return FilterAndPairFn.mergeJsonObjects(existing, existingAt, incoming, incomingAt,
+                Set.of("alsoKnownAs"), Map.of(), Map.of(), Map.of(), "", "img", "main");
+    }
+
+    private static String canonicalAka(JsonObject merged) {
+        JsonObject copy = merged.deepCopy();
+        FilterAndPairFn.stripProvenanceRecursively(copy);
+        return FilterAndPairFn.canonicalize(copy).toString();
+    }
+
+    /**
+     * Regression: a case with 4 alsoKnownAs items, two sharing the same
+     * firstName-lastName-middleName key, was persisted whole on the first run (no merge), then
+     * on the next run the persisted group state merged with a fresh re-read of the SAME case.
+     * The keyed merge collapsed the same-key pair into one, so the content changed (4 -> 3
+     * items) with no real change and ai_iteration climbed. Merging a case with itself must
+     * keep all 4, and stay stable on repeated merges.
+     */
+    @Test
+    public void sameKeyItemsWithinOneCaseSurviveMergingWithItsOwnPersistedState() {
+        String json = "{\"alsoKnownAs\":["
+                + "{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\",\"suffix\":\"Jr\"},"
+                + "{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\",\"suffix\":\"Sr\"},"
+                + "{\"firstName\":\"Jan\",\"lastName\":\"Roe\",\"middleName\":\"B\"},"
+                + "{\"firstName\":\"Joe\",\"lastName\":\"Poe\",\"middleName\":\"C\"}]}";
+        String t = "2026-01-01T00:00:00.000000Z";
+
+        JsonObject persisted = stamped(json, "CASE-1");
+        JsonObject once = mergeAka(persisted, t, stamped(json, "CASE-1"), t);
+        JsonObject twice = mergeAka(once, t, stamped(json, "CASE-1"), t);
+
+        assertEquals(4, once.getAsJsonArray("alsoKnownAs").size());
+        assertEquals(4, twice.getAsJsonArray("alsoKnownAs").size());
+        assertEquals("Repeated merge of unchanged content must not change it",
+                canonicalAka(once), canonicalAka(twice));
+    }
+
+    /** Exact duplicate items (identical content, same key) are preserved, not deduped. */
+    @Test
+    public void exactDuplicateItemsOnOneSideAreKept() {
+        String json = "{\"alsoKnownAs\":["
+                + "{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\"},"
+                + "{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\"}]}";
+        String t = "2026-01-01T00:00:00.000000Z";
+
+        JsonObject merged = mergeAka(stamped(json, "CASE-1"), t, stamped(json, "CASE-1"), t);
+
+        assertEquals(2, merged.getAsJsonArray("alsoKnownAs").size());
+    }
+
+    /** The same single item submitted by two different cases still dedupes to one copy. */
+    @Test
+    public void sameItemFromTwoCasesStillDedupesToOneCopy() {
+        String json = "{\"alsoKnownAs\":[{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\"}]}";
+
+        JsonObject merged = mergeAka(stamped(json, "CASE-1"), "2026-01-01T00:00:00.000000Z",
+                stamped(json, "CASE-2"), "2026-01-02T00:00:00.000000Z");
+
+        assertEquals(1, merged.getAsJsonArray("alsoKnownAs").size());
+    }
+
+    private static final String AKA_X =
+            "{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\"}";
+
+    private static String aka(String... items) {
+        return "{\"alsoKnownAs\":[" + String.join(",", items) + "]}";
+    }
+
+    /** Two cases each carrying the same two identical items: still two, not four. */
+    @Test
+    public void duplicatesAcrossDifferentCasesCollapseToTheLargestSinglesCaseCount() {
+        JsonObject merged = mergeAka(
+                stamped(aka(AKA_X, AKA_X), "CASE-1"), "2026-01-01T00:00:00.000000Z",
+                stamped(aka(AKA_X, AKA_X), "CASE-2"), "2026-01-02T00:00:00.000000Z");
+
+        assertEquals(2, merged.getAsJsonArray("alsoKnownAs").size());
+    }
+
+    /** One case's own duplicate is kept; the other case's copy adds nothing. */
+    @Test
+    public void aCasesOwnDuplicateIsKeptButNotMultipliedByAnotherCasesCopy() {
+        JsonObject merged = mergeAka(
+                stamped(aka(AKA_X, AKA_X), "CASE-1"), "2026-01-01T00:00:00.000000Z",
+                stamped(aka(AKA_X), "CASE-2"), "2026-01-02T00:00:00.000000Z");
+
+        assertEquals(2, merged.getAsJsonArray("alsoKnownAs").size());
+    }
+
+    /** Same key, different content, different cases: a real collision, one item wins. */
+    @Test
+    public void sameKeyDifferentContentAcrossCasesStillCollidesToOne() {
+        String junior = "{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\",\"suffix\":\"Jr\"}";
+        String senior = "{\"firstName\":\"Jon\",\"lastName\":\"Doe\",\"middleName\":\"A\",\"suffix\":\"Sr\"}";
+
+        JsonObject merged = mergeAka(
+                stamped(aka(junior), "CASE-1"), "2026-01-01T00:00:00.000000Z",
+                stamped(aka(senior), "CASE-2"), "2026-01-02T00:00:00.000000Z");
+
+        assertEquals(1, merged.getAsJsonArray("alsoKnownAs").size());
+        assertEquals("Sr", merged.getAsJsonArray("alsoKnownAs").get(0)
+                .getAsJsonObject().get("suffix").getAsString());
+    }
+
     // ── parseDecryptedPayload: id_request unwrap must be human-side only ────────
 
     private static final SegmentConfig ID_REQUEST_SEGMENT =

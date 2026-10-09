@@ -1126,6 +1126,11 @@ public class FilterAndPairFn
      *       it) falls back to the same latest-{@code created_at}-wins rule a scalar collision
      *       uses. Either way, WARN logged.</li>
      * </ul>
+     * Several items on the SAME side may share one key (exact duplicates, or same key with
+     * differing content); none are ever dropped. Items are paired one-to-one — identical content
+     * first, then remaining differing items index-wise in canonical order — and any surplus on
+     * either side is kept, so merging an array with itself is a no-op.
+     * <p>
      * When {@code keySpec} is {@code null} (no configured match key for this array path) or an
      * item's key can't be computed, no pairing is attempted for it — falls back to plain
      * concatenation, same as before composite keys existed.
@@ -1151,16 +1156,23 @@ public class FilterAndPairFn
             return combined;
         }
 
-        Map<String, JsonElement> existingByKey = new LinkedHashMap<>();
+        // Multimaps, not Map<key, item>: several items on the SAME side can legitimately share
+        // one composite key (e.g. two alsoKnownAs entries with the same first/last/middle name
+        // that differ elsewhere, or are exact duplicates in the source). A plain put() per key
+        // silently kept only the last of them, so the merged payload — and the pending row
+        // persisted from it — lost items the source actually had. That made the next run's
+        // persisted-vs-fresh merge produce yet another, different content signature, firing a
+        // spurious re-comparison (ai_iteration climbing) with no real change.
+        Map<String, List<JsonElement>> existingByKey = new LinkedHashMap<>();
         for (JsonElement el : existingArr) {
             String itemKey = JsonFieldExtractor.extractKeyValue(el, keySpec, arrayPath);
-            if (itemKey != null) existingByKey.put(itemKey, el);
+            if (itemKey != null) existingByKey.computeIfAbsent(itemKey, k -> new ArrayList<>()).add(el);
             else combined.add(stampSourceCaseId(el, existingArrayCase)); // unkeyable — no pairing possible
         }
-        Map<String, JsonElement> incomingByKey = new LinkedHashMap<>();
+        Map<String, List<JsonElement>> incomingByKey = new LinkedHashMap<>();
         for (JsonElement el : incomingArr) {
             String itemKey = JsonFieldExtractor.extractKeyValue(el, keySpec, arrayPath);
-            if (itemKey != null) incomingByKey.put(itemKey, el);
+            if (itemKey != null) incomingByKey.computeIfAbsent(itemKey, k -> new ArrayList<>()).add(el);
             else combined.add(stampSourceCaseId(el, incomingArrayCase));
         }
 
@@ -1169,21 +1181,40 @@ public class FilterAndPairFn
         allItemKeys.addAll(incomingByKey.keySet());
 
         for (String itemKey : allItemKeys) {
-            JsonElement e1 = existingByKey.get(itemKey);
-            JsonElement e2 = incomingByKey.get(itemKey);
+            List<JsonElement> existingItems = new ArrayList<>(existingByKey.getOrDefault(itemKey, List.of()));
+            List<JsonElement> incomingItems = new ArrayList<>(incomingByKey.getOrDefault(itemKey, List.of()));
 
-            if (e1 != null && e2 == null) {
-                combined.add(stampSourceCaseId(e1, existingArrayCase));
-
-            } else if (e1 == null) {
-                combined.add(stampSourceCaseId(e2, incomingArrayCase));
-
-            } else if (businessItemsEqual(e1, e2)) {
+            // 1. Identical-content items pair off one-to-one (a multiset match), each pair kept
+            //    as a single copy. Because it's one-to-one, a side's own exact duplicates are
+            //    preserved (a=[x,x] merged with a=[x,x] stays [x,x], not [x]), while the same
+            //    item submitted by two cases still dedupes to one copy.
+            for (int i = 0; i < existingItems.size(); ) {
+                JsonElement e1 = existingItems.get(i);
+                int match = -1;
+                for (int j = 0; j < incomingItems.size(); j++) {
+                    if (businessItemsEqual(e1, incomingItems.get(j))) { match = j; break; }
+                }
+                if (match < 0) { i++; continue; }
+                JsonElement e2 = incomingItems.remove(match);
+                existingItems.remove(i);
                 boolean keepExisting = existingWinsTies;
                 combined.add(stampSourceCaseId(keepExisting ? e1 : e2,
                         keepExisting ? existingArrayCase : incomingArrayCase));
+            }
 
-            } else {
+            // 2. Whatever is left with this key differs in content. Sort each side canonically
+            //    (source row order is not stable) and pair index-wise as genuine item-level
+            //    collisions; with unique keys per side this is exactly one pair, as before.
+            Comparator<JsonElement> byContent =
+                    Comparator.comparing(el -> canonicalize(stripSourceCaseId(el)).toString());
+            existingItems.sort(byContent);
+            incomingItems.sort(byContent);
+
+            int paired = Math.min(existingItems.size(), incomingItems.size());
+            for (int i = 0; i < paired; i++) {
+                JsonElement e1 = existingItems.get(i);
+                JsonElement e2 = incomingItems.get(i);
+
                 boolean e1HasPriority = priorityField != null
                         && e1.isJsonObject() && e1.getAsJsonObject().has(priorityField);
                 boolean e2HasPriority = priorityField != null
@@ -1206,6 +1237,14 @@ public class FilterAndPairFn
                 LOG.warn("imageId={} segment={} field={} itemKey={} — cross-case array item "
                                 + "collision, keeping {} item ({})", imageId, segment, arrayPath, itemKey,
                         keepExisting ? "existing" : "incoming", reason);
+            }
+
+            // 3. Surplus on either side has no counterpart — kept as-is, never dropped.
+            for (int i = paired; i < existingItems.size(); i++) {
+                combined.add(stampSourceCaseId(existingItems.get(i), existingArrayCase));
+            }
+            for (int i = paired; i < incomingItems.size(); i++) {
+                combined.add(stampSourceCaseId(incomingItems.get(i), incomingArrayCase));
             }
         }
         return combined;
