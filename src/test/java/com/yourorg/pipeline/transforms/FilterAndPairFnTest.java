@@ -233,13 +233,55 @@ public class FilterAndPairFnTest {
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /**
+     * Two DISTINCT AI payloads sharing the exact same real created_at: "latest" must be the
+     * same payload regardless of the order the rows are read in, or the compared AI would flip
+     * between runs and fire a spurious re-comparison.
+     */
+    private void assertEqualTimestampTieAlwaysPicks(String expectedPayload, boolean reversed) {
+        String aPayload = payloadWithMarker("img020", "a");
+        String bPayload = payloadWithMarker("img020", "b");
+
+        TableRow human = sourceRow("img020", HUMAN_METHOD, "key1", "2026-04-01T10:00:00Z");
+        TableRow aiA = sourceRowWithPayload("img020", AI_METHOD, "key1", "2026-04-01T08:00:00Z",
+                null, aPayload);
+        TableRow aiB = sourceRowWithPayload("img020", AI_METHOD, "key1", "2026-04-01T08:00:00Z",
+                null, bPayload);
+
+        PCollectionTuple routed = runPipeline("img020",
+                reversed ? List.of(human, aiB, aiA) : List.of(human, aiA, aiB),
+                List.of(), List.of());
+        PAssert.that(matched(routed)).satisfies(pairs -> {
+            List<KV<String, KV<GenericRecord, GenericRecord>>> list = new ArrayList<>();
+            pairs.forEach(list::add);
+            assertEquals(1, list.size());
+            assertEquals(expectedPayload,
+                    list.get(0).getValue().getValue().get("payload").toString());
+            assertEquals("2026-04-01T08:00:00.000000Z",
+                    list.get(0).getValue().getValue().get("created_at").toString());
+            return null;
+        });
+        pipeline.run().waitUntilFinish();
+    }
+
+    @Test
+    public void equalTimestampAiTieResolvesDeterministicallyInReadOrder() {
+        assertEqualTimestampTieAlwaysPicks(payloadWithMarker("img020", "b"), false);
+    }
+
+    @Test
+    public void equalTimestampAiTieResolvesDeterministicallyInReverseReadOrder() {
+        assertEqualTimestampTieAlwaysPicks(payloadWithMarker("img020", "b"), true);
+    }
+
+    /**
      * 1 human + 2 distinct AI payloads arrive in the same window, no case_id (single-case
      * segment). The group is always compared against only its single latest AI payload —
      * never a backlog of unmatched history.
      *
      * Expected:
-     *  - MATCHED:      1 pair — img001::main, against whichever AI payload is latest (bumped
-     *                    to created_at 08:00:01, +1s past the first-ever AI payload's 08:00)
+     *  - MATCHED:      1 pair — img001::main, against whichever AI payload is latest (the one
+     *                    with the later real source created_at, 09:00; timestamps are never
+     *                    adjusted)
      *  - CASE_PENDING:  1 record — comparison_version=1, last_compared_signature persisted
      *  - AI_PENDING:    2 records — both AI rows are retained even though only one was
      *                    compared, so aging is tracked for both independently
@@ -273,9 +315,8 @@ public class FilterAndPairFnTest {
             assertEquals("human", humanRec.get("payload_type").toString());
             assertEquals("Compared against ai2's content (the latest arrival)",
                     ai2Payload, aiRec.get("payload").toString());
-            // ai2 is the group's second-ever AI payload discovered this run, so it's bumped
-            // +1s past ai1's own original timestamp (see FilterAndPairFn.AI_TIMESTAMP_BUMP_SECONDS).
-            assertEquals("2026-04-01T08:00:01.000000Z", aiRec.get("created_at").toString());
+            // created_at is ai2's real source timestamp — never adjusted.
+            assertEquals("2026-04-01T09:00:00.000000Z", aiRec.get("created_at").toString());
             assertEquals(1L, humanRec.get("comparison_version"));
 
             return null;

@@ -31,6 +31,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -110,8 +111,6 @@ public class FilterAndPairFn
 
     public static final int MAX_WAIT_DAYS = 7;
 
-    /** Seconds a genuinely new AI payload's created_at is bumped past the group's prior max. */
-    public static final int AI_TIMESTAMP_BUMP_SECONDS = 1;
 
     /** Internal bucket key for human records with no real {@code case_id}. Never persisted as-is. */
     private static final String NO_CASE = "";
@@ -220,7 +219,7 @@ public class FilterAndPairFn
             }
         }
 
-        // ── Fold in the AI replay pool, seeding the running max created_at ──────
+        // ── Fold in the AI replay pool (previously saved AI rows) ───────────────
         // Colliding rows (more than one physical AI_PENDING_TAG row for the same payload) are
         // reconciled via mergeAiPendingMeta — the AI-side counterpart to mergeGroupMeta below.
         // A plain overwrite (or blindly adding one aiRows entry per physical row) would silently
@@ -242,23 +241,24 @@ public class FilterAndPairFn
                     persistedKey);
             aiPendingMeta.merge(persistedKey, p, FilterAndPairFn::mergeAiPendingMeta);
         }
-        Instant maxAiCreatedAt = null;
         for (GenericRecord p : aiPendingMeta.values()) {
-            String createdAt = str(p.get("created_at"));
             aiRows.add(newPayloadRow(imageId, str(p.get("key_id")), "ai",
-                    str(p.get("payload")), createdAt));
-            Instant parsed = parseInstant(createdAt);
-            if (parsed != null && (maxAiCreatedAt == null || parsed.isAfter(maxAiCreatedAt))) {
-                maxAiCreatedAt = parsed;
-            }
+                    str(p.get("payload")), str(p.get("created_at"))));
         }
 
-        // ── Assign always-increasing created_at to genuinely new AI payloads ────
-        // Dedup fresh candidates by payload identity first (a single physical row
-        // must only be bump-assigned once), then process in a stable order so the
-        // bump assignment is deterministic across runs.d
+        // ── Add genuinely new AI payloads, keeping their real source created_at ─
+        // A payload's created_at is its actual event time — never adjusted. Fresh candidates
+        // are sorted (created_at, then payload) BEFORE de-duplicating by content identity, so
+        // when the source wrote one logical event as several physical rows (each with its own
+        // ciphertext and slightly different timestamp) the earliest copy always wins, regardless
+        // of the order BigQuery returned them in.
+        List<GenericRecord> sortedFresh = new ArrayList<>(freshAiCandidates);
+        sortedFresh.sort(Comparator
+                .comparing((GenericRecord c) -> str(c.get("created_at")) == null ? "" : str(c.get("created_at")))
+                .thenComparing(c -> str(c.get("payload")) == null ? "" : str(c.get("payload"))));
+
         Map<String, GenericRecord> dedupedFresh = new LinkedHashMap<>();
-        for (GenericRecord c : freshAiCandidates) {
+        for (GenericRecord c : sortedFresh) {
             String freshPayloadStr = str(c.get("payload"));
             String freshKey = aiContentKey(str(c.get("key_id")), freshPayloadStr, seg);
             LOG.info("SIGCHECK-FRESH imageId={} segment={} keyIdLen={} payloadLen={} "
@@ -270,31 +270,29 @@ public class FilterAndPairFn
                     freshKey, aiPendingMeta.containsKey(freshKey));
             dedupedFresh.putIfAbsent(freshKey, c);
         }
-        List<GenericRecord> orderedFresh = new ArrayList<>(dedupedFresh.values());
-        orderedFresh.sort(Comparator
-                .comparing((GenericRecord c) -> str(c.get("created_at")) == null ? "" : str(c.get("created_at")))
-                .thenComparing(c -> str(c.get("payload"))));
 
-        for (GenericRecord candidate : orderedFresh) {
-            String key = aiContentKey(str(candidate.get("key_id")), str(candidate.get("payload")), seg);
-            if (aiPendingMeta.containsKey(key)) {
-                // Replay of an already-known row — the pending-pool copy above already
-                // covers it with its previously-assigned created_at; don't re-bump it.
+        for (Map.Entry<String, GenericRecord> fresh : dedupedFresh.entrySet()) {
+            if (aiPendingMeta.containsKey(fresh.getKey())) {
+                // Replay of an already-known row — the pending-pool copy above already covers it.
                 continue;
             }
-            Instant assigned;
-            if (maxAiCreatedAt == null) {
-                Instant original = parseInstant(str(candidate.get("created_at")));
-                assigned = original != null ? original : now;
-            } else {
-                assigned = maxAiCreatedAt.plusSeconds(AI_TIMESTAMP_BUMP_SECONDS);
-            }
-            maxAiCreatedAt = assigned;
+            GenericRecord candidate = fresh.getValue();
+            Instant original = parseInstant(str(candidate.get("created_at")));
+            Instant assigned = original != null ? original : now;
             aiRows.add(newPayloadRow(imageId, str(candidate.get("key_id")), "ai",
                     str(candidate.get("payload")), TimestampUtil.formatInstant(assigned)));
         }
 
-        aiRows.sort(Comparator.comparing(r -> str(r.get("created_at"))));
+        // Latest = highest created_at. Two distinct payloads can share a timestamp, and
+        // aiRows is built partly from a HashMap, so break ties by content identity — otherwise
+        // "latest" could flip between runs and fire a spurious re-comparison.
+        Map<GenericRecord, String> aiSortKey = new IdentityHashMap<>();
+        for (GenericRecord r : aiRows) {
+            aiSortKey.put(r, aiContentKey(str(r.get("key_id")), str(r.get("payload")), seg));
+        }
+        aiRows.sort(Comparator
+                .comparing((GenericRecord r) -> str(r.get("created_at")) == null ? "" : str(r.get("created_at")))
+                .thenComparing(aiSortKey::get));
 
         // ── Fold in existing pending rows ────────────────────────────────────────
         // Folded under PENDING_GROUP_KEY, NOT the persisted row's own case_id column — that
@@ -602,9 +600,8 @@ public class FilterAndPairFn
                 parseLong(left.get("retry_count")),
                 parseLong(right.get("retry_count"))));
 
-        // created_at is the assigned, monotonically-bumped identity timestamp for this payload
-        // (see AI_TIMESTAMP_BUMP_SECONDS) — keep whichever is earlier, consistent with
-        // first_seen_at reflecting when this payload was originally discovered.
+        // created_at is this payload's real source timestamp — keep whichever is earlier,
+        // consistent with first_seen_at reflecting when it was originally discovered.
         String leftCreatedAt  = str(left.get("created_at"));
         String rightCreatedAt = str(right.get("created_at"));
         if (rightCreatedAt != null
