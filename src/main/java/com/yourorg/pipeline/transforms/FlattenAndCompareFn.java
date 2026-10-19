@@ -602,8 +602,19 @@ public class FlattenAndCompareFn
      *
      * <p>Returns {@code [humanRemap, aiRemap]}.
      */
+    /**
+     * True when {@code key} is {@code childPrefix} + a single code segment — i.e. the child
+     * belongs to exactly this parent. A plain {@code startsWith} would also claim children of a
+     * DIFFERENT parent whose key merely extends this one (parent "3725-46804" vs
+     * "3725-46804-2630"), pulling them into both groups so the later group overwrote the
+     * earlier group's remap and orphaned a matched pair.
+     */
+    private static boolean isDirectChildKey(String key, String childPrefix) {
+        return key.startsWith(childPrefix) && key.indexOf('-', childPrefix.length()) < 0;
+    }
+
     @SuppressWarnings("unchecked")
-    private static Map<String, String>[] computeSoftMatchRemapsForArray(
+    static Map<String, String>[] computeSoftMatchRemapsForArray(
             Map<String, List<FieldValue>> humanFields,
             Map<String, List<FieldValue>> aiFields,
             String arrayPath,
@@ -626,10 +637,10 @@ public class FlattenAndCompareFn
                 .forEach(parentKey -> {
                     String childPrefix = parentKey + "-";
                     List<String> humanChildKeys = humanArrayKeys.stream()
-                            .filter(k -> k.startsWith(childPrefix))
+                            .filter(k -> isDirectChildKey(k, childPrefix))
                             .collect(Collectors.toList());
                     List<String> aiChildKeys = aiArrayKeys.stream()
-                            .filter(k -> k.startsWith(childPrefix))
+                            .filter(k -> isDirectChildKey(k, childPrefix))
                             .collect(Collectors.toList());
                     processGroup(parentKey, humanChildKeys, aiChildKeys, humanRemap, aiRemap);
                 });

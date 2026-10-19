@@ -247,4 +247,27 @@ public class FlattenAndCompareFnTest {
                 FlattenAndCompareFn.inferArrayCaseId("tradelines.extraField", "ZZZ", multi));
         assertNull(FlattenAndCompareFn.inferArrayCaseId("notAnArray", null, multi));
     }
+
+    /**
+     * Parent keys where one extends the other ("3725-46804" / "3725-46804-2630") must not leak
+     * children into each other's group: the human-only child stays human-only (AI = XXX).
+     */
+    @Test
+    public void softMatchDoesNotLeakChildrenAcrossPrefixSharingParents() {
+        String arr = "nonreportedAddresses.disputeCodes";
+        Map<String, List<JsonFieldExtractor.FieldValue>> human = new HashMap<>();
+        human.put("nonreportedAddresses", List.of(
+                new JsonFieldExtractor.FieldValue("3725-46804", "x")));
+        human.put(arr, List.of(new JsonFieldExtractor.FieldValue("3725-46804-704", "704")));
+        Map<String, List<JsonFieldExtractor.FieldValue>> ai = new HashMap<>();
+        ai.put("nonreportedAddresses", List.of(
+                new JsonFieldExtractor.FieldValue("3725-46804-2630", "x")));
+        ai.put(arr, List.of(new JsonFieldExtractor.FieldValue("3725-46804-2630-704", "704")));
+
+        Map<String, String>[] remaps = FlattenAndCompareFn.computeSoftMatchRemapsForArray(
+                human, ai, arr, "nonreportedAddresses");
+
+        assertEquals("3725-46804-XXX-704", remaps[0].get("3725-46804-704"));
+        assertEquals("3725-46804-2630-704-XXX", remaps[1].get("3725-46804-2630-704"));
+    }
 }
