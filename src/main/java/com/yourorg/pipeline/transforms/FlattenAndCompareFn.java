@@ -360,8 +360,8 @@ public class FlattenAndCompareFn
                         if (itemCaseId == null) {
                             itemCaseId = inferArrayCaseId(field, matchKey, humanFields);
                         }
-                        String rowCaseId = resolveCaseId(field, itemCaseId,
-                                caseIdByPath, canonicalCaseId);
+                        String rowCaseId = AMBIGUOUS_CASE.equals(itemCaseId) ? null
+                                : resolveCaseId(field, itemCaseId, caseIdByPath, canonicalCaseId);
                         emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                                 aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
                                 field, matchKey, humanVal, aiVal);
@@ -378,8 +378,8 @@ public class FlattenAndCompareFn
                     if (itemCaseId == null) {
                         itemCaseId = inferArrayCaseId(field, null, humanFields);
                     }
-                    String rowCaseId = resolveCaseId(field, itemCaseId,
-                            caseIdByPath, canonicalCaseId);
+                    String rowCaseId = AMBIGUOUS_CASE.equals(itemCaseId) ? null
+                            : resolveCaseId(field, itemCaseId, caseIdByPath, canonicalCaseId);
                     emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
                             aiCreatedAt, humanCreatedAt, loadTime, rootToLabel,
                             field, null, humanVal, aiVal);
@@ -392,6 +392,9 @@ public class FlattenAndCompareFn
                 imageId, segment, iteration, rowsEmitted, allFields.size());
     }
 
+    /** Sentinel from {@link #inferArrayCaseId}: several cases, none identifiable — emit null. */
+    static final String AMBIGUOUS_CASE = "\u0000AMBIGUOUS";
+
     /**
      * Case id for a row whose human side carries none of its own — an AI-only field or array
      * item (extra fields/items the AI produced under an array the human also has). Without
@@ -402,8 +405,12 @@ public class FlattenAndCompareFn
      * (longest matching {@link #ARRAY_MATCH_KEYS} prefix). Prefers a case_id shared by human
      * values with the same {@code matchKey} (the same item, via a sibling field); otherwise the
      * array's case_id if all its attributed human values agree on one. Returns {@code null}
-     * when ambiguous (several cases in the array and no matching item) or when {@code field} is
+     * when the array has no case attribution at all or when {@code field} is
      * not under any configured array, leaving {@link #resolveCaseId} to its other fallbacks.
+     *
+     * <p>When the array holds several cases and none matches this item, returns
+     * {@link #AMBIGUOUS_CASE}: the caller writes a {@code null} case_id rather than guessing
+     * (the canonical case_id would be wrong for it).
      */
     static String inferArrayCaseId(String field, String matchKey,
                                    Map<String, List<FieldValue>> humanFields) {
@@ -429,7 +436,7 @@ public class FlattenAndCompareFn
         }
         if (itemCases.size() == 1) return itemCases.iterator().next();
         if (itemCases.isEmpty() && arrayCases.size() == 1) return arrayCases.iterator().next();
-        return null;
+        return arrayCases.isEmpty() ? null : AMBIGUOUS_CASE;
     }
 
     /**

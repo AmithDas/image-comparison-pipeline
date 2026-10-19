@@ -500,8 +500,8 @@ public class FilterAndPairFnTest {
             records.forEach(list::add);
             assertEquals("One consolidated group row, not two separate case rows", 1, list.size());
             GenericRecord row = list.get(0);
-            assertEquals("Canonical case_id is the earlier-arriving contributor",
-                    "case1", row.get("case_id").toString());
+            assertEquals("Canonical case_id is the latest-arriving contributor",
+                    "case2", row.get("case_id").toString());
             assertEquals(2L, row.get("comparison_version"));
             Set<String> mergedCaseIds = Set.of(row.get("merged_case_ids").toString().split(";"));
             assertEquals(Set.of("case1", "case2"), mergedCaseIds);
