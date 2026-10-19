@@ -298,7 +298,7 @@ public class FilterAndPairFn
 
         // ── Fold in existing pending rows ────────────────────────────────────────
         // Folded under PENDING_GROUP_KEY, NOT the persisted row's own case_id column — that
-        // column is the group's canonicalCaseId (earliest-arriving contributor), but the row
+        // column is the group's canonicalCaseId (latest-arriving contributor), but the row
         // itself is the WHOLE group's already-merged state, not just that one case's content.
         // Folding it under a real case's bucket would let it collide with (and lose to, via
         // foldPendingHuman's putIfAbsent) a genuine fresh re-read of that case's own row —
@@ -309,9 +309,9 @@ public class FilterAndPairFn
         // case_id/created_at columns — even though its CONTENT is folded under the sentinel
         // bucket (excluded from case identity below), it still represents a real, already-known
         // contributing case_id whose arrival time must still count when picking the group's
-        // canonical (earliest) case — otherwise a case known only via persisted state (not
+        // canonical (latest) case — otherwise a case known only via persisted state (not
         // freshly re-surfacing this run) would be forgotten and a later-arriving fresh case
-        // could wrongly become canonical instead.
+        // could wrongly become canonical instead (or a stale earlier one stay canonical).
         Map<String, GenericRecord> groupPendingMeta = new HashMap<>();
         Set<String>                allContributingCaseIds = new LinkedHashSet<>();
         String   canonicalCaseId = null;
@@ -338,7 +338,7 @@ public class FilterAndPairFn
                     && (canonicalCaseId == null
                         || (createdAt != null
                             && (canonicalCreatedAt == null
-                                || createdAt.compareTo(canonicalCreatedAt) < 0)))) {
+                                || createdAt.compareTo(canonicalCreatedAt) > 0)))) {
                 canonicalCaseId    = persistedCaseKey;
                 canonicalCreatedAt = createdAt;
             }
@@ -410,7 +410,7 @@ public class FilterAndPairFn
                     if (canonicalCaseId == null
                             || (incomingCreatedAt != null
                                 && (canonicalCreatedAt == null
-                                    || incomingCreatedAt.compareTo(canonicalCreatedAt) < 0))) {
+                                    || incomingCreatedAt.compareTo(canonicalCreatedAt) > 0))) {
                         canonicalCaseId    = caseKey;
                         canonicalCreatedAt = incomingCreatedAt;
                     }

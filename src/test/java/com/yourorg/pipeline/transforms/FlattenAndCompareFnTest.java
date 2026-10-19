@@ -243,7 +243,8 @@ public class FlattenAndCompareFnTest {
         var multi = humanTradelines("{\"tradelines\":["
                 + "{\"_sourceCaseId\":\"C1\",\"accountNumber\":\"A\",\"customerNumber\":\"1\",\"dateOpened\":\"d\"},"
                 + "{\"_sourceCaseId\":\"C2\",\"accountNumber\":\"B\",\"customerNumber\":\"1\",\"dateOpened\":\"d\"}]}");
-        assertNull(FlattenAndCompareFn.inferArrayCaseId("tradelines.extraField", "ZZZ", multi));
+        assertEquals(FlattenAndCompareFn.AMBIGUOUS_CASE,
+                FlattenAndCompareFn.inferArrayCaseId("tradelines.extraField", "ZZZ", multi));
         assertNull(FlattenAndCompareFn.inferArrayCaseId("notAnArray", null, multi));
     }
 }
