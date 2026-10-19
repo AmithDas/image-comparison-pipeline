@@ -217,4 +217,33 @@ public class FlattenAndCompareFnTest {
 
         assertNull(humanFields.get("addresses.streetNumber").get(0).caseId);
     }
+
+    private static Map<String, List<JsonFieldExtractor.FieldValue>> humanTradelines(String json) {
+        return JsonFieldExtractor.flatten(json, FlattenAndCompareFn.ARRAY_MATCH_KEYS);
+    }
+
+    /** AI-only extra field under a tradeline the human has: inherits that item's case. */
+    @Test
+    public void aiOnlyFieldInheritsMatchingHumanItemCase() {
+        var human = humanTradelines("{\"tradelines\":["
+                + "{\"_sourceCaseId\":\"C1\",\"accountNumber\":\"A\",\"customerNumber\":\"1\",\"dateOpened\":\"d\"},"
+                + "{\"_sourceCaseId\":\"C2\",\"accountNumber\":\"B\",\"customerNumber\":\"1\",\"dateOpened\":\"d\"}]}");
+        String mk = human.get("tradelines.accountNumber").stream()
+                .filter(v -> "B".equals(v.value)).findFirst().get().matchKey;
+
+        assertEquals("C2", FlattenAndCompareFn.inferArrayCaseId("tradelines.extraField", mk, human));
+    }
+
+    /** AI-only item with no matching human item: single-case array gives that case; multi-case is ambiguous. */
+    @Test
+    public void aiOnlyItemUsesArrayCaseOnlyWhenUnambiguous() {
+        var single = humanTradelines("{\"tradelines\":[{\"_sourceCaseId\":\"C1\",\"accountNumber\":\"A\",\"customerNumber\":\"1\",\"dateOpened\":\"d\"}]}");
+        assertEquals("C1", FlattenAndCompareFn.inferArrayCaseId("tradelines.extraField", "ZZZ", single));
+
+        var multi = humanTradelines("{\"tradelines\":["
+                + "{\"_sourceCaseId\":\"C1\",\"accountNumber\":\"A\",\"customerNumber\":\"1\",\"dateOpened\":\"d\"},"
+                + "{\"_sourceCaseId\":\"C2\",\"accountNumber\":\"B\",\"customerNumber\":\"1\",\"dateOpened\":\"d\"}]}");
+        assertNull(FlattenAndCompareFn.inferArrayCaseId("tradelines.extraField", "ZZZ", multi));
+        assertNull(FlattenAndCompareFn.inferArrayCaseId("notAnArray", null, multi));
+    }
 }

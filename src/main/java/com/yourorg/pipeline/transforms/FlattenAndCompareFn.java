@@ -357,6 +357,9 @@ public class FlattenAndCompareFn
                         String humanVal = humanFv != null ? humanFv.value : null;
                         String aiVal    = aiFv    != null ? aiFv.value    : null;
                         String itemCaseId = humanFv != null ? humanFv.caseId : null;
+                        if (itemCaseId == null) {
+                            itemCaseId = inferArrayCaseId(field, matchKey, humanFields);
+                        }
                         String rowCaseId = resolveCaseId(field, itemCaseId,
                                 caseIdByPath, canonicalCaseId);
                         emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
@@ -372,6 +375,9 @@ public class FlattenAndCompareFn
                     String humanVal = humanFv != null ? humanFv.value : null;
                     String aiVal    = i < aiEntries.size() ? aiEntries.get(i).value : null;
                     String itemCaseId = humanFv != null ? humanFv.caseId : null;
+                    if (itemCaseId == null) {
+                        itemCaseId = inferArrayCaseId(field, null, humanFields);
+                    }
                     String rowCaseId = resolveCaseId(field, itemCaseId,
                             caseIdByPath, canonicalCaseId);
                     emitRow(ctx, imageId, segment, rowCaseId, keyId, iteration,
@@ -384,6 +390,46 @@ public class FlattenAndCompareFn
 
         LOG.info("Compared imageId='{}' segment='{}' iteration={} — {} rows ({} fields)",
                 imageId, segment, iteration, rowsEmitted, allFields.size());
+    }
+
+    /**
+     * Case id for a row whose human side carries none of its own — an AI-only field or array
+     * item (extra fields/items the AI produced under an array the human also has). Without
+     * this such rows would fall to the canonical case_id even though the array they belong to
+     * is tagged to a specific case.
+     *
+     * <p>Looks only at human values under the same configured array path as {@code field}
+     * (longest matching {@link #ARRAY_MATCH_KEYS} prefix). Prefers a case_id shared by human
+     * values with the same {@code matchKey} (the same item, via a sibling field); otherwise the
+     * array's case_id if all its attributed human values agree on one. Returns {@code null}
+     * when ambiguous (several cases in the array and no matching item) or when {@code field} is
+     * not under any configured array, leaving {@link #resolveCaseId} to its other fallbacks.
+     */
+    static String inferArrayCaseId(String field, String matchKey,
+                                   Map<String, List<FieldValue>> humanFields) {
+        String arrayPath = null;
+        for (String p : ARRAY_MATCH_KEYS.keySet()) {
+            if ((field.equals(p) || field.startsWith(p + "."))
+                    && (arrayPath == null || p.length() > arrayPath.length())) {
+                arrayPath = p;
+            }
+        }
+        if (arrayPath == null) return null;
+
+        Set<String> itemCases = new HashSet<>();
+        Set<String> arrayCases = new HashSet<>();
+        for (Map.Entry<String, List<FieldValue>> e : humanFields.entrySet()) {
+            String k = e.getKey();
+            if (!(k.equals(arrayPath) || k.startsWith(arrayPath + "."))) continue;
+            for (FieldValue fv : e.getValue()) {
+                if (fv.caseId == null || fv.caseId.isEmpty()) continue;
+                arrayCases.add(fv.caseId);
+                if (matchKey != null && matchKey.equals(fv.matchKey)) itemCases.add(fv.caseId);
+            }
+        }
+        if (itemCases.size() == 1) return itemCases.iterator().next();
+        if (itemCases.isEmpty() && arrayCases.size() == 1) return arrayCases.iterator().next();
+        return null;
     }
 
     /**
